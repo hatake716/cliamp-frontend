@@ -831,6 +831,37 @@ class CapsuleButton(Gtk.Button):
         self.image.set_visible(bool(icon_name))
 
 
+class GlassButton(Gtk.Button):
+    """ページの上に浮かべるガラスのカプセル (記号と短い文字。「Spotify から取り込む…」など)。
+
+    `GlassButton(label, icon_name, tooltip=None)`。高さ 34。記号は赤。`set_compact(True)` で文字を
+    隠して丸にする (狭い幅)。ツールチップと読み上げの名前は tooltip (無ければ label)。"""
+
+    def __init__(self, label: str, icon_name: str, tooltip: str | None = None):
+        super().__init__()
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        box.set_halign(Gtk.Align.CENTER)
+        self.image = Gtk.Image.new_from_icon_name(icon_name)
+        self.image.set_pixel_size(15)
+        box.append(self.image)
+        self.label = _label(label, "music-glass-button-label", ellipsize=False)
+        box.append(self.label)
+        self.set_child(box)
+        self.add_css_class("music-glass-button")
+        self.add_css_class("music-glass")
+        self.set_valign(Gtk.Align.CENTER)
+        text = tooltip or label
+        self.set_tooltip_text(text)
+        self.update_property([Gtk.AccessibleProperty.LABEL], [text])
+
+    def set_compact(self, compact: bool) -> None:
+        self.label.set_visible(not compact)
+        if compact:
+            self.add_css_class("compact")
+        else:
+            self.remove_css_class("compact")
+
+
 class GlassCapsule(Gtk.Box):
     """ガラスのカプセル。中に CircleButton を並べる (全画面の ✕ / ミニプレーヤー など)。
 
@@ -1185,7 +1216,8 @@ class MediaCard(_Card):
     """正方形の絵に題と副題を添えたカード (最近再生した項目・プレイリスト)。
 
     `MediaCard(loader, subject, title, subtitle, size=170, kind="track", on_activate=None)`
-    角 7。乗せると絵が少し暗くなる。属性: subject, art (Artwork), art_height。"""
+    角 7。乗せると絵が少し暗くなる。属性: subject, art (Artwork), art_height。
+    `set_subtitle(text)` で副題を替える (後から分かったこと。取り込んだプレイリストの「Spotify ·」など)。"""
 
     def __init__(self, loader, subject, title: str, subtitle: str, size: int = 170,
                  kind: str = "track", on_activate=None):
@@ -1209,8 +1241,13 @@ class MediaCard(_Card):
         box.append(self.subtitle_label)
         box.set_size_request(size, -1)
         self.set_child(box)
-        tip = title if not subtitle else f"{title}\n{subtitle}"
-        self.set_tooltip_text(tip)
+        self._title = title
+        self.set_subtitle(subtitle)
+
+    def set_subtitle(self, text: str) -> None:
+        self.subtitle_label.set_text(text or "")
+        self.subtitle_label.set_visible(bool(text))
+        self.set_tooltip_text(self._title if not text else f"{self._title}\n{text}")
 
 
 class TallCard(_Card):
@@ -1832,9 +1869,10 @@ class EmptyState(Gtk.Box):
     """何も無いときや失敗したときの表示 (中央に記号・題・説明・ボタン)。
 
     `EmptyState(icon_name, title, description=None, button_label=None, on_button=None)`
-    ボタンは赤で塗ったカプセル (画面で 1 つだけの色付きの操作)。
+    ボタンは赤で塗ったカプセル (画面で 1 つだけの色付きの操作)。その右に塗らない 2 つ目のボタンを
+    置ける (`set_secondary(label, on_button)`)。
     `set_title(text)` / `set_description(text)` / `set_icon_name(name)` /
-    `set_button(label, on_button)` (後からボタンを出す・隠す)。属性 button。"""
+    `set_button(label, on_button)` (後からボタンを出す・隠す)。属性 button / secondary。"""
 
     def __init__(self, icon_name: str, title: str, description: str | None = None,
                  button_label: str | None = None, on_button=None):
@@ -1862,19 +1900,32 @@ class EmptyState(Gtk.Box):
         self.description_label.set_visible(bool(description))
         self.append(self.description_label)
         self.on_button = on_button
+        self.on_secondary = None
         self.button = None
+        self.secondary = None
+        # ボタンの列 (赤い主のボタンと、塗らない 2 つ目のボタン)
+        self.buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        self.buttons.set_halign(Gtk.Align.CENTER)
+        self.buttons.set_margin_top(14)
+        self.buttons.set_visible(False)
+        self.append(self.buttons)
         if button_label:
-            self.button = CapsuleButton(button_label, accent_text=False, filled=True)
-            self.button.set_halign(Gtk.Align.CENTER)
-            self.button.set_margin_top(14)
-            self.button.connect("clicked", EmptyState._on_button_clicked)
-            self.append(self.button)
+            self.set_button(button_label, on_button)
 
     @staticmethod
     def _on_button_clicked(button) -> None:
         state = button.get_ancestor(EmptyState)
         if state is not None:
             invoke(state.on_button, state)
+
+    @staticmethod
+    def _on_secondary_clicked(button) -> None:
+        state = button.get_ancestor(EmptyState)
+        if state is not None:
+            invoke(state.on_secondary, state)
+
+    def _update_buttons(self) -> None:
+        self.buttons.set_visible(any(b is not None and b.get_visible() for b in (self.button, self.secondary)))
 
     def set_title(self, text: str) -> None:
         self.title_label.set_text(text or "")
@@ -1892,16 +1943,34 @@ class EmptyState(Gtk.Box):
         if not label:
             if self.button is not None:
                 self.button.set_visible(False)
+            self._update_buttons()
             return
         if self.button is None:
             self.button = CapsuleButton(label, accent_text=False, filled=True)
-            self.button.set_halign(Gtk.Align.CENTER)
-            self.button.set_margin_top(14)
             self.button.connect("clicked", EmptyState._on_button_clicked)
-            self.append(self.button)
+            self.buttons.prepend(self.button)
         else:
             self.button.set_label(label)
         self.button.set_visible(True)
+        self._update_buttons()
+
+    def set_secondary(self, label: str | None, on_button=None) -> None:
+        """主のボタンの右の、塗らない 2 つ目のボタンを出す (無ければ作る) か、label が空なら隠す。"""
+        self.on_secondary = on_button if label else None
+        if not label:
+            if self.secondary is not None:
+                self.secondary.set_visible(False)
+            self._update_buttons()
+            return
+        if self.secondary is None:
+            self.secondary = CapsuleButton(label, accent_text=True)
+            self.secondary.add_css_class("secondary")
+            self.secondary.connect("clicked", EmptyState._on_secondary_clicked)
+            self.buttons.append(self.secondary)
+        else:
+            self.secondary.set_label(label)
+        self.secondary.set_visible(True)
+        self._update_buttons()
 
 
 class LoadingState(Gtk.Box):

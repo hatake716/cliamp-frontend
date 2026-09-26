@@ -20,6 +20,11 @@ Gtk.ListBox (.navigation-sidebar) で作る。Adw.Sidebar (libadwaita 1.9) も
 - `select_key(key)` で選択だけを合わせる (on_select は呼ばない)。key は
   pages.page_key() の形。合う行が無ければ選択を外す。
 - `refresh()` でプロバイダーのプレイリストを取り直す。
+
+Spotify から取り込む: 「プレイリスト」の節の見出しと行を右クリックすると「Spotify から取り込む…」(取り込んだ
+ローカルのプレイリストの行なら「Spotify から更新」も) のメニュー。Spotify のプレイリストが「開発者アプリの
+持ち主が Premium でない」で読めないときは、Spotify の行の代わりに「Spotify から取り込む…」の行を 1 つ
+出す (選べない行。押すと取り込みの窓。ツールチップに理由)。ほかの失敗は今までどおり黙って出さない。
 """
 
 from __future__ import annotations
@@ -31,10 +36,10 @@ import gi
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
-from gi.repository import Adw, GLib, Gtk, Pango  # noqa: E402
+from gi.repository import Adw, Gdk, Gio, GLib, Gtk, Pango  # noqa: E402
 
 from .pages import Bindings, page_key  # noqa: E402
-from .protocol import Response  # noqa: E402
+from .protocol import SPOTIFY_OWNER_PREMIUM, Response, is_spotify_owner_premium_required  # noqa: E402
 from .widgets import Artwork  # noqa: E402
 
 # (ページ ID, 表示名, 記号, 節)
@@ -52,6 +57,10 @@ SECTION_TITLES = {"library": "ライブラリ", "playlists": "プレイリスト
 # プレイリストの行を出さないプロバイダー (local は ctx.local_playlists から、
 # radio はラジオのページで扱う)
 SKIP_PROVIDERS = ("local", "radio")
+
+# 押すと窓を出す行 (ページではない)
+IMPORT_ACTION = "action:spotify-import"
+IMPORT_LABEL = "Spotify から取り込む…"
 
 STATE_TEXT = {
     "playing": "再生中",
@@ -78,13 +87,17 @@ class SidebarRow(Gtk.ListBoxRow):
     __gtype_name__ = "CliampMusicSidebarRow"
 
     def __init__(self, page_id: str, title: str, *, icon_name: str | None = None, section: str = "",
-                 params: dict | None = None, art: tuple | None = None, loader=None):
+                 params: dict | None = None, art: tuple | None = None, loader=None, tooltip: str | None = None):
         super().__init__()
         self.page_id = page_id
         self.params = dict(params or {})
         self.section = section
         self.key = page_key(page_id, **self.params)
         self.add_css_class("music-sidebar-row")
+        if self.is_action:
+            # 窓を出すだけの行。選ばない (いまのページの行の選択を動かさない)
+            self.add_css_class("music-sidebar-action")
+            self.set_selectable(False)
         box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=9)
         if art is not None and loader is not None:
             self.add_css_class("with-art")
@@ -101,8 +114,12 @@ class SidebarRow(Gtk.ListBoxRow):
         self.title_label.set_hexpand(True)
         box.append(self.title_label)
         self.set_child(box)
-        self.set_tooltip_text(title if len(title) > 18 else None)
+        self.set_tooltip_text(tooltip or (title if len(title) > 18 else None))
         self.update_property([Gtk.AccessibleProperty.LABEL], [title])
+
+    @property
+    def is_action(self) -> bool:
+        return self.page_id.startswith("action:")
 
 
 class Sidebar(Adw.Bin):
@@ -121,6 +138,8 @@ class Sidebar(Adw.Bin):
         self._provider_names: list[str] = []
         self._fetch_token = 0
         self._just_selected = None
+        # Spotify のプレイリストが「持ち主が Premium でない」で読めない (取り込みの行を出す)
+        self._spotify_blocked = False
         self.add_css_class("music-sidebar")
 
         view = Adw.ToolbarView()
@@ -149,6 +168,24 @@ class Sidebar(Adw.Bin):
         press.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
         press.connect("pressed", Sidebar._on_list_press)
         self.list.add_controller(press)
+        # 「プレイリスト」の節の右クリック (長押し) のメニュー
+        secondary = Gtk.GestureClick()
+        secondary.set_button(Gdk.BUTTON_SECONDARY)
+        secondary.connect("pressed", Sidebar._on_list_secondary)
+        self.list.add_controller(secondary)
+        long_press = Gtk.GestureLongPress()
+        long_press.set_touch_only(True)
+        long_press.connect("pressed", Sidebar._on_list_long_press)
+        self.list.add_controller(long_press)
+        self.menu_actions = Gio.SimpleActionGroup()
+        importer = Gio.SimpleAction.new("import-spotify", None)
+        importer.connect("activate", Sidebar._on_import_action, weakref.ref(self))
+        self.menu_actions.add_action(importer)
+        updater = Gio.SimpleAction.new("update-spotify", GLib.VariantType.new("s"))
+        updater.connect("activate", Sidebar._on_update_action, weakref.ref(self))
+        self.menu_actions.add_action(updater)
+        self.insert_action_group("sidebar", self.menu_actions)
+        self.context_menu: Gtk.PopoverMenu | None = None
         self.list.update_property([Gtk.AccessibleProperty.LABEL], ["サイドバー"])
 
         for page_id, title, icon, section in FIXED_ITEMS:
@@ -273,10 +310,136 @@ class Sidebar(Adw.Bin):
         self._open(row, again=True)
 
     def _open(self, row: SidebarRow, again: bool = False) -> None:
+        if row.is_action:
+            # 窓を出すだけ (選択はいまのページの行のまま)
+            self.select_key(self._selected_key)
+            if row.page_id == IMPORT_ACTION:
+                self.open_import()
+            return
         if not again and row.key == self._selected_key:
             return
         self._selected_key = row.key
         self._on_select(row.page_id, dict(row.params))
+
+    # --- 右クリックのメニュー -----------------------------------------------------------
+
+    def open_import(self) -> None:
+        opener = getattr(self.ctx, "open_spotify_import", None)
+        if callable(opener):
+            opener()
+
+    @staticmethod
+    def _on_import_action(_action, _param, ref) -> None:
+        sidebar = ref()
+        if sidebar is not None:
+            sidebar.open_import()
+
+    @staticmethod
+    def _on_update_action(_action, param, ref) -> None:
+        sidebar = ref()
+        updater = getattr(sidebar.ctx, "update_spotify_import", None) if sidebar is not None else None
+        if callable(updater):
+            updater(param.get_string())
+
+    def context_menu_model(self, row: SidebarRow | None, *, header: bool = False) -> Gio.Menu | None:
+        """row (「プレイリスト」の節の行) の右クリックのメニュー。節の外なら None。header なら row の上の
+        節の見出し (「プレイリスト」) のメニュー (取り込みだけ)。"""
+        if row is None or row.section != "playlists":
+            return None
+        store = self.ctx.store
+        can_save = store.connected and store.supports("playlist_add")
+        menu = Gio.Menu()
+        main = Gio.Menu()
+        main.append(IMPORT_LABEL, "sidebar.import-spotify")
+        menu.append_section(None, main)
+        self.menu_actions.lookup_action("import-spotify").set_enabled(can_save)
+        name = row.params.get("id") if row.params.get("provider") == "local" and not header else None
+        lookup = getattr(self.ctx, "import_record", None)
+        if name and callable(lookup) and lookup(name) is not None:
+            update = Gio.Menu()
+            item = Gio.MenuItem.new("Spotify から更新", None)
+            item.set_action_and_target_value("sidebar.update-spotify", GLib.Variant.new_string(name))
+            update.append_item(item)
+            menu.append_section(None, update)
+            busy = name in getattr(self.ctx, "spotify_imports_busy", ())
+            self.menu_actions.lookup_action("update-spotify").set_enabled(
+                can_save and store.supports("playlist_delete") and not busy)
+        return menu
+
+    def popup_context_menu(self, row: SidebarRow | None, x: float, y: float, *, header: bool = False) -> bool:
+        """一覧の (x, y) を指して row (header なら row の上の節の見出し) の右クリックのメニューを出す。
+        出せたら True。"""
+        model = self.context_menu_model(row, header=header)
+        if model is None:
+            return False
+        if self.context_menu is not None:
+            self.context_menu.unparent()
+        popover = Gtk.PopoverMenu.new_from_model(model)
+        popover.add_css_class("music-sidebar-menu")
+        popover.set_parent(self.list)
+        popover.set_has_arrow(False)
+        popover.set_position(Gtk.PositionType.BOTTOM)
+        popover.set_halign(Gtk.Align.START)
+        rect = Gdk.Rectangle()
+        rect.x, rect.y, rect.width, rect.height = int(x), int(y), 1, 1
+        popover.set_pointing_to(rect)
+        popover.connect("closed", Sidebar._on_menu_closed)
+        self.context_menu = popover
+        popover.popup()
+        return True
+
+    @staticmethod
+    def _on_menu_closed(popover: Gtk.PopoverMenu) -> None:
+        # 項目の action は閉じた後に走ることがあるので、外すのは一呼吸おいてから
+        def drop() -> bool:
+            sidebar = popover.get_ancestor(Sidebar)
+            if sidebar is not None and sidebar.context_menu is popover:
+                sidebar.context_menu = None
+            if popover.get_parent() is not None:
+                popover.unparent()
+            return GLib.SOURCE_REMOVE
+
+        GLib.idle_add(drop)
+
+    def row_at(self, y: float) -> tuple[SidebarRow | None, bool]:
+        """一覧の y にある行と、そこがその行の上の節の見出しか。見出しは行の外に置かれるので
+        (Gtk.ListBox.get_row_at_y は見出しの上では None)、見出しの矩形でも探す。"""
+        row = self.list.get_row_at_y(int(y))
+        if row is not None:
+            return row, False
+        for candidate in self.rows():
+            header = candidate.get_header()
+            if header is None or not header.get_visible():
+                continue
+            ok, bounds = header.compute_bounds(self.list)
+            if ok and bounds.get_y() <= y < bounds.get_y() + bounds.get_height():
+                return candidate, True
+        return None, False
+
+    @staticmethod
+    def _on_list_secondary(gesture: Gtk.GestureClick, _n: int, x: float, y: float) -> None:
+        listbox = gesture.get_widget()
+        sidebar = listbox.get_ancestor(Sidebar)
+        if sidebar is None:
+            return
+        row, header = sidebar.row_at(y)
+        if sidebar.popup_context_menu(row, x, y, header=header):
+            gesture.set_state(Gtk.EventSequenceState.CLAIMED)
+
+    @staticmethod
+    def _on_list_long_press(gesture: Gtk.GestureLongPress, x: float, y: float) -> None:
+        listbox = gesture.get_widget()
+        sidebar = listbox.get_ancestor(Sidebar)
+        if sidebar is not None:
+            row, header = sidebar.row_at(y)
+            sidebar.popup_context_menu(row, x, y, header=header)
+
+    def do_dispose(self) -> None:
+        menu = getattr(self, "context_menu", None)
+        if menu is not None and menu.get_parent() is not None:
+            menu.unparent()
+        self.context_menu = None
+        Adw.Bin.do_dispose(self)
 
     # --- プレイリストの行 -----------------------------------------------------------
 
@@ -290,6 +453,7 @@ class Sidebar(Adw.Bin):
         else:
             self._provider_lists.clear()
             self._provider_order = []
+            self._spotify_blocked = False
             self._rebuild_playlists()
 
     def _rebuild_all(self) -> None:
@@ -303,6 +467,7 @@ class Sidebar(Adw.Bin):
         if not store.connected or not store.supports("providers"):
             self._provider_lists.clear()
             self._provider_order = []
+            self._spotify_blocked = False
             self._rebuild_playlists()
             return
         self._fetch_token += 1
@@ -320,6 +485,8 @@ class Sidebar(Adw.Bin):
             this._provider_names = [p.name or p.key for p in result if not p.virtual]
             wanted = [p for p in result if p.playlists and p.key not in SKIP_PROVIDERS]
             this._provider_order = [p.key for p in wanted]
+            if "spotify" not in this._provider_order:
+                this._spotify_blocked = False
             for key in list(this._provider_lists):
                 if key not in this._provider_order:
                     del this._provider_lists[key]
@@ -333,10 +500,15 @@ class Sidebar(Adw.Bin):
             if this is None or token != this._fetch_token:
                 return
             if isinstance(result, Response):
-                # サインインが要る・失敗した: 黙って出さない
+                # サインインが要る・失敗した: 黙って出さない。ただし Spotify の開発者アプリの持ち主が
+                # Premium でないときは、代わりに取り込みの行を出す (公開プレイリストはそれで使える)
                 this._provider_lists.pop(key, None)
+                if key == "spotify":
+                    this._spotify_blocked = is_spotify_owner_premium_required(result.error)
             else:
                 this._provider_lists[key] = list(result)
+                if key == "spotify":
+                    this._spotify_blocked = False
             this._rebuild_playlists()
 
         self.ctx.catalog.providers(on_providers)
@@ -356,8 +528,13 @@ class Sidebar(Adw.Bin):
 
     def _rebuild_playlists(self) -> None:
         wanted = self._wanted_playlist_rows()
+        store = self.ctx.store
+        action = (self._spotify_blocked and store.connected and store.supports("playlists")
+                  and store.supports("playlist_add"))
         current = [(row.title_label.get_text(), row.params) for row in self._playlist_rows]
-        if current == [(title, params) for title, params, _art in wanted]:
+        current_action = any(row.is_action for row in self._playlist_rows)
+        if current == [(title, params) for title, params, _art in wanted] + ([(IMPORT_LABEL, {})] if action else []) \
+                and current_action == action:
             return
         selected_key = self._selected_key
         for row in self._playlist_rows:
@@ -366,6 +543,11 @@ class Sidebar(Adw.Bin):
         for title, params, art_key in wanted:
             row = SidebarRow("playlist", title, section="playlists", params=params,
                              art=("placeholder", art_key, "playlist"), loader=self.ctx.artwork)
+            self.list.append(row)
+            self._playlist_rows.append(row)
+        if action:
+            row = SidebarRow(IMPORT_ACTION, IMPORT_LABEL, icon_name="music-import-symbolic", section="playlists",
+                             tooltip=SPOTIFY_OWNER_PREMIUM)
             self.list.append(row)
             self._playlist_rows.append(row)
         self.list.invalidate_headers()

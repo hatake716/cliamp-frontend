@@ -196,6 +196,31 @@ window.music .music-glass-capsule > button.music-circle:active,
 window.music .music-glass-capsule > menubutton > button:active { background-color: rgba(255, 255, 255, 0.15); }
 
 /* ------------------------------------------------------------------
+ * ガラスのカプセルのボタン (GlassButton)。ページの上に浮かべる操作
+ * (すべてのプレイリストの「Spotify から取り込む」)。記号は赤、文字は白。
+ * 地・縁・影は .music-glass のもの。狭い幅では記号だけの丸 (.compact)
+ * ------------------------------------------------------------------ */
+
+window.music button.music-glass-button {
+  min-width: 0;
+  min-height: 34px;
+  padding: 0 15px 0 12px;
+  margin: 0;
+  color: var(--m-label);
+  font-size: 13px;
+  font-weight: 600;
+  outline-offset: 1px;
+  transition: background-color 120ms ease, color 120ms ease;
+}
+
+window.music button.music-glass-button.compact { min-width: 34px; padding: 0; }
+window.music button.music-glass-button image { color: var(--m-key-text); }
+window.music button.music-glass-button:hover { background-color: rgba(58, 59, 67, 0.94); }
+window.music button.music-glass-button:active { background-color: rgba(70, 71, 80, 0.96); }
+window.music button.music-glass-button:disabled,
+window.music button.music-glass-button:disabled image { color: var(--m-tertiary); }
+
+/* ------------------------------------------------------------------
  * 入り切りの丸 (ToggleCircle)。入 = 薄い赤の丸に赤い記号
  * ------------------------------------------------------------------ */
 

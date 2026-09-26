@@ -15,6 +15,16 @@ providers の答えの playback (曲を YouTube で探して鳴らすか) は、
 それより前の答えには載らない。そこで、spotify のカタログ系が (この cliamp で) 初めて成功した後に
 providers を 1 度だけ取り直し、覚えている答えを置き換える (PROTOCOL.md の ProviderInfo)。
 providers の答えを受け取るたびに add_providers_listener の聞き手へ渡す (取り直しの答えも)。
+
+Spotify の Web API が「開発者アプリの持ち主が Premium でない」と断ったとき (403 "Active premium
+subscription required for the owner of the app") は、どの呼び出しも同じ答えになる。サイドバー・ホーム・
+すべてのプレイリスト・打ちながらの検索がそれぞれ Spotify に頼み直さないよう、その答えを
+STICKY_FAILURE_TTL の間覚え、そのプロバイダーの playlists / tracks / search には送らずに同じ失敗を返す
+(force (Ctrl+R) と繋ぎ直しでは忘れて頼み直す)。
+
+track_hook (AppContext が差す) は、届いた曲の並び (tracks / search / history) を渡す前に通す関数。
+取り込んだ Spotify のプレイリストの曲 (ローカルの TOML で meta を失ったもの) に Spotify の曲 ID を
+付け直すのに使う (spotify_import.ImportIndex.restore_all)。
 """
 
 from __future__ import annotations
@@ -34,6 +44,7 @@ from .protocol import (
     Response,
     Track,
     fold_text,
+    is_spotify_owner_premium_required,
     parse_lyrics,
     parse_playlists,
     parse_providers,
@@ -59,6 +70,8 @@ SWEEP_SECONDS = 60.0
 LAZY_SESSION_PROVIDERS = frozenset({"spotify"})
 _SESSION_KINDS = frozenset({"playlists", "tracks", "search"})
 _PROVIDERS_KEY = ("providers",)
+# 「持ち主が Premium でない」のように、そのプロバイダーのどの呼び出しも同じに断られる失敗を覚える時間
+STICKY_FAILURE_TTL = 600.0
 
 
 def _call(callback: Callable[[Any], object], value: Any) -> bool:
@@ -89,6 +102,10 @@ class Catalog:
         # 送った providers の答えがセッションより前のものかもしれない (届いたら取り直す)
         self._providers_again = False
         self._providers_listeners: list[Callable[[list[ProviderInfo]], object]] = []
+        # プロバイダー → (期限, 失敗の Response)。どの呼び出しも同じに断られる失敗 (持ち主が Premium でない)
+        self._provider_failures: dict[str, tuple[float, Response]] = {}
+        # 曲の並びを渡す前に通す関数 (AppContext が取り込んだ曲の ID を付け直すのに使う)
+        self.track_hook: Callable[[list[Track]], list[Track]] | None = None
 
     # --- 共通 -------------------------------------------------------------------
 
@@ -114,6 +131,14 @@ class Catalog:
                callback: Callable, *, force: bool = False, miss: Callable[[Response], tuple[Any, float] | None] | None = None,
                lane: str | None = None, **fields) -> None:
         now = time.monotonic()
+        provider = key[1] if len(key) > 1 and key[0] in _SESSION_KINDS else None
+        if provider is not None:
+            failure = self._provider_failures.get(provider)
+            if failure is not None and (force or failure[0] <= now):
+                del self._provider_failures[provider]  # 頼み直す (Ctrl+R・期限切れ)
+            elif failure is not None:
+                self._later(callback, failure[1])
+                return
         if not force:
             hit = self._cache.get(key)
             if hit is not None and hit[0] > now:
@@ -140,8 +165,12 @@ class Catalog:
                 value = parse(response.data)
                 if ttl > 0 and not stale:
                     self._store(key, ttl, value)
+                if provider is not None:
+                    self._provider_failures.pop(provider, None)
             else:
                 value = response
+                if provider is not None and is_spotify_owner_premium_required(response.error):
+                    self._provider_failures[provider] = (time.monotonic() + STICKY_FAILURE_TTL, response)
                 substitute = miss(response) if miss is not None else None
                 if substitute is not None:
                     value, miss_ttl = substitute
@@ -198,9 +227,28 @@ class Catalog:
         if provider is None:
             self._cache.clear()
             self._sessions.clear()
+            self._provider_failures.clear()
             return
+        self._provider_failures.pop(provider, None)
         for key in [k for k in self._cache if len(k) > 1 and k[1] == provider]:
             del self._cache[key]
+
+    def provider_failure(self, provider: str) -> Response | None:
+        """provider のどの呼び出しも同じに断られている失敗 (持ち主が Premium でないなど)。無ければ None。"""
+        failure = self._provider_failures.get(provider)
+        if failure is None or failure[0] <= time.monotonic():
+            return None
+        return failure[1]
+
+    def _tracks(self, data: dict) -> list[Track]:
+        tracks = parse_tracks(data)
+        hook = self.track_hook
+        if hook is not None and tracks:
+            try:
+                tracks = list(hook(tracks))
+            except Exception as exc:  # 飾り (絵とリンク) のための付け直し。失敗しても曲は渡す
+                log(f"曲の付け直しに失敗: {exc}")
+        return tracks
 
     # --- 読み取り -----------------------------------------------------------------
 
@@ -228,7 +276,7 @@ class Catalog:
     def tracks(self, provider: str, id: str, callback: Callable[[list[Track] | Response], object], *,
                force: bool = False) -> None:
         ttl = LOCAL_TRACKS_TTL if provider == LOCAL else TRACKS_TTL
-        self._fetch(("tracks", provider, id), ttl, "tracks", parse_tracks, callback, force=force,
+        self._fetch(("tracks", provider, id), ttl, "tracks", self._tracks, callback, force=force,
                     provider=provider, id=id)
 
     def search(self, provider: str, query: str, callback: Callable[[list[Track] | Response], object],
@@ -241,7 +289,7 @@ class Catalog:
             return
         limit = max(1, min(50, int(limit)))
         key = ("search", provider, fold_text(query), limit)
-        self._fetch(key, SEARCH_TTL, "search", parse_tracks, callback, force=force, lane=lane,
+        self._fetch(key, SEARCH_TTL, "search", self._tracks, callback, force=force, lane=lane,
                     provider=provider, query=query, limit=limit)
 
     def lyrics(self, artist: str, title: str, callback: Callable[[Lyrics | None], object]) -> None:
@@ -261,7 +309,7 @@ class Catalog:
     def history(self, callback: Callable[[list[Track] | Response], object], limit: int = 50, *,
                 force: bool = False) -> None:
         """最近再生した曲 (新しい順、played_at 付き)。覚えない (いつも取り直す)。"""
-        self._fetch(("history", "", int(limit)), 0.0, "history", parse_tracks, callback, force=force,
+        self._fetch(("history", "", int(limit)), 0.0, "history", self._tracks, callback, force=force,
                     limit=int(limit))
 
     # --- 再生と編集 -----------------------------------------------------------------

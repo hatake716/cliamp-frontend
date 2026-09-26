@@ -41,6 +41,15 @@
   `unplayable` も無し) で返る。Spotify の検索は開発モードのアプリと同じく cliamp の
   friendlySearchError の文言で断り、spotify:track: の曲を始めると本物と同じ
   "custom streamer: spotify: streaming unavailable (…)" の誤りで止まる。
+- spotify_owner_premium=True (--spotify-owner-premium) は、Spotify の開発者アプリの持ち主が Premium で
+  ないとき (2026-09 の実測)。Web API はどの呼び出しにも 403 "Active premium subscription required for the
+  owner of the app" を返し、cliamp は本物と同じ文脈で包む: playlists は "spotify: your music: http status
+  403 Forbidden: {…}"、search は "spotify: search: http status 403 Forbidden: {…}"、tracks は上流の言い換え
+  "spotify: playlist not accessible: only playlists you own or collaborate on can be loaded"。
+- ローカルのプレイリストに足した曲は、YouTube で探して鳴らす Spotify の曲 (path "ytsearch1:…"、meta
+  の spotify.id / spotify.bridge 付き) でも TOML の欄 (path・title・artist・album…) だけが残り、meta は
+  落ちる。読み戻すと path が yt-dlp の検索式なので stream が立つ (本物と同じ)。名前 + ".toml" が
+  255 バイトを超える playlist_add は、本物 (os.OpenFile) と同じ "open …: file name too long" で断る。
 
 試験の道具: `isolate_display()` (利用者の画面に繋がない)、`temp_socket_path()`、
 `temp_dir(prefix)` (どちらも試験の終わりに消える)、
@@ -216,6 +225,16 @@ SPOTIFY_SEARCH_BLOCKED = (
 # 本物の ErrStreamingUnavailable に player の "custom streamer: " が付いたもの。
 SPOTIFY_STREAMING_UNAVAILABLE = ("custom streamer: spotify: streaming unavailable (this Spotify connection is "
                                  "Web API only; Spotify Premium is required to stream Spotify tracks)")
+# 開発者アプリの持ち主が Premium でないときの Web API の 403 の本文 (Spotify の JSON のまま)。cliamp の
+# webAPI は "http status 403 Forbidden: <本文>" で包む
+SPOTIFY_OWNER_PREMIUM_BODY = ('{\n  "error" : {\n    "status" : 403,\n    "message" : "Active premium '
+                              'subscription required for the owner of the app"\n  }\n}')
+SPOTIFY_OWNER_PREMIUM_ERRORS = {
+    "playlists": f"spotify: your music: http status 403 Forbidden: {SPOTIFY_OWNER_PREMIUM_BODY}",
+    "search": f"spotify: search: http status 403 Forbidden: {SPOTIFY_OWNER_PREMIUM_BODY}",
+    # 上流の Tracks は 403 を含む誤りをどれもこう言い換える (本文は捨てられる)
+    "tracks": "spotify: playlist not accessible: only playlists you own or collaborate on can be loaded",
+}
 
 
 def spotify_bridge(track: dict) -> dict:
@@ -716,7 +735,8 @@ class FakeCliamp:
                  spotify_needs_auth: bool = False, latency: float = 0.0, buffer_secs: float = 0.0,
                  initial_state: str = "playing", empty: bool = False, seed: int = 7,
                  radios_toml: bool = False, device_descriptions: bool = False,
-                 switch_keeps_old: bool = False, spotify_web_only: bool = False):
+                 switch_keeps_old: bool = False, spotify_web_only: bool = False,
+                 spotify_owner_premium: bool = False):
         self.socket_path = socket_path
         self.legacy = legacy
         self.spotify_needs_auth = spotify_needs_auth
@@ -727,6 +747,8 @@ class FakeCliamp:
         self._spotify_session = False
         # 空でなければ Spotify の playlists / tracks / search をこの誤りで断る (回数の制限など)
         self.spotify_error = ""
+        # 開発者アプリの持ち主が Premium でない (Web API がどの呼び出しも 403 で断る)
+        self.spotify_owner_premium = spotify_owner_premium
         self.latency = latency
         self.buffer_secs = buffer_secs
         self.radios_toml = radios_toml
@@ -1585,15 +1607,18 @@ class FakeCliamp:
     def _needs_auth() -> dict:
         return {"ok": False, "error": "sign-in required", "needs_auth": True}
 
-    def _spotify_session_or_refusal(self) -> dict | None:
+    def _spotify_session_or_refusal(self, cmd: str = "playlists") -> dict | None:
         """Spotify のカタログ系の前置き (本物の ensureSession と、その後の Web API の断り)。
         サインインが要れば needs_auth。そうでなければセッションができ (providers に playback が
-        載るようになる)、spotify_error があればその誤り。通れば None。"""
+        載るようになる)、spotify_error があればその誤り、持ち主が Premium でなければ cmd ごとの
+        403 の誤り。通れば None。"""
         if self.spotify_needs_auth:
             return self._needs_auth()
         self._spotify_session = True
         if self.spotify_error:
             return {"ok": False, "error": self.spotify_error}
+        if self.spotify_owner_premium:
+            return {"ok": False, "error": SPOTIFY_OWNER_PREMIUM_ERRORS[cmd]}
         return None
 
     @staticmethod
@@ -1705,7 +1730,7 @@ class FakeCliamp:
                 return {"ok": False, "error": f"open {self._toml_path(pid)}: no such file or directory"}
             return {"ok": True, "tracks": tracks}
         if provider == "spotify":
-            refused = self._spotify_session_or_refusal()
+            refused = self._spotify_session_or_refusal("tracks")
             if refused is not None:
                 return refused
             if pid not in self.spotify_lists:
@@ -1758,7 +1783,7 @@ class FakeCliamp:
                         found.append(self._stand_in_art(dict(t)))
             return {"ok": True, "tracks": found[:limit]}
         if provider == "spotify":
-            refused = self._spotify_session_or_refusal()
+            refused = self._spotify_session_or_refusal("search")
             if refused is not None:
                 return refused
             if self.spotify_web_only:
@@ -1842,6 +1867,10 @@ class FakeCliamp:
         bad = self._local_name_error(name)
         if bad is not None:
             return bad
+        if len((name + ".toml").encode("utf-8")) > 255:
+            # external/local は os.OpenFile(<dir>/<名前>.toml) で開く。名前が NAME_MAX (255 バイト) を超えると
+            # Linux は ENAMETOOLONG を返し、Go の *PathError はこの形になる
+            return {"ok": False, "error": f"open {self._toml_path(name)}: file name too long"}
         self.local_playlists.setdefault(name, []).extend(local_track(t) for t in tracks)
         return {"ok": True}
 
@@ -1898,13 +1927,20 @@ def main(argv: list[str] | None = None) -> int:
                         help="読み込み中の曲の切り替えで前の曲の位置と長さを出す (本物の TUI)")
     parser.add_argument("--spotify-web-only", action="store_true",
                         help="Spotify を Web API だけの接続にする (曲は YouTube で探して鳴らし、検索は断られる)")
+    parser.add_argument("--spotify-owner-premium", action="store_true",
+                        help="Spotify の開発者アプリの持ち主が Premium でない (Web API がどの呼び出しも 403 で断る)")
+    parser.add_argument("--no-local-playlists", action="store_true",
+                        help="ローカルのプレイリストを空で始める")
     args = parser.parse_args(argv)
 
     server = FakeCliamp(args.socket, legacy=args.legacy, art_dir=args.art_dir,
                         spotify_needs_auth=args.spotify_needs_auth, latency=args.latency,
                         buffer_secs=args.buffer, initial_state=args.state, empty=args.empty,
                         radios_toml=args.radios_toml, device_descriptions=args.device_descriptions,
-                        switch_keeps_old=args.switch_keeps_old, spotify_web_only=args.spotify_web_only)
+                        switch_keeps_old=args.switch_keeps_old, spotify_web_only=args.spotify_web_only,
+                        spotify_owner_premium=args.spotify_owner_premium)
+    if args.no_local_playlists:
+        server.local_playlists.clear()
     server.start()
     print(f"fake-cliamp: {args.socket} で待ち受けています (api {0 if args.legacy else 1})",
           file=sys.stderr, flush=True)

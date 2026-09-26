@@ -407,6 +407,36 @@ class Helpers(unittest.TestCase):
         for bad in ("", "  ", ".", "..", "a/b", "a\\b", "Recently Played", None):
             self.assertFalse(p.valid_playlist_name(bad), bad)
 
+    def test_playlist_name_problem_says_why(self):
+        """理由はそれぞれ (予約名に「/」の話をしない)。名前 + ".toml" が 255 バイトを超えると cliamp の
+        os.OpenFile が ENAMETOOLONG で断るので、その前に言う。"""
+        cases = {
+            "": "名前を入れてください",
+            "   ": "名前を入れてください",
+            ".": "この名前は使えません",
+            "..": "この名前は使えません",
+            "Recently Played": "この名前は cliamp が履歴に使っています",
+            "a/b": "この名前は使えません (「/」と「\\」は入れられません)",
+            "a\\b": "この名前は使えません (「/」と「\\」は入れられません)",
+            "夏" * 84: "名前が長すぎます (日本語ならおよそ 80 文字まで)",
+            "a" * 251: "名前が長すぎます (日本語ならおよそ 80 文字まで)",
+            "壊れた\ud83d": "この名前は使えません",
+        }
+        for name, reason in cases.items():
+            with self.subTest(name=name[:10]):
+                self.assertEqual(p.playlist_name_problem(name), reason)
+                self.assertFalse(p.valid_playlist_name(name))
+        for good in ("夏" * 83, "a" * 250, " Focus ", "Recently Played 2"):
+            self.assertEqual(p.playlist_name_problem(good), "", good[:10])
+
+    def test_fit_playlist_name(self):
+        self.assertEqual(p.fit_playlist_name("Focus"), "Focus")
+        self.assertEqual(p.fit_playlist_name("Focus", " 2"), "Focus 2")
+        long = p.fit_playlist_name("夏" * 100)
+        self.assertEqual(long, "夏" * 82 + "…")  # 82*3 + 3 = 249
+        self.assertEqual(p.fit_playlist_name("夏" * 100, " 12"), "夏" * 81 + "… 12")
+        self.assertEqual(p.fit_playlist_name("a" * 300), "a" * 247 + "…")
+
     def test_relative_time(self):
         now = datetime(2026, 9, 26, 12, 0, 0, tzinfo=timezone.utc)
         cases = {

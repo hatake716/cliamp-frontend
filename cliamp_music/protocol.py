@@ -760,6 +760,19 @@ _SPOTIFY_RATE_LIMITED = re.compile(
 _SPOTIFY_SEARCH_BLOCKED_RE = re.compile(_SPOTIFY_AT + r"spotify: search blocked\b",
                                         re.IGNORECASE | re.MULTILINE)
 _SPOTIFY_SEARCH_FAILED_RE = re.compile(_SPOTIFY_AT + r"spotify: search:", re.IGNORECASE | re.MULTILINE)
+# Spotify の Web API は、開発者アプリ (client_id) の持ち主が Premium でないと、どの呼び出しにも 403
+# "Active premium subscription required for the owner of the app" を返す (2026-09 の実測)。cliamp は
+# 本文をそのまま包む ("spotify: your music: http status 403 Forbidden: {…"message": "Active premium …"}")。
+SPOTIFY_OWNER_PREMIUM = ("Spotify の開発者アプリの持ち主が Premium でないため、Spotify のライブラリは読めません。"
+                         "公開プレイリストは「Spotify から取り込む」で使えます")
+_SPOTIFY_OWNER_PREMIUM_RE = re.compile(r"active premium subscription required for the owner of the app",
+                                       re.IGNORECASE)
+# cliamp の Spotify の tracks は Web API の 403 をどれも "spotify: playlist not accessible: only playlists you
+# own or collaborate on can be loaded" に言い換える (持ち主が Premium でないときも)
+SPOTIFY_NOT_ACCESSIBLE = ("このプレイリストは Spotify のライブラリから読めません (読めるのは自分のと共同編集の"
+                          "プレイリストだけ)。公開プレイリストなら「Spotify から取り込む」で使えます")
+_SPOTIFY_NOT_ACCESSIBLE_RE = re.compile(_SPOTIFY_AT + r"spotify: playlist not accessible\b",
+                                        re.IGNORECASE | re.MULTILINE)
 _SPOTIFY_STREAMING_RE = re.compile(_SPOTIFY_AT + re.escape(SPOTIFY_STREAMING_UNAVAILABLE) + r"\b",
                                    re.IGNORECASE | re.MULTILINE)
 _GO_DURATION_PART = re.compile(r"([0-9]+(?:\.[0-9]*)?)(ns|us|µs|μs|ms|h|m|s)")
@@ -834,9 +847,23 @@ def is_spotify_search_blocked(text: str) -> bool:
     return bool(_SPOTIFY_SEARCH_FAILED_RE.search(text)) and "invalid limit" in text.lower()
 
 
+def is_spotify_owner_premium_required(text: str) -> bool:
+    """Spotify の Web API が「開発者アプリの持ち主が Premium でない」と断った誤りか (403
+    "Active premium subscription required for the owner of the app")。cliamp の Spotify の誤り
+    ("spotify: " で始まる) のときだけ (YouTube の検索の誤りは利用者の語を繰り返すので見ない)。"""
+    text = _as_str(text)[:_CLASSIFY_MAX]
+    return _is_spotify_error(text) and bool(_SPOTIFY_OWNER_PREMIUM_RE.search(text))
+
+
+def is_spotify_not_accessible(text: str) -> bool:
+    """cliamp の Spotify の tracks が 403 を言い換えた "spotify: playlist not accessible: …" か。"""
+    text = _as_str(text)[:_CLASSIFY_MAX]
+    return _is_spotify_error(text) and bool(_SPOTIFY_NOT_ACCESSIBLE_RE.search(text))
+
+
 def describe_catalog_error(text: str) -> str:
-    """カタログ系の失敗のうち日本語で言い直せるもの (Spotify の回数の制限・検索の封鎖・
-    鳴らせない曲)。cliamp の Spotify の誤り ("spotify: " で始まる) だけを言い直し、それ以外
+    """カタログ系の失敗のうち日本語で言い直せるもの (Spotify の回数の制限・持ち主が Premium でない・
+    読めないプレイリスト・検索の封鎖・鳴らせない曲)。cliamp の Spotify の誤り ("spotify: " で始まる) だけを言い直し、それ以外
     (語を繰り返す YouTube の検索の誤りなど) は空。"""
     text = _as_str(text)
     if not text or not _is_spotify_error(text):
@@ -844,6 +871,10 @@ def describe_catalog_error(text: str) -> str:
     wait = spotify_rate_limit_wait(text)
     if wait is not None:
         return spotify_rate_limit_message(wait)
+    if is_spotify_owner_premium_required(text):
+        return SPOTIFY_OWNER_PREMIUM
+    if is_spotify_not_accessible(text):
+        return SPOTIFY_NOT_ACCESSIBLE
     if is_spotify_search_blocked(text):
         return f"{SPOTIFY_SEARCH_BLOCKED_TITLE}。{SPOTIFY_SEARCH_BLOCKED}"
     if _SPOTIFY_STREAMING_RE.search(text[:_CLASSIFY_MAX]):
@@ -1310,14 +1341,52 @@ def fold_text(text: str) -> str:
     return unicodedata.normalize("NFKC", _as_str(text)).casefold()
 
 
-def valid_playlist_name(name: str) -> bool:
-    """ローカルのプレイリスト名として使えるか (cliamp の safePath と同じ条件 + 予約名)。"""
+# cliamp の external/local は <ディレクトリ>/<名前>.toml を開くので、名前に ".toml" を足したものが
+# ファイル名の上限 (Linux の NAME_MAX、255 バイト) を超えると "open …: file name too long" で断られる
+PLAYLIST_NAME_MAX_BYTES = 255 - len(".toml")
+
+
+def playlist_name_problem(name: str) -> str:
+    """ローカルのプレイリスト名として使えない理由 (日本語の短い文)。使えれば ""。
+
+    cliamp の safePath と同じ条件 (空・"."・".."・"/" と "\\")、予約名 (履歴の仮想プレイリスト)、
+    ファイル名の長さ (名前 + ".toml" が 255 バイトまで)。前後の空白は除いて見る。"""
     if not isinstance(name, str):
-        return False
+        return "名前を入れてください"
     name = name.strip()
-    if not name or name in (".", "..") or name == RECENTLY_PLAYED:
-        return False
-    return not any(ch in name for ch in "/\\")
+    if not name:
+        return "名前を入れてください"
+    if name in (".", ".."):
+        return "この名前は使えません"
+    if name == RECENTLY_PLAYED:
+        return "この名前は cliamp が履歴に使っています"
+    if any(ch in name for ch in "/\\"):
+        return "この名前は使えません (「/」と「\\」は入れられません)"
+    try:
+        size = len(name.encode("utf-8"))
+    except UnicodeEncodeError:  # 対になっていないサロゲート (cliamp へ送れない)
+        return "この名前は使えません"
+    if size > PLAYLIST_NAME_MAX_BYTES:
+        return "名前が長すぎます (日本語ならおよそ 80 文字まで)"
+    return ""
+
+
+def valid_playlist_name(name: str) -> bool:
+    """ローカルのプレイリスト名として使えるか (playlist_name_problem が空か)。"""
+    return not playlist_name_problem(name)
+
+
+def fit_playlist_name(name: str, suffix: str = "") -> str:
+    """name + suffix がプレイリスト名の長さの上限 (PLAYLIST_NAME_MAX_BYTES) に収まるよう、name を文字の
+    切れ目で縮める (縮めたら末尾に「…」)。収まっていればそのまま。"""
+    limit = PLAYLIST_NAME_MAX_BYTES - len(suffix.encode("utf-8", "replace"))
+    data = name.encode("utf-8", "replace")
+    if len(data) <= limit:
+        return name + suffix
+    ellipsis = "…"
+    room = max(0, limit - len(ellipsis.encode("utf-8")))
+    cut = data[:room].decode("utf-8", "ignore").rstrip()
+    return cut + ellipsis + suffix
 
 
 def _parse_iso(iso: str) -> datetime | None:

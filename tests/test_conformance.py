@@ -836,6 +836,20 @@ class _Conformance(_Calls):
         self.ok("playlist_delete", name=name)
         self.assertEqual(back, [{"path": station["path"], "title": "Station", "stream": True}])
 
+    def test_playlist_add_keeps_bridged_spotify_tracks_without_meta(self):
+        """「Spotify から取り込む」の曲 (YouTube で探して鳴らす形) もローカルのプレイリストに足せる。
+        TOML に残るのは path・title・artist・album・duration だけで meta は落ち、path が yt-dlp の検索式なので
+        読み戻すと stream が立つ (GUI は落ちた Spotify の曲 ID を自分の表で付け直す)。"""
+        name = self._scratch()
+        bridged = {"path": "ytsearch1:Queen David Bowie Under Pressure", "title": "Under Pressure",
+                   "artist": "Queen, David Bowie", "album": "Hot Space", "duration": 248,
+                   "meta": {"spotify.id": "2aoo2jlRnM3A0NyLQqMN2f", "spotify.bridge": "youtube"}}
+        self.ok("playlist_add", name=name, tracks=[bridged])
+        back = self.ok("tracks", provider="local", id=name)["tracks"]
+        self.ok("playlist_delete", name=name)
+        self.assertEqual(back, [{"path": bridged["path"], "title": "Under Pressure", "artist": "Queen, David Bowie",
+                                 "album": "Hot Space", "duration": 248, "stream": True}])
+
     def test_playlist_edit_errors(self):
         tracks = self.library(1)
         self.assertEqual(self.err("playlist_add", tracks=tracks), "playlist_add requires a name")
@@ -849,6 +863,17 @@ class _Conformance(_Calls):
                          "playlist_remove_track requires a name and an index")
         self.assertEqual(self.err("playlist_remove_track", name="ドライブ", index=99),
                          "track index 99 out of range")
+
+    def test_playlist_add_name_too_long(self):
+        """名前 + ".toml" が NAME_MAX (255 バイト) を超えると、external/local の os.OpenFile が
+        ENAMETOOLONG で断る (GUI は名前を 250 バイトまでに抑える: protocol.PLAYLIST_NAME_MAX_BYTES)。"""
+        tracks = self.library(1)
+        error = self.err("playlist_add", name="夏" * 84, tracks=tracks)  # 252 + 5 = 257 バイト
+        self.assertTrue(error.startswith("open ") and error.endswith(".toml: file name too long"), error)
+        name = "夏" * 83  # 249 + 5 = 254 バイト
+        self.call("playlist_delete", name=name)
+        self.ok("playlist_add", name=name, tracks=tracks)
+        self.ok("playlist_delete", name=name)
 
     def test_large_request_over_64k(self):
         """要求 1 行 64 KiB 超 (8 MiB まで) を受け付ける。プレイリストへの追加で確かめる。"""

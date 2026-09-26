@@ -19,6 +19,9 @@ macOS 27 の「ミュージック」風に操作する GTK4 + libadwaita のア�
 - **サイドバー**: 検索・ホーム・ラジオ、ライブラリ (最近再生した項目・再生中のリスト)、
   プレイリスト (cliamp のローカルのプレイリストと、Spotify など cliamp に登録された
   プロバイダーのもの)。窓の端まで続く macOS 27 の形で、記号は赤。
+- **Spotify から取り込む**: Spotify の公開プレイリスト・アルバムのリンクを貼ると、ローカルの
+  プレイリストとして取り込み、曲は YouTube で探して鳴らす (Spotify の無料プランでも使える。
+  [下](#spotify-から取り込む-公開プレイリストアルバム))。
 - **再生バー**: 画面の下に浮かぶガラスのカプセル。シャッフル・前へ・再生・次へ・
   リピート、アートワークと曲名、ドラッグでシークできる細い線、再生速度・イコライザ・
   リンクのコピー、歌詞と次に再生のパネル、出力先 (cliamp の `device`)、音量。
@@ -169,26 +172,83 @@ macOS の Command は Ctrl に置き換えてある。
 ## Spotify (無料プラン)
 
 cliamp の Spotify は、曲そのものを librespot (Spotify の再生の仕組み) で受けて鳴らすので、
-Spotify から直接鳴らせるのは Premium の利用者だけ。無料プランでもプレイリストを使えるように、
-パッチは Spotify の接続を 2 つの形で扱う。
+Spotify から直接鳴らせるのは Premium の利用者だけ。さらに 2026 年 9 月の時点で、Spotify の
+Web API は **開発者アプリ (client_id) の持ち主が Premium でないと、どの呼び出しにも 403
+"Active premium subscription required for the owner of the app" を返す**。無料プランの
+アカウントで自分の client_id を作っても、プレイリスト・保存した曲・検索のどれも読めない
+(`client_id` を書かないときの cliamp の組み込みの共有の client_id は、世界中で共有されているため
+回数の制限にかかり、24 時間待てと言われる)。無料プランで Spotify のプレイリストを使うには、
+下の「Spotify から取り込む」を使う。
+
+アプリはこの 403 を英語のまま出さず、「Spotify の開発者アプリの持ち主が Premium でないため、
+Spotify のライブラリは読めません。公開プレイリストは「Spotify から取り込む」で使えます」と
+言い換える (すべてのプレイリストの Spotify の節、検索の「Spotify」の範囲 (「Spotify では検索できません」と
+「YouTube で検索」「Spotify から取り込む…」のボタン)、Spotify のプレイリストの詳細)。サイドバーには Spotify のプレイリストの代わりに「Spotify から取り込む…」の行を 1 つ出す。
+一度この答えを受けたら 10 分は Spotify に頼み直さない (打ちながらの検索が 403 を受け続けない。
+Ctrl+R と cliamp への繋ぎ直しで頼み直す)。
+
+### Spotify から取り込む (公開プレイリスト・アルバム)
+
+![Spotify から取り込む](docs/screenshots/spotify-import.png)
+
+Spotify の Web API を通さず、ログインの要らない埋め込み用の頁
+(`https://open.spotify.com/embed/playlist/<id>`、`/embed/album/<id>`) から曲の一覧を読み、
+cliamp の **ローカルのプレイリスト** として保存する。曲は下の「Web API だけ」の接続と同じ形
+(`ytsearch1:<アーティスト> <曲名>`) で、**YouTube で探して鳴らす** (最初に見つかった動画を鳴らすので、
+ライブ版やカバーが当たることもある)。
+
+- 開き方: すべてのプレイリストの右上の「Spotify から取り込む…」、サイドバーの「プレイリスト」の
+  見出しか行の右クリック、ローカルのプレイリストが無いときのボタン。Spotify のアプリの「共有」→
+  「リンクをコピー」で出る `https://open.spotify.com/playlist/…` (`?si=…` 付き・`/intl-ja/` 付きも、
+  `spotify:playlist:…` も可) を貼ると、その場で読んで名前・作り手・曲数を見せ、プレイリストの名前に
+  Spotify の名前を入れる (手で打つときは、打ち終えて手を止めてから確かめる。繋がらなかったときは
+  「もう一度読む」か Enter)。同じ名前のローカルのプレイリストがあれば「置き換える / 別の名前にする」を
+  尋ねる。取り込んだら「「名前」を取り込みました (N 曲)」と出て、そのプレイリストを開く。
+  プレイリストの名前はファイル名になるので、長すぎる名前 (日本語でおよそ 80 文字を超えるもの) は
+  使えない (Spotify の名前が長ければ縮めて入れる)。
+- 取り込んだプレイリストの詳細には「Spotify から取り込み · 曲は YouTube で探して再生します」と
+  書き添え、「…」の「Spotify から更新」で読み直して曲を置き換える (名前はそのまま)。置き換える前に
+  「「名前」の N 曲を、Spotify の〜の M 曲に置き換えます」と確かめる (自分で足した曲が混じっていれば、
+  それが外れることも言う。Spotify と同じならそのまま)。GUI を閉じている間に TUI で消して同じ名前で
+  作り直したプレイリストは、取り込んだものとして扱わない (更新もしない)。
+- 置き換え (「置き換える」「Spotify から更新」) は cliamp に置き換えの命令が無いので、前の曲を消してから
+  足す。足せなければ前の曲を戻す。戻すこともできなかったとき (cliamp が止まった・ディスクが一杯) は、
+  前の曲の一覧を `~/.local/state/cliamp-music/playlist-backups/` に残し、窓で「もう一度戻す」を出す。
+  「Spotify で開く」は元のプレイリストの頁。曲の絵・「リンクをコピー」・「Spotify で開く」は
+  Spotify の曲のもの (ローカルのプレイリストの TOML には meta が残らないので、取り込んだ曲の
+  Spotify の曲 ID はアプリが `~/.local/state/cliamp-music/spotify-imports.json` に覚えておく。
+  TUI から鳴らしても、再生バー・次に再生・履歴の絵は Spotify の曲のもの)。
+- 制限:
+  - 読めるのは **公開** のプレイリストとアルバムだけ。非公開のプレイリストと「お気に入りの曲」
+    (Liked Songs) は Spotify の外からは読めない (公開のプレイリストに入れてから取り込む)。
+  - 埋め込みの頁は **100 曲まで** しか載せない。それより長いものは最初の 100 曲を取り込み、
+    「Spotify の公開ページは 100 曲までです。最初の 100 曲を取り込みました」と知らせる
+    (全体の曲数は通常の頁から読んで添える)。
+  - 取り込んだ後の Spotify での変更は、「Spotify から更新」するまで入らない。
+  - 公開の頁の形は Spotify の都合で変わりうる。変わったら「Spotify の頁の形が変わったため読めません」
+    と出る (アプリの更新が要る)。
+
+### Premium の開発者アプリ (Web API)
+
+開発者アプリの持ち主が Premium なら、今までどおり自分の client_id で cliamp の Spotify を使う
+(Premium のアカウントならこれが普通の使い方)。パッチは Spotify の接続を 2 つの形で扱う。
 
 - **Premium** (librespot のセッションが作れる): 今までどおり。曲は Spotify から直接鳴り、
   `spotify_credentials.json` の形も変わらない。
 - **Web API だけ**: サインイン (OAuth) は済んだが、Spotify が librespot のセッションを断った
   とき (自分で登録した client_id のトークンに `login5` が `INVALID_CREDENTIALS` を返す、
-  無料プランにアクセスポイントが Premium を求める、など。一時的なネットワークの失敗は含まない)。cliamp はトークンを捨てずに Web API だけを使い、
-  プレイリストと保存した曲 (Your Music) の一覧は Spotify から取る。曲は **YouTube で探して
-  鳴らす** (Spotify の曲名とアーティストで yt-dlp の `ytsearch1:` を引き、最初に見つかった動画を
-  鳴らす。ライブ版やカバーが当たることもある)。曲名・アルバム・長さ・アートワークは Spotify の
+  無料プランのアカウントにアクセスポイントが Premium を求める、など。一時的なネットワークの失敗は
+  含まない)。cliamp はトークンを捨てずに Web API だけを使い、プレイリストと保存した曲 (Your Music)
+  の一覧は Spotify から取る。曲は **YouTube で探して鳴らす** (Spotify の曲名とアーティストで yt-dlp の
+  `ytsearch1:` を引き、最初に見つかった動画を鳴らす)。曲名・アルバム・長さ・アートワークは Spotify の
   もので、「リンクをコピー」も Spotify の曲を指す。アプリのプレイリストの詳細とすべての
   プレイリストの Spotify の節には「曲は YouTube で探して再生します」と出る。リフレッシュ
   トークンは Web API だけの印と一緒に `spotify_credentials.json` に残るので、次からはブラウザを
   開かずに繋がる (librespot は試し直さないので、Premium にしたら `cliamp spotify reset` して
   サインインし直す)。
 
-無料プランでも、Spotify が librespot のセッションを断らなかったとき (組み込みの共有の
-client_id で起きた) は Web API だけの接続にならず、曲は Spotify から鳴らそうとして失敗する。
-無料プランでは下のとおり自分の client_id を使う。
+Spotify が librespot のセッションを断らなかったとき (組み込みの共有の client_id で起きた) は
+Web API だけの接続にならず、曲は Spotify から鳴らそうとして失敗する。
 
 使い方: [cliamp の説明](https://github.com/bjarneo/cliamp/blob/main/docs/spotify.md) のとおり
 [Spotify for Developers](https://developer.spotify.com/dashboard) でアプリを作り (開発モードで
@@ -199,8 +259,7 @@ client_id で起きた) は Web API だけの接続にならず、曲は Spotify
 - **検索**: 開発モードのアプリからの `/v1/search` は Spotify が止めている (400 "Invalid limit")。
   検索の「Spotify」の範囲では英語の誤りの代わりに「Spotify では検索できません」と出し、
   「YouTube で検索」のボタンで YouTube の範囲に替えて探し直せる。プレイリストと保存した曲は
-  そのまま使える。`client_id` を書かないときの cliamp の組み込みの共有の client_id は、世界中で
-  共有されているため回数の制限 (1 日待てと言われることもある) にかかりやすい。
+  そのまま使える。
 - **回数の制限**: Spotify の Web API に待つよう言われたとき (429 の Retry-After)、cliamp は短い
   待ち (30 秒まで) だけ待ってやり直し、それより長ければ待たずに失敗を返す (何時間も止まった
   ままにならない)。アプリは「Spotify から回数の制限を受けています。24 時間ほど待ってから、

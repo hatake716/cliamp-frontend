@@ -192,6 +192,11 @@ window.music list.music-sidebar-list > row.music-sidebar-row:selected label.musi
   font-weight: 700;
 }
 
+/* 窓を出すだけの行 (「Spotify から取り込む…」)。ページの行より控えめに */
+window.music list.music-sidebar-list > row.music-sidebar-row.music-sidebar-action label.music-sidebar-label {
+  color: var(--m-secondary);
+}
+
 /* 節の見出し「ライブラリ」「プレイリスト」 (11px/600) */
 window.music list.music-sidebar-list label.music-sidebar-section {
   margin: 14px 18px 5px 20px;

@@ -283,7 +283,7 @@ TrackInfo の `path` のまま) を付けると、cliamp はその曲か確か�
 | `load_provider` | `provider`, `id`, `index`, `name` | `total`, `gen` (`tracks` の結果で `replace` する。`source` は `{provider, id, name}`。`index` が範囲外なら何も替えずに `index out of range`)。プロバイダーに取り直させて添字で選ぶので、GUI は見えている並びがあるときは `replace` で送る (見た後でリストが変わっていても、見た曲を鳴らすため) |
 | `lyrics` | `artist`, `title` | `lyrics`, `synced` / `error: "not found"` |
 | `history` | `limit` (既定 50) | `tracks` (新しい順、`played_at` 付き) |
-| `playlist_add` | `name`, `tracks` | `{ok}` (ローカルのプレイリスト `~/.config/cliamp/playlists/<name>.toml` に追加。無ければ作る。TOML に残る欄は上の「型」を参照) |
+| `playlist_add` | `name`, `tracks` | `{ok}` (ローカルのプレイリスト `~/.config/cliamp/playlists/<name>.toml` に追加。無ければ作る。TOML に残る欄は上の「型」を参照。`<name>.toml` が 255 バイト (NAME_MAX) を超える名前は `open …/<name>.toml: file name too long`。GUI は名前 250 バイトまでに抑える) |
 | `playlist_delete` | `name` | `{ok}` (無ければ `remove …/<name>.toml: no such file or directory`) |
 | `playlist_remove_track` | `name`, `index`, `path` | `{ok}` (`path` は上の「添字の確かめ」)。**最後の曲を外すと、プレイリストのファイルごと消える** (external/local の RemoveTrack)。その後の `tracks` は `open …/<name>.toml: no such file or directory`、`playlists` にも出ない |
 
@@ -345,6 +345,15 @@ cliamp の Spotify は、サインインで得た OAuth のトークンから go
   (`spotify: search blocked — …`)。GUI は YouTube の検索を勧めてよい。
 - `spotify:track:` の曲は鳴らせない (上の「再生の失敗」の `spotify: streaming unavailable`)。
 
+開発者アプリ (client_id) の持ち主が Premium でないと、Spotify の Web API はどの呼び出しにも 403
+`{"error": {"status": 403, "message": "Active premium subscription required for the owner of the app"}}` を
+返す (2026-09 の実測。無料プランのアカウントで作ったアプリ)。cliamp は本文をそのまま包むので、`playlists` は
+`spotify: your music: http status 403 Forbidden: {…}`、`search` は `spotify: search: http status 403 Forbidden:
+{…}` になる。`tracks` は上流が 403 を含む誤りをどれも `spotify: playlist not accessible: only playlists you own
+or collaborate on can be loaded` に言い換えるので、本文は残らない。GUI は "Active premium subscription required
+for the owner of the app" を含む Spotify の誤りを日本語に言い直し、公開プレイリストの取り込み (下の「GUI 側の
+約束」) を勧める (偽の cliamp は `--spotify-owner-premium` でこの形を返す)。
+
 Web API の 429 (待ってほしい): `Retry-After` が 30 秒以下なら待って繰り返す (最大 8 回。
 `Retry-After` が無ければ 1, 2, 4 … 秒、30 秒で頭打ち)。30 秒を越える待ちを求められたら
 待たずに `spotify: rate limited by Spotify; retry after <長さ>` (Go の time.Duration の書き方、
@@ -386,3 +395,9 @@ daemon の `seek_to` もすぐ答え、シークしている間の `status` の 
 - TUI では `play` は停止中に何もしない。停止中の再生は `toggle` を送る。
 - GUI は MPRIS の名前を取らない (Open-Voice が MPRIS のプレイヤー数を前提に
   一時停止と再開をしているため)。
+- 「Spotify から取り込む」(GUI だけの機能。パッチは関わらない): GUI は Spotify の公開の埋め込み用の頁から
+  プレイリスト・アルバムの曲を読み、Web API だけの接続と同じ橋渡しの形 (`ytsearch1:…`、meta の `spotify.id` と
+  `spotify.bridge`) で `playlist_add` する。ローカルのプレイリストの TOML には meta が残らないので、GUI は
+  橋渡しの path → Spotify の曲 ID の表を自分で持ち、読み戻した曲 (`tracks`・`playlist`・`status`・`history`) に
+  meta を付け直して扱う。置き換え (「Spotify から更新」) は `playlist_delete` のあと `playlist_add` (cliamp に
+  置き換えの命令は無い。足せなければ前の曲を `playlist_add` で戻し、戻せなければ GUI の状態のディレクトリに控える)。

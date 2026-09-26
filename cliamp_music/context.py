@@ -34,6 +34,7 @@ from .protocol import (  # noqa: E402
     valid_playlist_name,
 )
 from .radio import RadioBrowser  # noqa: E402
+from .spotify_import import ImportIndex, default_index_path  # noqa: E402
 from .state import GuiState  # noqa: E402
 from .store import PlayerStore  # noqa: E402
 
@@ -62,6 +63,11 @@ class AppContext(GObject.Object):
     変わった。Spotify の Web API だけの接続は、cliamp がセッションを作った後の providers の答えに
     しか playback が載らないので、カタログがカタログ系の初めての成功の後で取り直した答えで
     変わる (すべてのプレイリストの Spotify の節の書き添えなどに使う)。
+
+    imports (spotify_import.ImportIndex) は Spotify から取り込んだローカルのプレイリストの記録と、橋渡しの
+    path → Spotify の曲 ID の表 (state.json と同じディレクトリの spotify-imports.json)。カタログと store の
+    track_hook に差し、ローカルの TOML や履歴で meta を失った取り込んだ曲に Spotify の曲 ID を付け直す
+    (アートワーク・リンク・track_key が cliamp の Web API だけの Spotify の曲と同じに働く)。
     """
 
     __gtype_name__ = "CliampMusicAppContext"
@@ -73,7 +79,7 @@ class AppContext(GObject.Object):
     def __init__(self, app: Any = None, *, window: Any = None, client: CliampClient | None = None,
                  store: PlayerStore | None = None, catalog: Catalog | None = None,
                  artwork: ArtworkLoader | None = None, radio: RadioBrowser | None = None,
-                 state: GuiState | None = None):
+                 state: GuiState | None = None, imports: ImportIndex | None = None):
         super().__init__()
         self.app = app
         self.window = window
@@ -83,6 +89,15 @@ class AppContext(GObject.Object):
         self.artwork = artwork or ArtworkLoader()
         self.radio = radio or RadioBrowser()
         self.state = state or GuiState()
+        # 取り込んだ Spotify のプレイリストの記録 (ファイルは初めて使うときに読む)
+        self.imports = imports or ImportIndex(default_index_path(getattr(self.state, "path", None)))
+        if hasattr(self.catalog, "track_hook"):
+            self.catalog.track_hook = self.imports.restore_all
+        if hasattr(self.store, "track_hook"):
+            self.store.track_hook = self.imports.restore
+        # 取り込み・更新の最中のローカルのプレイリスト名と、最後に出した取り込みの窓 (試験・撮影が見る)
+        self.spotify_imports_busy: set[str] = set()
+        self.spotify_import_dialog = None
         self._local_playlists: list[str] = []
         self._local_playlists_loaded = False
         self._playlist_menus: deque[Gio.Menu] = deque(maxlen=32)
@@ -230,6 +245,11 @@ class AppContext(GObject.Object):
                 return
             names = [info.name for info in result if info.id != RECENTLY_PLAYED]
             self._local_playlists_loaded = True
+            try:
+                # TUI で消した・名前を変えた取り込みの記録を忘れる (取り込んだばかりのものは残す)
+                self.imports.prune(names)
+            except Exception as exc:  # 記録は飾り。失敗しても一覧は使う
+                log(f"取り込みの記録を整理できません: {exc}")
             if names != self._local_playlists:
                 self._local_playlists = names
                 for menu in list(self._playlist_menus):
@@ -288,6 +308,47 @@ class AppContext(GObject.Object):
         dialog.connect("response", on_response)
         parent = self.window if isinstance(self.window, Gtk.Widget) else None
         dialog.present(parent)
+
+    # --- Spotify から取り込む -----------------------------------------------------------
+
+    def open_spotify_import(self, url: str = ""):
+        """「Spotify から取り込む」の窓を出す (url を渡すとすぐ読む)。出した窓を返す。"""
+        from .importer import open_dialog
+
+        return open_dialog(self, url)
+
+    def update_spotify_import(self, name: str, callback=None) -> bool:
+        """取り込んだプレイリスト name を、取り込んだときのリンクから読み直して置き換える
+        (「Spotify から更新」)。始めたら True。callback(できたか)。"""
+        from .importer import update_import
+
+        return update_import(self, name, callback)
+
+    def import_record(self, name: str):
+        """ローカルのプレイリスト name を Spotify から取り込んだ記録 (無ければ None)。"""
+        try:
+            return self.imports.get(name)
+        except Exception as exc:  # 記録は飾り
+            log(f"取り込みの記録を読めません: {exc}")
+            return None
+
+    def imported_record(self, name: str, tracks):
+        """いまの曲 tracks から見て、ローカルのプレイリスト name が Spotify から取り込んだもののままなら、
+        その記録 (無ければ None)。記録は名前だけで引くので、中身が別物になっていれば (TUI で消して同じ名前で
+        作り直したなど) 記録を忘れる (ImportIndex.confirm)。取り込んだものとしての見せ方 (書き添え・
+        「Spotify ·」・Spotify の絵・「Spotify から更新」) はこれで決める。"""
+        try:
+            return self.imports.confirm(name, tracks)
+        except Exception as exc:  # 記録は飾り
+            log(f"取り込みの記録を確かめられません: {exc}")
+            return None
+
+    def forget_import(self, name: str) -> None:
+        """ローカルのプレイリスト name を消したので、取り込みの記録も忘れる。"""
+        try:
+            self.imports.forget(name)
+        except Exception as exc:
+            log(f"取り込みの記録を消せません: {exc}")
 
     # --- 窓の外とのやりとり ----------------------------------------------------------------
 
@@ -394,7 +455,9 @@ class AppContext(GObject.Object):
         if url:
             links = Gio.Menu()
             links.append("リンクをコピー", "track.copy-link")
-            links.append("ブラウザで開く", "track.open-browser")
+            # Spotify の曲 (YouTube で探して鳴らす曲・取り込んだ曲も) は Spotify の頁を開く
+            links.append("Spotify で開く" if url.startswith("https://open.spotify.com/") else "ブラウザで開く",
+                         "track.open-browser")
             menu.append_section(None, links)
             action("copy-link", lambda _v: self.copy_text(url))
             action("open-browser", lambda _v: self.open_uri(url))

@@ -32,7 +32,12 @@ equalizer, stress, playback-error, playback-error-fullscreen, playback-error-min
 collapsed-sidebar,
 panel-over, disconnected, reconnected, legacy, legacy-playlists, legacy-search,
 playlist-web-only, playlists-web-only, search-spotify-blocked (Spotify の接続が Web API だけの
-cliamp。偽を --spotify-web-only で起こし直す)。
+cliamp。偽を --spotify-web-only で起こし直す)、
+import-dialog, import-dialog-error, import-dialog-network, import-dialog-ready, imported-playlist,
+import-update-confirm, imported-playlists (「Spotify から取り込む」。Spotify の公開頁は
+tests/spotify_fixtures.py の架空のもので答える。窓はどの状態でもリンクの欄が動かないことも確かめる)、
+playlists-owner-premium, search-spotify-owner-premium (Spotify の開発者アプリの持ち主が Premium でない
+cliamp。偽を --spotify-owner-premium で起こし直す)。
 """
 
 from __future__ import annotations
@@ -68,7 +73,9 @@ FRAMED = ("home", "search", "search-results", "radio", "recent", "playlists", "p
           "nowplaying", "lyrics", "queue", "fullscreen-lyrics", "fullscreen-queue", "stress",
           "narrow", "collapsed-sidebar", "panel-over", "disconnected", "legacy", "mini-square", "mini-compact",
           "equalizer", "playback-error", "playback-error-fullscreen", "playback-error-mini",
-          "playlist-web-only", "search-spotify-blocked")
+          "playlist-web-only", "search-spotify-blocked", "import-dialog", "import-dialog-error",
+          "import-dialog-network", "import-dialog-ready", "imported-playlist", "import-update-confirm",
+          "imported-playlists", "playlists-owner-premium", "search-spotify-owner-premium")
 
 LONG_TITLE = "夜明け前のプラットホームで君を待つ & <特別版> — とても長い日本語の曲名が再生バーに入りきらないとき"
 LONG_ARTIST = "青い灯台 & <Friends> feat. 真夜中ポスト"
@@ -452,6 +459,7 @@ def install_network_guard(problems: list[str], art_dir: Path) -> None:
     無いものとして 404 を返す (実際にも無い動画が多い)。"""
     import hashlib
     import io
+    import json
     import re
     import socket
     import urllib.error
@@ -459,7 +467,12 @@ def install_network_guard(problems: list[str], art_dir: Path) -> None:
     from cliamp_music import artwork, radio
 
     thumbs = sorted(p for p in art_dir.glob("*.png") if int(p.stem.split("-")[-1]) % 3 == 1)
+    squares = sorted(p for p in art_dir.glob("*.png") if int(p.stem.split("-")[-1]) % 3 != 1)
     youtube = re.compile(r"^https://i\.ytimg\.com/vi/([A-Za-z0-9_-]{11})/(hq|sd)default\.jpg$")
+    # Spotify の曲の絵 (oEmbed の thumbnail_url) とプレイリストの絵。取り込んだ曲は oEmbed で絵を探す
+    oembed = re.compile(r"^https://open\.spotify\.com/oembed\?url=https://open\.spotify\.com/track/"
+                        r"([A-Za-z0-9]{22})$")
+    spotify_image = re.compile(r"^https://(?:i\.scdn\.co|image-cdn-ak\.spotifycdn\.com)/image/([A-Za-z0-9-]+)$")
 
     original_connect = socket.socket.connect
     original_connect_ex = socket.socket.connect_ex
@@ -488,6 +501,14 @@ def install_network_guard(problems: list[str], art_dir: Path) -> None:
 
     def artwork_urlopen(request, timeout=None):
         url = str(getattr(request, "full_url", request))
+        spotify = oembed.match(url)
+        if spotify is not None:
+            body = json.dumps({"thumbnail_url": f"https://i.scdn.co/image/shoot{spotify.group(1)}"})
+            return io.BytesIO(body.encode())
+        image = spotify_image.match(url)
+        if image is not None and squares:
+            index = int(hashlib.sha1(image.group(1).encode()).hexdigest(), 16) % len(squares)
+            return io.BytesIO(squares[index].read_bytes())
         match = youtube.match(url)
         if match is None or not thumbs:
             return no_urlopen(request, timeout)
@@ -498,6 +519,52 @@ def install_network_guard(problems: list[str], art_dir: Path) -> None:
 
     artwork.urlopen = artwork_urlopen
     radio.urlopen = no_urlopen
+
+
+# 「Spotify から取り込む」で使う架空の公開プレイリスト (100 曲で切れ、全体は 150 曲) と、無いプレイリスト
+SHOOT_PLAYLIST = "37i9dQZF1DXshootNight1"
+SHOOT_MISSING = "0000shootMissing000000"
+SHOOT_OFFLINE = "0000shootOffline000000"  # ネットワークに繋がらない (「もう一度読む」)
+SHOOT_PLAYLIST_NAME = "深夜のドライブ・ミックス"
+
+
+def install_spotify_fixtures(problems: list[str]):
+    """Spotify の公開頁 (埋め込みの頁と曲数の頁) を tests/spotify_fixtures.py の架空の頁で答える
+    (spotify_import.urlopen を差し替える。知らない URL は失敗として記録する)。曲は偽の cliamp の
+    架空の曲名で、100 曲を超える分は Live / Acoustic などの版にする。返す FakeWeb の pages を
+    替えると、Spotify で変わったことにできる (「Spotify から更新」)。"""
+    sys.path.insert(0, str(ROOT / "tests"))
+    import spotify_fixtures as fx
+    from fake_cliamp import LIBRARY
+
+    from cliamp_music import spotify_import
+
+    variants = ("", " (Live)", " (Acoustic)", " (Remix)")
+    items = []
+    for i in range(spotify_import.EMBED_TRACK_CAP):
+        title, artist, _album, secs, *_rest = LIBRARY[i % len(LIBRARY)]
+        version = variants[(i // len(LIBRARY)) % len(variants)]
+        artists = ["Aurora Lane", "Mira Okafor"] if title == "Glass Harbor" else [artist]
+        items.append(fx.track_item(title + version, artists, secs * 1000 + 417, f"shoot|{i}"))
+    web = fx.FakeWeb({
+        fx.embed_url("playlist", SHOOT_PLAYLIST): fx.embed_page(id=SHOOT_PLAYLIST, name=SHOOT_PLAYLIST_NAME,
+                                                                subtitle="Spotify", items=items),
+        fx.page_url("playlist", SHOOT_PLAYLIST): fx.count_page(150, owner="Spotify"),
+        fx.embed_url("playlist", SHOOT_MISSING): fx.missing_page(404),
+        fx.embed_url("playlist", SHOOT_OFFLINE): OSError("撮影: 繋がらない"),
+    })
+    # Spotify で 3 曲を外した後の頁 (「Spotify から更新」の確かめ)
+    web.updated = fx.embed_page(id=SHOOT_PLAYLIST, name=SHOOT_PLAYLIST_NAME, subtitle="Spotify", items=items[3:])
+
+    def urlopen(request, timeout=None):
+        url = request.full_url
+        if url not in web.pages:
+            problems.append(f"知らない Spotify の頁を読もうとしました: {url}")
+        time.sleep(0.25)  # 読み込み中の表示が一瞬出る程度
+        return web(request, timeout)
+
+    spotify_import.urlopen = urlopen
+    return web
 
 
 def install_radio_fixtures(favicon_dir: Path) -> None:
@@ -571,7 +638,14 @@ def child_main(args: argparse.Namespace) -> int:
 
     from cliamp_music import app as app_module
     from cliamp_music.pages.home import WEB_ONLY_NOTE, provider_playback
-    from cliamp_music.protocol import SPOTIFY_SEARCH_BLOCKED_TITLE, Track, is_youtube_bridge
+    from cliamp_music.pages.playlists import IMPORTED_NOTE
+    from cliamp_music.protocol import (
+        SPOTIFY_OWNER_PREMIUM,
+        SPOTIFY_SEARCH_BLOCKED_TITLE,
+        Track,
+        is_youtube_bridge,
+    )
+    from cliamp_music.sidebar import IMPORT_ACTION
 
     out = Path(args.out)
     work = Path(args.work)
@@ -580,6 +654,7 @@ def child_main(args: argparse.Namespace) -> int:
     problems: list[str] = []
     install_network_guard(problems, art_dir)
     install_radio_fixtures(work / "favicons")
+    spotify_web = install_spotify_fixtures(problems)
     fake = FakeProcess(sock, art_dir)
     fake.start()
     shots: list[str] = []
@@ -1132,10 +1207,147 @@ def child_main(args: argparse.Namespace) -> int:
                     "「YouTube で検索」で YouTube の結果が出ない")
         yield from restart_fake()
 
+    def scene_spotify_import():
+        """「Spotify から取り込む」: 空の窓・読めない・読めた (名前入り・100 曲で切れる知らせ)、取り込んだ
+        プレイリストの頁とすべてのプレイリスト。"""
+        window = win()
+        resize(1180)
+        window.navigate("playlists")
+        yield Until(lambda: page_id() == "playlists" and "local" in page().sections, 10, "すべてのプレイリストが開かない")
+        playlists = page()
+        check(playlists.import_button.get_mapped(), "ヘッダーに「Spotify から取り込む」がありません")
+        yield 0.6
+        playlists.import_button.emit("clicked")
+        yield Until(lambda: ctx().spotify_import_dialog is not None and ctx().spotify_import_dialog.get_mapped(), 5,
+                    "取り込みの窓が出ない")
+        dialog = ctx().spotify_import_dialog
+        check(window.get_focus() is not None and window.get_focus().get_ancestor(Gtk.Entry) is dialog.url_entry,
+              "取り込みの窓のリンクの欄にフォーカスがありません")
+        yield 0.8
+        # 窓は縦の真ん中に置かれる。中身の高さが状態で変わると、リンクの欄が上下に動く
+        entry_at: dict[str, float] = {}
+
+        def note_entry(state: str) -> None:
+            ok, point = dialog.url_entry.compute_point(window, Graphene.Point().init(0, 0))
+            check(ok, "リンクの欄の場所が分かりません")
+            entry_at[state] = round(point.y, 1)
+
+        note_entry("empty")
+        capture(window, "import-dialog")
+        dialog.url_entry.set_text(f"https://open.spotify.com/playlist/{SHOOT_MISSING}")
+        yield Until(lambda: dialog.state == "loading", 5, "読み込み中にならない")
+        yield 0.1
+        note_entry("loading")
+        yield Until(lambda: dialog.state == "error", 5, "無いプレイリストの誤りが出ない")
+        check("非公開" in dialog.problem, f"無いときの説明が違います ({dialog.problem!r})")
+        check(not dialog.retry_button.get_visible(), "無いプレイリストに「もう一度読む」を出しています")
+        yield 0.5
+        note_entry("error")
+        capture(window, "import-dialog-error")
+        dialog.url_entry.set_text(f"https://open.spotify.com/playlist/{SHOOT_OFFLINE}")
+        yield Until(lambda: dialog.state == "error" and dialog.retry_button.get_visible(), 5,
+                    "繋がらないときの誤りが出ない")
+        check("ネットワーク" in dialog.problem, f"繋がらないときの説明が違います ({dialog.problem!r})")
+        window.set_focus(None)
+        yield 0.5
+        note_entry("network")
+        capture(window, "import-dialog-network")
+        dialog.url_entry.set_text(f"https://open.spotify.com/intl-ja/playlist/{SHOOT_PLAYLIST}?si=0a1b2c3d4e5f")
+        yield Until(lambda: dialog.state == "ready", 5, "公開プレイリストが読めない")
+        check(dialog.name_entry.get_text() == SHOOT_PLAYLIST_NAME, "名前が Spotify の名前になっていません")
+        check(dialog.preview_note.get_visible(), "100 曲で切れる知らせがありません")
+        check(dialog.get_response_enabled("import"), "「取り込む」が押せません")
+        window.set_focus(None)
+        yield 1.4
+        note_entry("ready")
+        check(len(set(entry_at.values())) == 1, f"状態でリンクの欄が動きます ({entry_at})")
+        capture(window, "import-dialog-ready")
+        # 「取り込む」(ボタンは応答を出してから窓を閉じる)
+        dialog.emit("response", "import")
+        dialog.force_close()
+        yield Until(lambda: page_id() == "playlist" and getattr(page(), "playlist_id", "") == SHOOT_PLAYLIST_NAME
+                    and len(page().tracks) == 100, 10, "取り込んだプレイリストが開かない")
+        detail = page()
+        yield Until(lambda: detail.header.note_label.get_visible(), 5, "取り込んだ書き添えが出ない")
+        check(detail.header.note_label.get_text().startswith("Spotify から取り込み"),
+              f"書き添えが違います ({detail.header.note_label.get_text()!r})")
+        check(detail.header.subtitle_label.get_text() == "Spotify", "提供元の行が Spotify の作り手になっていません")
+        check(all(is_youtube_bridge(t) for t in detail.tracks), "取り込んだ曲に Spotify の曲 ID が戻っていません")
+        check(selected() == f"playlist:local:{SHOOT_PLAYLIST_NAME}",
+              f"サイドバーが取り込んだプレイリストを選んでいません ({selected()})")
+        yield 1.8
+        capture(window, "imported-playlist")
+        check(IMPORTED_NOTE in detail.header.note_label.get_text() or "最初の 100 曲" in detail.header.note_label.get_text(),
+              "書き添えに取り込みのことがありません")
+        # 「Spotify から更新」は、読み直した曲を見せて確かめてから置き換える (ここでは取り消す)
+        embed = f"https://open.spotify.com/embed/playlist/{SHOOT_PLAYLIST}"
+        imported_page = spotify_web.pages[embed]
+        spotify_web.pages[embed] = spotify_web.updated
+        detail.update_from_spotify()
+        yield Until(lambda: ctx().spotify_import_dialog is not None
+                    and getattr(ctx().spotify_import_dialog, "has_response", lambda _r: False)("update"), 8,
+                    "「Spotify から更新」の確かめが出ない")
+        confirm = ctx().spotify_import_dialog
+        check(f"「{SHOOT_PLAYLIST_NAME}」の 100 曲を、Spotify のプレイリスト「{SHOOT_PLAYLIST_NAME}」の 97 曲に"
+              in confirm.get_body(), f"確かめの文が違います ({confirm.get_body()!r})")
+        window.set_focus(None)
+        yield 1.0
+        capture(window, "import-update-confirm")
+        confirm.emit("response", "cancel")
+        confirm.force_close()
+        spotify_web.pages[embed] = imported_page
+        yield Until(lambda: SHOOT_PLAYLIST_NAME not in ctx().spotify_imports_busy, 5, "取り込み中の印が外れない")
+        check(len(detail.tracks) == 100, "取り消したのに曲が変わりました")
+        # 取り込んだ曲から鳴らすと、再生バーも Spotify の曲の絵とリンク
+        detail.play_from(2)
+        yield Until(lambda: store().status.track is not None and is_youtube_bridge(store().status.track)
+                    and store().status.index == 2, 8, "取り込んだ曲が鳴らない")
+        window.navigate("playlists")
+        yield Until(lambda: page_id() == "playlists" and page().sections.get("local") is not None
+                    and page().sections["local"].keys and len(page().sections["local"].keys) == 3, 10,
+                    "すべてのプレイリストに取り込んだものが出ない")
+        yield 1.6
+        capture(window, "imported-playlists")
+
+    def scene_owner_premium():
+        """Spotify の開発者アプリの持ち主が Premium でない cliamp: 英語の 403 ではなく何が起きていて
+        何を使えばよいかを言い、取り込みへ導く (サイドバーには取り込みの行)。"""
+        window = win()
+        yield from restart_fake("--spotify-owner-premium")
+        resize(1180)
+        window.navigate("playlists")
+        yield Until(lambda: page_id() == "playlists" and "spotify" in page().sections
+                    and page().sections["spotify"].note.get_visible(), 10, "Spotify の節に説明が出ない")
+        section = page().sections["spotify"]
+        check(section.note.get_text() == SPOTIFY_OWNER_PREMIUM, f"Spotify の節の説明が違います ({section.note.get_text()!r})")
+        check(section.action.get_visible(), "Spotify の節に「Spotify から取り込む…」がありません")
+        yield Until(lambda: any(r.page_id == IMPORT_ACTION for r in window.sidebar.rows()), 5,
+                    "サイドバーに取り込みの行が出ない")
+        check("Active premium" not in texts(page()), "Spotify の英語の文がそのまま出ています")
+        yield 1.2
+        capture(window, "playlists-owner-premium")
+        window.navigate("search")
+        yield Until(lambda: page_id() == "search", 5, "検索が開かない")
+        search = page()
+        yield Until(lambda: search.scopes.get_n_toggles() == 3, 10, "Spotify の範囲が出ない")
+        search.set_scope("spotify")
+        search.set_query("夜のドライブ")
+        yield Until(lambda: search.results.state == "empty", 10, "Spotify の検索の断りが出ない")
+        window.set_focus(None)
+        check(search.results.empty.title_label.get_text() == SPOTIFY_SEARCH_BLOCKED_TITLE,
+              f"検索の断りの題が違います ({search.results.empty.title_label.get_text()!r})")
+        secondary = search.results.empty.secondary
+        check(secondary is not None and secondary.get_visible(), "検索の断りに「Spotify から取り込む…」がありません")
+        yield 1.0
+        capture(window, "search-spotify-owner-premium")
+        search.set_scope("youtube")
+        yield from restart_fake()
+
     scenes = [scene_start, scene_home, scene_search, scene_search_results, scene_radio, scene_recent,
               scene_playlists, scene_playlist, scene_nowplaying, scene_lyrics, scene_queue,
               scene_fullscreen, scene_miniplayer, scene_equalizer, scene_stress, scene_playback_error,
-              scene_narrow, scene_disconnected, scene_legacy, scene_web_only]
+              scene_narrow, scene_disconnected, scene_legacy, scene_web_only, scene_spotify_import,
+              scene_owner_premium]
 
     def all_steps():
         for scene in scenes:

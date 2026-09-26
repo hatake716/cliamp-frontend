@@ -495,6 +495,7 @@ REQUIRED_MODULES = (
     "cliamp_music.widgets", "cliamp_music.window", "cliamp_music.sidebar", "cliamp_music.playerbar",
     "cliamp_music.panels", "cliamp_music.pages", "cliamp_music.app",
     "cliamp_music.fullscreen", "cliamp_music.miniplayer", "cliamp_music.equalizer",
+    "cliamp_music.spotify_import", "cliamp_music.importer",
 )
 
 

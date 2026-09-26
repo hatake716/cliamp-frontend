@@ -18,9 +18,21 @@ cliamp と、とても長いリストだけ `load_provider`。ローカルのプ
 プレイリストごと消すので、そのときはページを閉じる。曲を YouTube で探して鳴らすプレイリスト
 (プロバイダーの playback が "youtube" か、曲が YouTube で探す Spotify の曲) は、情報の行の
 下に「曲は YouTube で探して再生します」と控えめに書き添える。
+
+Spotify から取り込む: すべてのプレイリストのヘッダーの右にガラスのカプセル「Spotify から取り込む…」
+(狭い幅では記号だけ)。ローカルのプレイリストが 1 つも無いときと、Spotify の節が「開発者アプリの持ち主が
+Premium でない」で読めないとき (その説明を書く) は、節にも同じボタンを出す。取り込んだローカルの
+プレイリストの詳細は、提供元の行を Spotify での作り手 (アルバムならアーティスト)、絵を Spotify の絵にし、
+情報の行の下に「Spotify から取り込み · 曲は YouTube で探して再生します」と書き添え、「…」に
+「Spotify から更新」(読み直し、確かめてから置き換える)・「Spotify で開く」を足す。カードは副題を
+「Spotify · N 曲」、絵を Spotify の絵にする。取り込んだものかは記録 (名前で引く) だけでなく曲でも
+確かめる (AppContext.imported_record。TUI で消して同じ名前で作り直したものは別物として記録を忘れる)。
+Spotify のプレイリストの詳細が同じ理由で読めないときは、そのプレイリストを取り込むボタンを出す。
 """
 
 from __future__ import annotations
+
+import re
 
 import gi
 
@@ -31,13 +43,25 @@ from gi.repository import Adw, Gio, GObject, Gtk  # noqa: E402
 from ..protocol import (  # noqa: E402
     PLAYBACK_YOUTUBE,
     RECENTLY_PLAYED,
+    SPOTIFY_OWNER_PREMIUM,
     PlaylistInfo,
     Response,
     Source,
     Track,
+    is_spotify_not_accessible,
+    is_spotify_owner_premium_required,
     is_youtube_bridge,
 )
-from ..widgets import MediaCard, SectionHeader, TrackList, TrackRow, format_count  # noqa: E402
+from ..spotify_import import SpotifyRef  # noqa: E402
+from ..widgets import (  # noqa: E402
+    CapsuleButton,
+    GlassButton,
+    MediaCard,
+    SectionHeader,
+    TrackList,
+    TrackRow,
+    format_count,
+)
 from .home import (  # noqa: E402
     DETAIL_LIST_SIDE,
     OFFLINE_TEXT,
@@ -52,12 +76,14 @@ from .home import (  # noqa: E402
     DetailHeader,
     PageBase,
     _label,
+    imported_record,
     info_line,
     is_playing,
     provider_label,
     provider_playback,
     remember_provider_names,
     row_key,
+    set_local_playlist_art,
     set_playlist_art,
     shuffle_provider,
     total_duration,
@@ -69,6 +95,16 @@ CARD = 170
 LOCAL = "local"
 # これより長いリストは replace で送らず load_provider に任せる (要求 1 行は 8 MiB まで)
 REPLACE_MAX_TRACKS = 10000
+IMPORT_LABEL = "Spotify から取り込む…"
+_SPOTIFY_ID = re.compile(r"[A-Za-z0-9]{22}")
+IMPORTED_NOTE = "Spotify から取り込み · 曲は YouTube で探して再生します"
+
+
+def imported_note(record) -> str:
+    """取り込んだプレイリストの書き添え (公開ページの上限で切れていれば、そのことも)。"""
+    if record is not None and record.truncated and record.total > record.count:
+        return f"Spotify から取り込み (全 {record.total} 曲のうち最初の {record.count} 曲) · 曲は YouTube で探して再生します"
+    return IMPORTED_NOTE
 
 
 def auth_note(ctx, provider: str) -> str:
@@ -95,6 +131,15 @@ class _ProviderSection(Gtk.Box):
         page.inset(self.note)
         self.note.set_visible(False)
         self.append(self.note)
+        # 「Spotify から取り込む…」(ローカルが空のとき・Spotify のライブラリが読めないとき)
+        self.action = CapsuleButton(IMPORT_LABEL, "music-import-symbolic")
+        self.action.add_css_class("music-section-action")
+        self.action.set_halign(Gtk.Align.START)
+        self.action.connect("clicked", weak_call(page.open_import))
+        page.inset(self.action)
+        self.action.set_visible(False)
+        self.append(self.action)
+        self.offer_import = False
         self.groups = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         page.inset(self.groups)
         self.append(self.groups)
@@ -117,6 +162,10 @@ class PlaylistsPage(PageBase):
         super().__init__(ctx)
         self.add_css_class("music-playlists-page")
         self.add_large_title()
+        self.import_button = GlassButton(IMPORT_LABEL, "music-import-symbolic")
+        self.import_button.add_css_class("music-header-action")
+        self.import_button.connect("clicked", weak_call(self.open_import))
+        self.header_bar.pack_end(self.import_button)
         self.state = ContentStack("読み込み中…")
         self.sections: dict[str, _ProviderSection] = {}
         self.body.append(self.state)
@@ -131,6 +180,7 @@ class PlaylistsPage(PageBase):
 
     def load(self, force: bool = False) -> None:
         store = self.ctx.store
+        self._update_import_button()
         if not store.connected:
             self.state.show_empty("music-radio-symbolic", OFFLINE_TITLE, OFFLINE_TEXT)
             return
@@ -159,8 +209,22 @@ class PlaylistsPage(PageBase):
         self.ctx.catalog.providers(done, force=force)
 
     def _on_connection(self, *_args) -> None:
+        self._update_import_button()
         if self.ctx.store.connected:
             self.load(force=False)
+
+    def _update_import_button(self) -> None:
+        store = self.ctx.store
+        self.import_button.set_sensitive(store.connected and store.supports("playlist_add"))
+
+    def open_import(self) -> None:
+        """「Spotify から取り込む」の窓を出す。"""
+        opener = getattr(self.ctx, "open_spotify_import", None)
+        if callable(opener):
+            opener()
+
+    def on_narrow_changed(self, narrow: bool) -> None:
+        self.import_button.set_compact(narrow)
 
     def _on_local_changed(self, *_args) -> None:
         if LOCAL in self.sections:
@@ -175,6 +239,7 @@ class PlaylistsPage(PageBase):
         """節の注意書き: 取れないときの説明、無ければ曲を YouTube で探して鳴らすことの書き添え。"""
         if not section.loaded:
             return
+        section.action.set_visible(section.offer_import and self.ctx.store.supports("playlist_add"))
         if section.problem:
             section.show_note(section.problem)
         elif provider_playback(self.ctx, section.key) == PLAYBACK_YOUTUBE:
@@ -212,13 +277,22 @@ class PlaylistsPage(PageBase):
             if isinstance(result, Response):
                 section.keys = None
                 self._clear_groups(section)
-                section.problem = (auth_note(self.ctx, key) if result.needs_auth
-                                   else f"読み込めませんでした: {result.message}")
+                # Spotify の開発者アプリの持ち主が Premium でない: 何が起きていて何を使えばよいかを言う
+                blocked = is_spotify_owner_premium_required(result.error)
+                section.offer_import = blocked
+                if result.needs_auth:
+                    section.problem = auth_note(self.ctx, key)
+                elif blocked:
+                    section.problem = SPOTIFY_OWNER_PREMIUM
+                else:
+                    section.problem = f"読み込めませんでした: {result.message}"
                 self._update_note(section)
                 return
             infos = [info for info in result if not (key == LOCAL and info.id == RECENTLY_PLAYED)]
+            section.offer_import = key == LOCAL and not infos
             if not infos:
-                section.problem = ("プレイリストはありません。曲の「…」から「プレイリストに追加」で作れます。"
+                section.problem = ("プレイリストはありません。曲の「…」から「プレイリストに追加」で作るか、"
+                                   "Spotify の公開プレイリストを取り込めます。"
                                    if key == LOCAL else "プレイリストはありません。")
             else:
                 section.problem = ""
@@ -249,9 +323,16 @@ class PlaylistsPage(PageBase):
             grid.append_card(self._card(info))
         section.groups.append(grid)
 
+    @staticmethod
+    def _local_subtitle(count: int, imported: bool) -> str:
+        subtitle = format_count(count) if count else "プレイリスト"
+        return f"Spotify · {subtitle}" if imported else subtitle  # 取り込んだもの
+
     def _card(self, info: PlaylistInfo) -> MediaCard:
         if info.provider == LOCAL:
-            subtitle = format_count(info.track_count) if info.track_count else "プレイリスト"
+            # 記録があれば取り込んだものとして出し、曲が届いたら確かめ直す (_fill_art)
+            lookup = getattr(self.ctx, "import_record", None)
+            subtitle = self._local_subtitle(info.track_count, callable(lookup) and lookup(info.id) is not None)
         else:
             subtitle = format_count(info.track_count) if info.track_count else provider_label(self.ctx, info.provider)
         card = MediaCard(self.ctx.artwork, ("placeholder", f"{info.provider}:{info.id}", "playlist"),
@@ -262,16 +343,16 @@ class PlaylistsPage(PageBase):
         return card
 
     def _fill_art(self, card: MediaCard, info: PlaylistInfo) -> None:
-        import weakref
-
-        card_ref = weakref.ref(card)
-
-        def done(result) -> None:
-            target = card_ref()
-            if target is None or isinstance(result, Response):
+        # カードは曲の一覧が届くまで強く持つ (格子のカードは Python から誰も持っていないので、
+        # 包みへの弱い参照は部品が生きていても消え、絵が代わりの絵のままになっていた)
+        def done(result, target: MediaCard = card) -> None:
+            if isinstance(result, Response) or target.get_parent() is None:
                 return
-            set_playlist_art(self.ctx, target.art, result, f"{info.provider}:{info.id}",
-                             max(CARD, getattr(target, "art_height", CARD)))
+            # 記録だけ残って中身が別物 (TUI で作り直した) なら「Spotify ·」を外す (記録も忘れる)
+            record = imported_record(self.ctx, info.id, result)
+            target.set_subtitle(self._local_subtitle(info.track_count or len(result), record is not None))
+            set_local_playlist_art(self.ctx, target.art, info.id, result, f"{info.provider}:{info.id}",
+                                   max(CARD, getattr(target, "art_height", CARD)))
 
         self.ctx.catalog.tracks(info.provider, info.id, done)
 
@@ -309,6 +390,8 @@ class PlaylistDetailPage(PageBase):
         self._keys: tuple | None = None
         self._serial = 0
         self._dialog = None
+        # 取り込んだもの (のまま) なら、その記録 (曲が届いたときに確かめる)
+        self._record = None
 
         self.header = DetailHeader(ctx, on_shuffle=weak_call(self.shuffle), on_play=weak_call(self.play_first),
                                    menu_factory=weak_call(self._menu))
@@ -378,6 +461,16 @@ class PlaylistDetailPage(PageBase):
                 if result.needs_auth:
                     self._show_problem("music-note-list-symbolic", "サインインが必要です",
                                        auth_note(self.ctx, self.provider))
+                elif is_spotify_owner_premium_required(result.error) or is_spotify_not_accessible(result.error):
+                    # 開発者アプリの持ち主が Premium でない・Spotify が読ませない。公開プレイリストなら
+                    # このまま取り込める (Spotify の Web API を通さずに公開の頁から読む)
+                    url = self.spotify_url
+                    owner = is_spotify_owner_premium_required(result.error)
+                    # 題は断られたこと (このプレイリスト)。理由は説明の文に (題と同じ文を繰り返さない)
+                    self._show_problem("music-note-list-symbolic", "このプレイリストは読めません",
+                                       SPOTIFY_OWNER_PREMIUM if owner else result.message,
+                                       button_label=IMPORT_LABEL if url else None,
+                                       on_button=weak_call(self.open_import) if url else None)
                 elif self.is_local and "no such file or directory" in result.error:
                     # 空になって消えた・TUI で消した。ファイルの場所 (open /…/X.toml) は見せない
                     if not self._leave_if_gone():
@@ -439,29 +532,68 @@ class PlaylistDetailPage(PageBase):
         return (provider_playback(self.ctx, self.provider) == PLAYBACK_YOUTUBE
                 or any(is_youtube_bridge(t) for t in self._tracks))
 
+    @property
+    def import_record(self):
+        """Spotify から取り込んだローカルのプレイリスト (のまま) なら、その記録 (無ければ None)。
+        曲が届いたときに AppContext.imported_record で確かめたもの (記録だけ残って中身が別物なら None)。"""
+        return self._record if self.editable else None
+
+    @property
+    def imported(self) -> bool:
+        """取り込んだプレイリストで、曲の半分以上がまだ取り込んだ曲か。"""
+        return self.import_record is not None
+
+    @property
+    def spotify_url(self) -> str:
+        """Spotify のプレイリストの頁 (Spotify のプレイリストの詳細で、ID が Spotify の形のときだけ)。"""
+        if self.provider != "spotify" or not _SPOTIFY_ID.fullmatch(self.playlist_id or ""):
+            return ""
+        return SpotifyRef("playlist", self.playlist_id).url
+
     def _update_note(self) -> None:
+        if self.is_local:
+            record = self.import_record
+            self.header.set_note(imported_note(record) if record is not None else "")
+            self.header.set_subtitle((record.subtitle or "Spotify") if record is not None
+                                     else provider_label(self.ctx, self.provider))
+            return
         self.header.set_note(WEB_ONLY_NOTE if self._tracks and self.plays_via_youtube else "")
 
-    def _show_problem(self, icon: str, title: str, text: str) -> None:
+    def _show_problem(self, icon: str, title: str, text: str, *, button_label: str | None = None,
+                      on_button=None) -> None:
         self._tracks = []
         self._keys = None
+        self._record = None
         self.rows.build([])
         self.header.set_info("")
         self.header.set_note("")
         self.header.set_actions_sensitive(False)
         # ローカルは曲が読めなくても「…」から削除できる
         self.header.more_button.set_sensitive(self.editable)
-        self.state.show_empty(icon, title, text)
+        self.state.show_empty(icon, title, text, button_label=button_label, on_button=on_button)
+
+    def open_import(self) -> None:
+        """このプレイリスト (Spotify) を「Spotify から取り込む」の窓で開く。"""
+        opener = getattr(self.ctx, "open_spotify_import", None)
+        if callable(opener):
+            opener(self.spotify_url)
 
     def _show(self, tracks: list[Track]) -> None:
         keys = tuple(row_key(t) for t in tracks)
         self.header.set_info(info_line(len(tracks), total_duration(tracks)))
         self.header.set_actions_sensitive(bool(tracks))
         self.header.more_button.set_sensitive(self.editable or bool(tracks))
+        if self.editable:
+            # 取り込んだもののままか (記録だけ残って中身が別物なら記録を忘れる)
+            self._record = imported_record(self.ctx, self.playlist_id, list(tracks))
         if keys != self._keys:
             self._keys = keys
             self._tracks = list(tracks)
-            set_playlist_art(self.ctx, self.header.art, self._tracks, self._art_key(), DetailHeader.ART)
+            if self.is_local:
+                set_local_playlist_art(self.ctx, self.header.art, self.playlist_id, self._tracks, self._art_key(),
+                                       DetailHeader.ART)
+            else:
+                set_playlist_art(self.ctx, self.header.art, self._tracks, self._art_key(), DetailHeader.ART)
             # 曲を外した・足したときは差分だけ (スクロール位置と開いているメニューを失わない)
             self.rows.update(self._tracks)
         self._update_note()
@@ -550,6 +682,20 @@ class PlaylistDetailPage(PageBase):
             action.connect("activate", weak_call(self.enqueue_all, mode))
             action.set_enabled(bool(playable) and supports("enqueue"))
             group.add_action(action)
+        record = self.import_record
+        if record is not None:
+            spotify = Gio.Menu()
+            spotify.append("Spotify から更新", "page.update-spotify")
+            spotify.append("Spotify で開く", "page.open-spotify")
+            menu.append_section(None, spotify)
+            busy = self.playlist_id in getattr(self.ctx, "spotify_imports_busy", ())
+            update = Gio.SimpleAction.new("update-spotify", None)
+            update.connect("activate", weak_call(self.update_from_spotify))
+            update.set_enabled(not busy and supports("playlist_add") and supports("playlist_delete"))
+            group.add_action(update)
+            browse = Gio.SimpleAction.new("open-spotify", None)
+            browse.connect("activate", weak_call(self.open_in_spotify))
+            group.add_action(browse)
         if self.editable:
             danger = Gio.Menu()
             danger.append("プレイリストを削除…", "page.delete")
@@ -573,6 +719,19 @@ class PlaylistDetailPage(PageBase):
                 self.ctx.toast(f"追加できませんでした: {response.message}")
 
         self.ctx.store.enqueue(tracks, mode, callback=done)
+
+    # --- Spotify から取り込んだもの ---------------------------------------------------
+
+    def update_from_spotify(self) -> None:
+        """取り込んだときのリンクから読み直し、確かめてから曲を置き換える (名前はそのまま)。"""
+        updater = getattr(self.ctx, "update_spotify_import", None)
+        if callable(updater) and self.import_record is not None:
+            updater(self.playlist_id)
+
+    def open_in_spotify(self) -> None:
+        record = self.import_record
+        if record is not None:
+            self.ctx.open_uri(record.url)
 
     # --- 削除 -------------------------------------------------------------------
 
@@ -608,6 +767,9 @@ class PlaylistDetailPage(PageBase):
                 ctx.toast(f"削除できませんでした: {response.message}")
                 return
             ctx.toast(f"「{name}」を削除しました")
+            forget = getattr(ctx, "forget_import", None)
+            if callable(forget):
+                forget(name)
             ctx.refresh_local_playlists()
             self._leave()
 

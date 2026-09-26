@@ -31,6 +31,13 @@ cliamp が行い、アプリを閉じても音楽は止まらない。
     塊になる。自作アイコンは塗りの図形で描く。
   - GTK の CSS に backdrop-filter は無い。ガラスは「ほぼ不透明の面 + 上端の
     明るい線 + 下端の影 + 外側の影」で表す。影のぼかしは角丸の半径より小さく。
+  - PyGObject の包み (Python の部品のオブジェクト) への `weakref` は、Python から誰も持って
+    いない部品では、部品が GTK の中で生きていても消える (Python の属性は残り、包みは作り直される)。
+    格子のカード (MediaCard) の絵を曲の一覧が届いてから置く呼び出しがこれで黙って何もせず、
+    ローカルのプレイリストのカードが代わりの絵のままだった。一度きりの短い待ち (カタログの答え・
+    絵の取得) では部品を強く持つ。窓の子でない所に出した `Adw.Dialog` も同じなので、出している間は
+    ctx などから強く持つ (`importer.present_dialog`)。窓なしで出した `Adw.Dialog` は `force_close()`
+    で "closed" を出さない。
 - 外部とのやりとり (IPC・HTTP・ファイル) は GTK のスレッドで待たない。
   スレッドで行い、結果は `GLib.idle_add` で戻す。
 
@@ -47,6 +54,9 @@ cliamp_music/
   catalog.py       Catalog: providers / playlists / tracks / search / history / lyrics / ローカルのプレイリスト編集
   artwork.py       ArtworkLoader: アートワークの取得・切り抜き・キャッシュ・代わりの絵
   radio.py         RadioBrowser: Radio Browser API (局の一覧・検索)
+  spotify_import.py 純粋 (GTK 非依存)。Spotify の公開頁からの取り込み (リンクの読み取り・埋め込みの頁の
+                   解析・YouTube への橋渡し・取得)と、取り込んだものの表 ImportIndex
+  importer.py      「Spotify から取り込む」の窓 (SpotifyImportDialog) と取り込み・置き換え・更新の手順
   state.py         GuiState: アプリ自身の保存値 (~/.local/state/cliamp-music/state.json)
   context.py       AppContext: 上の部品の束と、ページから使う共通の操作
   widgets.py       デザインの部品 (Artwork, TrackRow, カード, 棚, ボタン…)
@@ -140,6 +150,9 @@ def describe_catalog_error(text) -> str     # カタログ系の失敗の言い�
                                             # 鳴らせない曲)。Response.message が使う。無ければ ""。
                                             # cliamp の Spotify の誤り ("spotify: " で始まる) だけ
                                             # (YouTube の検索の誤りは語を繰り返すので見ない)
+def is_spotify_owner_premium_required(text) -> bool   # "spotify: …" の誤りに 403 "Active premium subscription
+                                            # required for the owner of the app" (SPOTIFY_OWNER_PREMIUM に言い直す)
+def is_spotify_not_accessible(text) -> bool # "spotify: playlist not accessible: …" (tracks の 403 の上流の言い換え)
 def is_spotify_search_blocked(text) -> bool # "spotify: …" の誤りで、friendlySearchError ("spotify: search
                                             # blocked") か "spotify: search: …" の 400 "Invalid limit"
 def spotify_rate_limit_wait(text) -> float | None   # 回数の制限なら待つ秒 (不明は 0)、違えば None。
@@ -246,6 +259,7 @@ class PlayerStore(GObject.Object):
     def enqueue(tracks, mode="next"); queue_edit(mode, index=None, to=None, path=None)
     def remove(index, path=None)
     def refresh_playlist(); refresh_history()
+    track_hook: Callable[[Track], Track] | None   # 届いた曲を覚える前に通す (取り込んだ曲の ID を付け直す)
 ```
 
 `gen` が変わったら store が自分で `playlist` を取り直して `playlist-changed` を出す。
@@ -280,6 +294,8 @@ class Catalog:
     def playlist_remove_track(self, name, index, callback=None, path=None)
     def add_providers_listener(self, listener(list[ProviderInfo]))   # providers の答えが届くたび
     def invalidate(self, provider=None)   # 全部なら「セッションができた」印も忘れる (繋ぎ直し)
+    def provider_failure(self, provider) -> Response | None   # 覚えている「どの呼び出しも断られる」失敗
+    track_hook: Callable[[list[Track]], list[Track]] | None   # 曲の並びを渡す前に通す (AppContext が差す)
 ```
 
 providers の `playback` は cliamp が Spotify のセッションを作った後の答えにしか載らない
@@ -290,7 +306,10 @@ providers の `playback` は cliamp が Spotify のセッションを作った�
 聞き手になって覚え直し、鳴らし方が変われば "providers-changed" を出す。
 
 失敗は `Response` (kind 付き) をそのまま callback に渡す (`Response.message` は Spotify の回数の
-制限・検索の封鎖を日本語に言い直す。`describe_catalog_error`)。結果は短時間
+制限・持ち主が Premium でない・読めないプレイリスト・検索の封鎖を日本語に言い直す。`describe_catalog_error`)。
+Spotify の Web API が「開発者アプリの持ち主が Premium でない」と断った答え (`is_spotify_owner_premium_required`) は
+10 分覚え、そのプロバイダーの playlists / tracks / search には送らずに同じ答えを返す (サイドバー・ホーム・
+すべてのプレイリスト・打ちながらの検索が 403 を受け続けない。force と繋ぎ直しで忘れる)。結果は短時間
 覚えておく (検索は同じ語で 10 分、プレイリスト一覧は 5 分)。期限切れは足すたびに
 まとめて捨て、検索は新しい 200 件、歌詞は 300 件、曲の一覧は 100 件まで。
 検索ページは `lane` を付けて検索し、打ち直しで古い語の検索が worker を塞がないようにする。
@@ -347,6 +366,90 @@ class GuiState:   # ~/.local/state/cliamp-music/state.json。壊れていたら�
     def add_recent_search(q); def save()
 ```
 
+### spotify_import.py (純粋) と importer.py
+
+Spotify の Web API は開発者アプリの持ち主が Premium でないと 403 を返す (PROTOCOL.md) ので、無料プランの
+利用者のために、ログインの要らない埋め込み用の頁から公開プレイリスト・アルバムを取り込み、cliamp の
+ローカルのプレイリストにする。
+
+```python
+class SpotifyImportError(Exception): message; kind; detail
+    # kind: "url" | "not-found" | "unavailable" | "shape" (頁の形が変わった) | "network" | "rate-limited" | "empty"
+@dataclass(frozen=True)
+class SpotifyRef: kind ("playlist" | "album"); id (英数字 22)   # url / embed_url / uri
+def parse_spotify_url(text) -> SpotifyRef        # open.spotify.com/{playlist,album}/<id> (/intl-xx/・/embed/・
+                                                 # ?si=・#・スキーム無し・/user/<名前>/playlist/)、spotify:{playlist,album}:<id>、
+                                                 # 古い spotify:user:<名前>:playlist:<id>。貼った文の中のリンクも拾う。
+                                                 # 曲・アーティスト・ポッドキャスト・お気に入りの曲・短縮リンク・
+                                                 # ほかのサイト・ID の形の違いは理由つきの SpotifyImportError
+                                                 # 文の終わりの句読点・括弧 (「…<id>。」「…<id>)」) は外す。
+                                                 # ID は英数字ちょうど 22 文字 (fullmatch。"<id>\n" は通さない)
+def check_spotify_url(text) -> (SpotifyRef | None, 理由)   # 入力中の確かめ (空は (None, ""))
+def is_spotify_id(text) -> bool; def clean_text(text) -> str   # 対になっていないサロゲートを U+FFFD に
+def bridge_query(artists, title) -> str          # "ytsearch1:<アーティストを空白で> <曲名>" (Go の strings.Fields の空白で)
+def bridge_track(id, title, artists, *, duration=0, album="", year=0, track_number=0) -> Track
+    # パッチの external/spotify/bridge.go の bridged() と同じ形 (artist は ", " で繋ぐ、
+    # meta {"spotify.id", "spotify.bridge": "youtube"}、stream も unplayable も無し)
+def parse_embed_html(html, ref=None) -> ImportedList
+    # <script id="__NEXT_DATA__"> の props.pageProps.state.data.entity (name・subtitle・coverArt か
+    # visualIdentity.image・trackList)。曲の subtitle はアーティストを ",\u00a0" で繋いだもの。
+    # duration はミリ秒 (// 1000)。曲でない項目 (エピソード・手元のファイル) は skipped。
+    # pageProps.status 404 は not-found、ほかの失敗の頁は unavailable、形が違えば shape。
+    # 頁から取った文字列はどれも clean_text に通す (JSON の "\ud83d" のような切れた絵文字は、json.loads が
+    # UTF-8 にできない文字にするので、cliamp へ送る・GTK に渡す・表を保存するところで落ちる)
+def parse_total_count(html) -> int               # 通常の頁の music:song_count か og:description の "150 items"
+def fetch_list(target) -> ImportedList           # worker のスレッドから。埋め込みの頁はブラウザらしい
+                                                 # User-Agent で。100 曲あれば通常の頁 (ブラウザでない UA) から
+                                                 # 全体の曲数を読み、truncated と total を決める
+@dataclass(frozen=True)
+class ImportedList: kind; id; name; subtitle; cover_url; tracks; truncated; total; skipped; listed
+class ImportIndex:   # state.json と同じディレクトリの spotify-imports.json (初めて使うときに読む)
+    lookup(path) -> id | None; restore(track) -> Track; restore_all(tracks) -> list[Track]
+    record(name, result) -> ImportRecord; get(name) -> ImportRecord | None; forget(name); prune(names)
+    known_count(tracks) -> int                   # 取り込んだ曲 (橋渡しの path が表にある) の数
+    confirm(name, tracks) -> ImportRecord | None # 今の曲の半分以上が取り込んだ曲なら記録。そうでなければ
+                                                 # (TUI で消して同じ名前で作り直した) 記録を忘れて None
+                                                 # (取り込んで 2 分のうちは忘れない。曲が空なら決めない)
+    backup(name, tracks) -> path | None; drop_backup(path); backups()   # 置き換える前の曲の控え
+                                                 # (playlist-backups/<時刻>-<名前の要約>.json、20 個まで)
+def playlist_name_for(result) -> str             # 既定の名前 ("/" "\" は全角、予約名を避け、長さを収める)
+def suggest_name(name, existing) -> str          # 「名前 2」「名前 3」… (番号を足しても長さに収める)
+```
+
+プレイリスト名 (protocol.py): `playlist_name_problem(name)` は使えない理由の日本語 (空・"."・".."・
+予約名 "Recently Played"・`/` と `\`・長さ)、`valid_playlist_name` はその裏。cliamp の external/local は
+`<ディレクトリ>/<名前>.toml` を os.OpenFile で開くので、名前 + ".toml" が 255 バイト (NAME_MAX) を超えると
+英語の "file name too long" で断られる。その前に「名前が長すぎます」と言う (`PLAYLIST_NAME_MAX_BYTES`
+= 250。`fit_playlist_name(name, suffix)` は文字の切れ目で縮めて「…」を付ける)。
+
+ローカルのプレイリストの TOML には meta が残らないので、取り込んだ曲 (橋渡しの path) の Spotify の曲 ID は
+アプリの表が持つ。AppContext はカタログ (`Catalog.track_hook`: tracks / search / history の答え) と store
+(`PlayerStore.track_hook`: status の曲・リストの写し・履歴) の曲をこの表で「元に戻す」(meta の spotify.id と
+spotify.bridge を付け直す)。protocol.py は純粋なまま、`Track.spotify_id`・`web_url`・`track_key`・
+`is_youtube_bridge`・`artwork.art_sources` (Spotify の oEmbed の絵) が、Web API だけの Spotify の曲と同じに働く
+(TUI や load_provider で読み込んだときも)。表は曲 10000・プレイリスト 500 まで (古いものから忘れる)。
+ローカルのプレイリストの一覧を取り直すたびに、無くなったプレイリストの記録を忘れる (取り込んで 2 分の
+うちは残す)。
+
+記録は名前だけで引くので、取り込んだものとしての見せ方 (詳細の書き添え・提供元・「…」の「Spotify から更新」
+「Spotify で開く」、カードの「Spotify · N 曲」、Spotify の絵) は、記録と今の曲の両方で決める
+(`AppContext.imported_record(name, tracks)` = `ImportIndex.confirm`)。GUI を閉じている間に TUI で消して同じ
+名前で作り直したプレイリストは、取り込んだものとして見せず、記録も忘れる。
+
+importer.py: `fetch_async(target, callback)`、`SpotifyImportDialog`、`open_dialog(ctx, url)`、
+`start_import` (一覧を取り直してから、名前が重なれば `ask_collision`: 置き換える / 別の名前にする)、
+`save_import(ctx, name, result, replace=False)` (playlist_add。できたら表に書き、トースト「「名前」を取り込み
+ました (N 曲)」と切れていたことの知らせ、詳細へ移る。途中で思わぬ誤りが出ても取り込み中の印を外して知らせる)、
+`replace_local` (置き換え: 今の曲を読んで控え (`ImportIndex.backup`) てから delete + add。足せなければ読んだ曲を
+戻し、戻し終えてから知らせて一覧を取り直す。戻せなかったら控えを残し、`ask_restore` の窓 (「「名前」の曲を
+戻せませんでした」、控えの場所、「もう一度戻す」) を出す。置き換えられた・戻せたら控えは消す)、
+`update_import(ctx, name)` (「Spotify から更新」: 読み直しと今の曲の読み取りを待ち、今の曲が取り込んだもので
+なければ置き換えずに記録を忘れ、Spotify と同じ曲なら「もう最新です」、違えば `confirm_update` の窓
+「「名前」の N 曲を、Spotify の〜「…」の M 曲に置き換えます」(取り込んでいない曲が混じっていれば
+「このうち K 曲は…外れます」と言い、既定の応答を「キャンセル」に) で確かめてから置き換える。読み込み中の
+トーストは時間切れにせず、結果の前に消す。出したままだと Adw.ToastOverlay が後のトーストを 4 秒待たせる)。
+同じ名前の取り込みは 1 度に 1 つ (`ctx.spotify_imports_busy`。確かめている間も)。
+
 ### context.py
 
 ```python
@@ -369,7 +472,12 @@ class AppContext:
         # 消さない)。最後の曲を外すと cliamp はプレイリストごと消すので、一覧を取り直し
         # 「空になったので削除しました」と知らせる (詳細のページは自分で閉じる)。
     local_playlists: list[str]; local_playlists_loaded: bool   # 実際に取れた一覧か
-    def refresh_local_playlists(self, force=True, then=None)   # then(names | None)
+    def refresh_local_playlists(self, force=True, then=None)   # then(names | None)。取り込みの記録も整理する
+    imports: ImportIndex                        # 取り込んだ Spotify のプレイリストの記録 (カタログと store の track_hook)
+    def open_spotify_import(self, url="")      # 「Spotify から取り込む」の窓 (出した窓を返す)
+    def imported_record(self, name, tracks)     # 今の曲から見て取り込んだもののままなら記録 (別物なら忘れる)
+    def update_spotify_import(self, name, callback=None) -> bool   # 「Spotify から更新」
+    def import_record(self, name) -> ImportRecord | None; def forget_import(self, name)
     def remember_providers(self, providers)   # 表示名と鳴らし方 (playback) を覚える (pages.home の
                                               # remember_provider_names もこれを呼ぶ)
     # シグナル: "local-playlists-changed" (ローカルのプレイリストの一覧か中身が変わった)、
@@ -547,6 +655,14 @@ macOS 27 の形: 窓の端まで続く帯 (浮かない)、赤い記号、選択
   行に触らない)。スクロール位置・選択・フォーカス・開いているメニューを失わない。
 - すべてのプレイリスト (playlists.py): 題は「プレイリスト」(サイドバーの項目は
   「すべてのプレイリスト」)。プレイリストのカードの格子 (ローカル + 各プロバイダー)。
+  ヘッダーの右にガラスのカプセル「⤓ Spotify から取り込む…」(`widgets.GlassButton`。窓を開くので「…」。
+  狭い幅では記号だけの丸)。ローカルが空のときと、Spotify の節が「持ち主が Premium でない」で読めないとき
+  (その説明を書く) は、節にも「Spotify から取り込む…」のカプセル。取り込んだローカルのプレイリストのカードは
+  副題が「Spotify · N 曲」で、絵は Spotify の絵 (取れなければ曲の絵の 2x2)。どちらも曲が届いたら
+  `imported_record` で確かめ直す (作り直したものなら「N 曲」と曲の絵)。
+  サイドバーの「プレイリスト」の節の見出しと行を右クリック (長押し) すると「Spotify から取り込む…」
+  (取り込んだものの行なら「Spotify から更新」も)。見出しは Gtk.ListBox の行の外に置かれる (get_row_at_y は
+  None) ので、`Sidebar.row_at(y)` が見出しの矩形でも探す。
   曲を YouTube で探して鳴らすプロバイダー (providers の `playback` が "youtube") の節には
   見出しの下に「曲は YouTube で探して再生します」(12px 副次色の注意書き)。起動したばかりの
   cliamp では最初の providers の答えに `playback` が無いので、カタログが spotify の playlists の
@@ -562,6 +678,32 @@ macOS 27 の形: 窓の端まで続く帯 (浮かない)、赤い記号、選択
   添字で選ぶので、見た後で並びが変わると別の曲が鳴る。replace の無い cliamp と 1 万曲を
   超えるリストだけ `load_provider`)。ローカルのプレイリストが消えたら (最後の曲を外した・
   TUI で消した) ページを閉じる。ファイルの場所 (`open …/X.toml`) は見せない。
+  Spotify から取り込んだローカルのプレイリスト (記録があり、曲の半分以上が取り込んだ曲): 提供元の行は
+  Spotify での作り手 (アルバムならアーティスト)、絵は Spotify の絵、書き添えは「Spotify から取り込み · 曲は
+  YouTube で探して再生します」(100 曲で切れていれば「(全 150 曲のうち最初の 100 曲)」も)、「…」に
+  「Spotify から更新」(確かめてから置き換える)「Spotify で開く」。
+  Spotify のプレイリストが「持ち主が Premium でない」「読めない」で開けないときは、題「このプレイリストは
+  読めません」、説明にその理由、「Spotify から取り込む…」(ID が Spotify の形ならそのリンクを入れて開く)。
+
+### Spotify から取り込む (importer.py の Adw.AlertDialog)
+
+見出し「Spotify から取り込む」、説明 2 行。リンクの欄 (角 8、赤いフォーカスの輪) の下にいつも同じ案内
+(「Spotify の「共有」→「リンクをコピー」で出る open.spotify.com のリンク」)。その下の 1 つの薄い面
+(角 12、左に 56px の升) に、状態で次のどれか 1 つ: 案内 (升に取り込みの記号、「リンクを貼ると、ここに
+プレイリストの名前と曲数が出ます」)、形が違う理由・読めなかった理由 (升に琥珀色の「!」、琥珀色の文 3 行まで。
+面の縁も琥珀色。ネットワーク・回数の制限・Spotify が頁を返さないときは赤い「もう一度読む」)、読み込み中
+(升にスピナー)、読めたもの (絵 56px・名前・「プレイリスト · 作り手 · 100 曲 (全 150 曲)」・切れるときの
+知らせ (琥珀色、1 行))。その下に「プレイリストの名前」(いつも出しておき、読めるまでは押せない。読めたら
+Spotify の名前を入れる。打ち替えたら読み直しても触らない) と 1 行の案内 (理由ごとの文・重なりの前触れ・
+cliamp に繋がっていないこと)。どの状態でも窓の高さは変わらない (AdwAlertDialog は縦の真ん中に置かれる
+ので、中身が伸び縮みすると打っている欄が上下に動く。面は Gtk.Stack の vhomogeneous、名前の案内は
+高さを固定)。
+
+リンクは貼り付けたら (1 度に 8 文字以上増えたら) すぐ確かめてすぐ読む。1 文字ずつ打っているときは、形の
+誤りを手を止めるまで (0.9 秒) 言わず、正しい形になったら 0.35 秒待って読む。待っている間に同じリストのまま
+打ち足しても (ID の後の「/」「?si=…」) 待ち直して読む。Enter は待たずに読み (読めなかったものは読み直す)、
+Enter と欄を離れたときは出さずにおいた形の誤りも言う。「取り込む」は読めて名前が使えて cliamp に保存できる
+ときだけ押せ、cliamp との接続とローカルのプレイリストの一覧が変わればその場で直す。窓の幅は 420。
 
 ### フルスクリーンプレーヤー (fullscreen.py、Shift+Ctrl+F、Esc で戻る)
 

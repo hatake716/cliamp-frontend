@@ -14,6 +14,11 @@ CliampClient に任せ、結果は main loop で受け取る。
 buffering を返しつつ、位置と長さはまだ鳴っている前の曲のものを返す。その間は
 switching を立て、位置 0・長さは新しい曲の長さとして見せ、シークさせない (can_seek)。
 
+track_hook (AppContext が差す) は、cliamp から届いた曲 (status の曲・リストの写し・履歴) を覚える前に
+通す関数。取り込んだ Spotify のプレイリストを TUI や load_provider で読み込むと、cliamp の曲は
+ローカルの TOML から読み戻したもので meta が無いので、Spotify の曲 ID を付け直す (再生バー・次に再生・
+フルスクリーンの絵とリンクが Spotify の曲になる)。
+
 再生できなかった曲 (status の playback_error) は、新しい失敗ごとに 1 度だけ
 "playback-failed" を出す (同じ曲の同じ誤りを問い合わせのたびに出さない)。曲を始め直す
 操作 (止まっているときの再生、次へ・前へ、行を選ぶ、差し替え、すぐ再生) では楽観的に
@@ -134,6 +139,8 @@ class PlayerStore(GObject.Object):
         self._chosen_device: str | None = None
         # 最後に見た再生の失敗 (曲の path, 誤りの文言)。同じ失敗を何度も知らせない
         self._failure_seen: tuple[str, str] | None = None
+        # 届いた曲を覚える前に通す関数 (取り込んだ Spotify の曲の ID を付け直す。AppContext が差す)
+        self.track_hook: Callable[[Track], Track] | None = None
         client.connect("status", self._on_status)
         client.connect("connection-changed", self._on_connection)
         if client.connected:
@@ -235,7 +242,24 @@ class PlayerStore(GObject.Object):
             self.emit("state-changed")
         self.emit("status-changed")
 
+    def _restore(self, track: Track | None) -> Track | None:
+        hook = self.track_hook
+        if hook is None or track is None:
+            return track
+        try:
+            return hook(track)
+        except Exception as exc:  # 飾り (絵とリンク) のための付け直し。失敗しても曲はそのまま
+            log(f"曲の付け直しに失敗: {exc}")
+            return track
+
+    def _restore_all(self, tracks: list[Track]) -> list[Track]:
+        if self.track_hook is None:
+            return tracks
+        return [self._restore(t) for t in tracks]
+
     def _on_status(self, _client, status: Status) -> None:
+        if status.track is not None and self.track_hook is not None:
+            status.track = self._restore(status.track)
         now = time.monotonic()
         base = status.stamp or now
         base = self._apply_overrides(status, now, base)
@@ -725,6 +749,8 @@ class PlayerStore(GObject.Object):
             self._pl_inflight = False
             if response.ok and parsed is not None:
                 self._pl_fail = 0
+                if self.track_hook is not None:
+                    parsed.tracks = self._restore_all(parsed.tracks)
                 self.playlist = parsed
                 self.emit("playlist-changed")
             elif not self._pl_dirty:
@@ -781,7 +807,7 @@ class PlayerStore(GObject.Object):
             self._hist_inflight = False
             if response.ok:
                 self._hist_fail = 0
-                self.history = parse_tracks(response.data)
+                self.history = self._restore_all(parse_tracks(response.data))
                 self.emit("history-changed")
             elif response.kind != "offline" and not self._hist_dirty:
                 self._hist_fail += 1

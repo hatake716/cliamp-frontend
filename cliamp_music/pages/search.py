@@ -15,6 +15,10 @@
   代わりに「Spotify では検索できません」と使えるもの (プレイリスト・保存した曲) を言い、
   「YouTube で検索」のボタン (範囲を YouTube に替えて探し直す) を出す。Spotify の範囲の
   検索のときだけ (YouTube の検索の誤りは語を繰り返すので、語に同じ言葉があっても出さない)。
+  Spotify の開発者アプリの持ち主が Premium でないとき (403 "Active premium subscription required for
+  the owner of the app") も題は「Spotify では検索できません」。説明に理由と、公開プレイリストは
+  「Spotify から取り込む」で使えることを書き、「YouTube で検索」と「Spotify から取り込む…」を出す
+  (カタログがその答えを覚えるので、打ちながらの検索が Spotify に頼み続けることはない)。
 - 範囲は GuiState.search_scope に保存する。
 """
 
@@ -27,11 +31,13 @@ gi.require_version("Adw", "1")
 from gi.repository import Adw, GLib, Gtk  # noqa: E402
 
 from ..protocol import (  # noqa: E402
+    SPOTIFY_OWNER_PREMIUM,
     SPOTIFY_SEARCH_BLOCKED,
     SPOTIFY_SEARCH_BLOCKED_TITLE,
     Response,
     Source,
     Track,
+    is_spotify_owner_premium_required,
     is_spotify_search_blocked,
     spotify_rate_limit_wait,
 )
@@ -60,6 +66,7 @@ from .home import (  # noqa: E402
     weak_call,
     weak_handler,
 )
+from .playlists import IMPORT_LABEL  # noqa: E402
 
 DEBOUNCE_MS = 600
 SEARCH_LIMIT = 25
@@ -491,12 +498,27 @@ class SearchPage(PageBase):
             # 打ちながらの検索: まだ送っていない古い語は送らずに捨てる (worker を塞がない)
             catalog.search(scope, query, done, SEARCH_LIMIT, force=force, lane="search-page")
 
+    def open_import(self) -> None:
+        """「Spotify から取り込む」の窓を出す。"""
+        opener = getattr(self.ctx, "open_spotify_import", None)
+        if callable(opener):
+            opener()
+
     def _show_results(self, query: str, scope: str, result) -> None:
         if isinstance(result, Response):
             if result.needs_auth:
                 label = provider_label(self.ctx, scope)
                 self.results.show_empty("music-search-symbolic", "サインインが必要です",
                                         f"{label} はサインインが必要です (cliamp の端末で設定)")
+            elif scope == "spotify" and is_spotify_owner_premium_required(result.error):
+                # 開発者アプリの持ち主が Premium でない (Spotify のどの呼び出しも断られる)。題は断られたこと
+                # (検索)、理由は説明に。検索は YouTube で、Spotify の公開プレイリストは「Spotify から取り込む」で
+                opener = getattr(self.ctx, "open_spotify_import", None)
+                self.results.show_empty("music-search-symbolic", SPOTIFY_SEARCH_BLOCKED_TITLE,
+                                        SPOTIFY_OWNER_PREMIUM, button_label="YouTube で検索",
+                                        on_button=weak_call(self.set_scope, "youtube"),
+                                        secondary_label=IMPORT_LABEL if callable(opener) else None,
+                                        on_secondary=weak_call(self.open_import))
             elif (scope == "spotify" and is_spotify_search_blocked(result.error)
                   and spotify_rate_limit_wait(result.error) is None):
                 # 開発モードのアプリでは Spotify が検索を止めている。英語の長い文ではなく、

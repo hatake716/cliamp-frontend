@@ -109,6 +109,17 @@ window.music button.music-text-link {
 window.music button.music-text-link:hover { background-color: transparent; opacity: 0.78; }
 window.music button.music-text-link:active { opacity: 0.6; }
 
+/* ヘッダーの右のガラスのカプセル (すべてのプレイリストの「Spotify から取り込む」) */
+window.music headerbar.music-page-header button.music-header-action { margin: 0 4px 0 0; }
+
+/* 節の注意書きの下の「Spotify から取り込む…」(ローカルが空・Spotify のライブラリが読めない) */
+window.music button.music-capsule.music-section-action {
+  min-width: 0;
+  margin-top: 2px;
+  margin-bottom: 16px;
+  padding: 0 16px 0 14px;
+}
+
 /* ------------------------------------------------------------------
  * 詳細ページの頭 (プレイリスト・再生中のリスト)
  * ------------------------------------------------------------------ */
@@ -257,3 +268,112 @@ window.music .music-playlists-group {
 }
 
 window.music .music-playlists-grid { margin-bottom: 18px; }
+
+/* ------------------------------------------------------------------
+ * 「Spotify から取り込む」の窓 (importer.py の Adw.AlertDialog)
+ *
+ * 窓の中に出す (AdwDialog は窓の子) ので window.music の下で当たる。
+ * 入力欄は角 8 の灰色の面に赤いフォーカスの輪、案内と誤りは 12px (誤りは琥珀色。
+ * 赤は操作の色なので使わない)。リンクの下の 1 つの薄い面 (高さ一定) に、案内・誤り・スピナー・
+ * 読めたもの (絵 56px と名前・種類と曲数) のどれか。左は 56px の升で揃える。
+ * ------------------------------------------------------------------ */
+
+window.music .music-import-form { margin-top: 2px; }
+
+window.music .music-import-dialog entry.music-import-entry {
+  min-height: 34px;
+  padding: 0 10px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 8px;
+  background-color: rgba(118, 118, 128, 0.20);
+  background-image: none;
+  box-shadow: none;
+  color: var(--m-label);
+}
+
+window.music .music-import-dialog entry.music-import-entry:focus-within {
+  border-color: rgba(250, 88, 106, 0.90);
+  box-shadow: 0 0 0 3px rgba(250, 45, 72, 0.28);
+}
+
+window.music .music-import-dialog entry.music-import-entry > text > placeholder { color: var(--m-tertiary); }
+
+window.music .music-import-hint {
+  margin: 6px 2px 0;
+  font-size: 12px;
+  color: var(--m-secondary);
+}
+
+window.music .music-import-hint.problem { color: var(--m-warning); }
+
+window.music .music-import-well {
+  margin-top: 12px;
+  padding: 10px 12px 10px 10px;
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 12px;
+  background-color: rgba(255, 255, 255, 0.05);
+}
+
+/* 誤りのときは縁を琥珀色に */
+window.music .music-import-well.problem { border-color: rgba(255, 179, 64, 0.30); }
+
+/* どの頁も同じ高さ (窓が上下に動かない)。絵 56px と、3 行までの誤り + 「もう一度読む」が入る */
+window.music .music-import-well-page { min-height: 60px; }
+
+window.music .music-import-tile {
+  border-radius: 6px;
+  background-color: rgba(255, 255, 255, 0.06);
+}
+
+window.music .music-import-tile.placeholder image { color: var(--m-tertiary); }
+window.music .music-import-tile.problem { background-color: rgba(255, 179, 64, 0.12); }
+window.music .music-import-tile.problem image { color: var(--m-warning); }
+
+window.music .music-import-placeholder-label,
+window.music .music-import-loading-label { font-size: 12px; color: var(--m-secondary); }
+
+window.music .music-import-problem {
+  font-size: 12px;
+  color: var(--m-warning);
+}
+
+window.music button.music-import-retry {
+  min-height: 0;
+  margin: 2px 0 0 -6px;
+  padding: 1px 6px;
+  border-radius: 6px;
+}
+
+window.music .music-import-retry-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--m-key-text);
+}
+
+window.music .music-import-preview-title {
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--m-label);
+}
+
+window.music .music-import-preview-summary {
+  font-size: 12px;
+  color: var(--m-secondary);
+  font-feature-settings: "tnum";
+}
+
+window.music .music-import-preview-note {
+  margin-top: 2px;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--m-warning);
+}
+
+window.music .music-import-name { margin-top: 14px; }
+
+window.music .music-import-label {
+  margin: 0 2px 6px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--m-secondary);
+}

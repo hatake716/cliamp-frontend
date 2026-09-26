@@ -16,7 +16,15 @@ from fake_cliamp import FakeCliamp, run_loop, temp_socket_path  # noqa: E402
 try:
     from cliamp_music.catalog import Catalog
     from cliamp_music.client import CliampClient
-    from cliamp_music.protocol import RECENTLY_PLAYED, Lyrics, Response, Track, is_youtube_bridge, mix_url
+    from cliamp_music.protocol import (
+        RECENTLY_PLAYED,
+        SPOTIFY_OWNER_PREMIUM,
+        Lyrics,
+        Response,
+        Track,
+        is_youtube_bridge,
+        mix_url,
+    )
 
     HAVE_GI = True
 except ImportError:  # pragma: no cover
@@ -303,6 +311,100 @@ class WebOnlySpotify(CatalogTest):
                 result = self.get(method, *args)
                 self.assertIsInstance(result, Response)
                 self.assertEqual(result.message, want)
+
+
+class OwnerPremiumSpotify(CatalogTest):
+    """Spotify の開発者アプリの持ち主が Premium でない (Web API がどの呼び出しも 403 で断る)。"""
+
+    def setUp(self):
+        super().setUp()
+        self.fake.spotify_owner_premium = True
+
+    def spotify_requests(self):
+        return [r for r in self.fake.requests if r.get("provider") == "spotify"]
+
+    def test_the_refusal_is_remembered_for_every_spotify_call(self):
+        first = self.get(self.catalog.playlists, "spotify")
+        self.assertIsInstance(first, Response)
+        self.assertIn("Active premium subscription required", first.error)
+        self.assertEqual(first.message, SPOTIFY_OWNER_PREMIUM)
+        self.assertIs(self.catalog.provider_failure("spotify"), first)
+        # 以後の Spotify の playlists / tracks / search は送らずに同じ答え (打ちながらの検索も頼み続けない)
+        for method, args in ((self.catalog.playlists, ("spotify",)), (self.catalog.tracks, ("spotify", "YOUR MUSIC")),
+                             (self.catalog.search, ("spotify", "夜")), (self.catalog.search, ("spotify", "朝"))):
+            with self.subTest(method=method.__name__, args=args):
+                again = self.get(method, *args)
+                self.assertIsInstance(again, Response)
+                self.assertEqual(again.message, SPOTIFY_OWNER_PREMIUM)
+        self.assertEqual(len(self.spotify_requests()), 1)
+        # ほかのプロバイダーには関わらない
+        self.assertTrue(self.get(self.catalog.search, "youtube", "夜"))
+        self.assertTrue(self.get(self.catalog.playlists, "local"))
+        # Ctrl+R (force) は頼み直す。直っていれば忘れる
+        self.fake.spotify_owner_premium = False
+        lists = self.get(self.catalog.playlists, "spotify", force=True)
+        self.assertNotIsInstance(lists, Response)
+        self.assertIsNone(self.catalog.provider_failure("spotify"))
+        self.assertEqual(len(self.spotify_requests()), 2)
+
+    def test_reconnect_and_expiry_forget_the_refusal(self):
+        self.get(self.catalog.search, "spotify", "夜")
+        self.assertIsNotNone(self.catalog.provider_failure("spotify"))
+        self.catalog.invalidate()
+        self.assertIsNone(self.catalog.provider_failure("spotify"))
+        self.get(self.catalog.search, "spotify", "夜")
+        self.assertEqual(len(self.spotify_requests()), 2)
+        self.catalog.invalidate("spotify")
+        self.assertIsNone(self.catalog.provider_failure("spotify"))
+        self.get(self.catalog.tracks, "spotify", "YOUR MUSIC")
+        self.assertEqual(len(self.spotify_requests()), 3)
+        # tracks の 403 は上流が言い換える ("playlist not accessible") ので覚えない
+        self.assertIsNone(self.catalog.provider_failure("spotify"))
+        self.get(self.catalog.playlists, "spotify")
+        with unittest.mock.patch("cliamp_music.catalog.time.monotonic",
+                                 return_value=10 ** 9):
+            self.assertIsNone(self.catalog.provider_failure("spotify"))
+
+    def test_other_failures_are_not_remembered(self):
+        self.fake.spotify_owner_premium = False
+        self.fake.spotify_error = "spotify: rate limited by Spotify; retry after 24h0m0s"
+        self.get(self.catalog.playlists, "spotify")
+        self.get(self.catalog.playlists, "spotify")
+        self.assertEqual(len(self.spotify_requests()), 2)
+        self.assertIsNone(self.catalog.provider_failure("spotify"))
+
+
+class TrackHook(CatalogTest):
+    """取り込んだ曲の付け直し (AppContext が差す track_hook) は tracks / search / history に効く。"""
+
+    def test_hook_runs_on_track_lists(self):
+        seen = []
+
+        def hook(tracks):
+            seen.append(len(tracks))
+            return [Track(path=t.path, title=t.title + " ✓") for t in tracks]
+
+        self.catalog.track_hook = hook
+        local = self.get(self.catalog.tracks, "local", "Focus")
+        self.assertTrue(all(t.title.endswith(" ✓") for t in local))
+        history = self.get(self.catalog.history)
+        self.assertTrue(all(t.title.endswith(" ✓") for t in history))
+        found = self.get(self.catalog.search, "youtube", "夜")
+        self.assertTrue(all(t.title.endswith(" ✓") for t in found))
+        self.assertEqual(len(seen), 3)
+        # 覚えた答えは付け直した後のもの (もう一度は通さない)
+        self.get(self.catalog.tracks, "local", "Focus")
+        self.assertEqual(len(seen), 3)
+
+    def test_failing_hook_keeps_the_tracks(self):
+        def broken(_tracks):
+            raise RuntimeError("壊れた")
+
+        self.catalog.track_hook = broken
+        with unittest.mock.patch("cliamp_music.catalog.log") as log:
+            tracks = self.get(self.catalog.tracks, "local", "Focus")
+        self.assertEqual(len(tracks), 6)
+        log.assert_called_once()
 
 
 class _ManualClient:

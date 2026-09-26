@@ -423,6 +423,14 @@ icons["clear"] = svg("clear", circle(8, 8, 7.2), cross(8, 8, 3.0, 1.5, hole=True
 icons["warning"] = svg("warning", circle(8, 8, 7.2), rrect(7.05, 3.5, 8.95, 9.3, 0.95, hole=True),
                        circle(8, 11.75, 1.1, hole=True))
 
+# 取り込む (受け皿と下向きの矢印。square.and.arrow.down)
+icons["import"] = svg(
+    "import",
+    polyline([(4.4, 7.2), (2.4, 7.2), (2.4, 14.2), (13.6, 14.2), (13.6, 7.2), (11.6, 7.2)], 1.5),
+    capsule((8, 1.3), (8, 10.0), 1.6),
+    polyline([(4.9, 7.1), (8, 10.2), (11.1, 7.1)], 1.6),
+)
+
 OUT.mkdir(parents=True, exist_ok=True)
 for name, data in icons.items():
     (OUT / f"music-{name}-symbolic.svg").write_text(data)

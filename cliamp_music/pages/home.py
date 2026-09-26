@@ -451,17 +451,17 @@ def set_playlist_art(ctx, art: Artwork, tracks: list[Track], placeholder_key: st
         half = max(1, (px + 1) // 2)
         got: list[Gdk.Texture | None] = [None] * 4
         remaining = {"n": 4}
-        art_ref = weakref.ref(art)
         token = object()
         art._mosaic_token = token
 
-        def arrived(i: int, texture: Gdk.Texture) -> None:
+        # 絵は取れるまで (loader は必ず 1 度答える) 強く持つ。PyGObject の包みへの弱い参照は、Python から
+        # 誰も持っていない部品 (格子のカードの絵など) では、部品が生きていても消える
+        def arrived(i: int, texture: Gdk.Texture, target: Artwork = art) -> None:
             got[i] = texture
             remaining["n"] -= 1
             if remaining["n"] > 0:
                 return
-            target = art_ref()
-            if target is None or getattr(target, "_mosaic_token", None) is not token:
+            if getattr(target, "_mosaic_token", None) is not token:
                 return
             try:
                 target.set_texture(compose_mosaic([t for t in got if t is not None], px))
@@ -476,6 +476,40 @@ def set_playlist_art(ctx, art: Artwork, tracks: list[Track], placeholder_key: st
     else:
         art._mosaic_token = None
         art.set_subject(loader, ("placeholder", placeholder_key, "playlist"), kind="playlist")
+
+
+def imported_record(ctx, name: str, tracks: list[Track]):
+    """ローカルのプレイリスト name が、いまの曲 tracks から見て Spotify から取り込んだもののままなら、その
+    記録 (AppContext.imported_record。記録だけ残って中身が別物なら None)。"""
+    confirm = getattr(ctx, "imported_record", None)
+    return confirm(name, tracks) if callable(confirm) else None
+
+
+def set_local_playlist_art(ctx, art: Artwork, name: str, tracks: list[Track], placeholder_key: str,
+                           size: int) -> None:
+    """ローカルのプレイリストの絵。Spotify から取り込んだもの (のまま) で Spotify の絵 (記録の cover) が
+    分かればそれを、取れなければ (取れるまでは代わりの絵) 曲の絵から作る (set_playlist_art)。"""
+    record = imported_record(ctx, name, tracks)
+    cover = getattr(record, "cover_url", "") if record is not None else ""
+    if not cover:
+        set_playlist_art(ctx, art, tracks, placeholder_key, size)
+        return
+    loader = ctx.artwork
+    px = int(max(1, size) * max(1, art.get_scale_factor()))
+    art.set_subject(loader, ("placeholder", placeholder_key, "playlist"), kind="playlist")
+    token = object()
+    art._mosaic_token = token
+
+    def arrived(texture: Gdk.Texture, target: Artwork = art) -> None:
+        # 取れるまで強く持つ (set_playlist_art と同じ理由)
+        if getattr(target, "_mosaic_token", None) is not token:
+            return
+        if texture is loader.placeholder(cover, px, "track"):
+            set_playlist_art(ctx, target, tracks, placeholder_key, size)  # Spotify の絵が取れなかった
+        else:
+            target.set_texture(texture)
+
+    loader.request(cover, px, arrived)
 
 
 # --------------------------------------------------------------------------
@@ -1046,7 +1080,8 @@ class ContentStack(Gtk.Stack):
     """読み込み中 / 空・失敗 / 中身 を切り替える箱。
 
     `show_loading(text=None)` / `show_empty(icon, title, description=None, *, button_label=None,
-    on_button=None)` / `show_content()`。中身は `content` (縦の箱) に積む。"""
+    on_button=None, secondary_label=None, on_secondary=None)` / `show_content()`。中身は `content`
+    (縦の箱) に積む。"""
 
     def __init__(self, loading_text: str | None = None):
         super().__init__()
@@ -1070,12 +1105,15 @@ class ContentStack(Gtk.Stack):
         self.set_visible_child_name("loading")
 
     def show_empty(self, icon: str, title: str, description: str | None = None, *,
-                   button_label: str | None = None, on_button=None) -> None:
-        """空・失敗の表示。button_label があれば赤いカプセルのボタンも出す (押すと on_button)。"""
+                   button_label: str | None = None, on_button=None, secondary_label: str | None = None,
+                   on_secondary=None) -> None:
+        """空・失敗の表示。button_label があれば赤いカプセルのボタンも出す (押すと on_button)。
+        secondary_label があればその右に塗らないボタンも (押すと on_secondary)。"""
         self.empty.set_icon_name(icon)
         self.empty.set_title(title)
         self.empty.set_description(description)
         self.empty.set_button(button_label, on_button)
+        self.empty.set_secondary(secondary_label, on_secondary)
         self.set_visible_child_name("empty")
 
     def show_content(self) -> None:
@@ -1375,13 +1413,13 @@ class HomePage(PageBase):
         self.playlists.set_visible(bool(infos))
 
     def _fill_playlist_art(self, card: MediaCard, info: PlaylistInfo) -> None:
-        card_ref = weakref.ref(card)
-
-        def done(result) -> None:
-            target = card_ref()
-            if target is None or isinstance(result, Response):
+        # カードは曲の一覧が届くまで強く持つ (格子のカードは Python から誰も持っていないので、
+        # 包みへの弱い参照は部品が生きていても消え、絵が代わりの絵のままになっていた)
+        def done(result, target: MediaCard = card) -> None:
+            if isinstance(result, Response) or target.get_parent() is None:
                 return
-            set_playlist_art(self.ctx, target.art, result, f"{info.provider}:{info.id}", target.art_height)
+            set_local_playlist_art(self.ctx, target.art, info.id, result, f"{info.provider}:{info.id}",
+                                   target.art_height)
 
         self.ctx.catalog.tracks(info.provider, info.id, done)
 
