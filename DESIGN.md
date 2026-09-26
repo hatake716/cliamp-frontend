@@ -163,9 +163,19 @@ class CliampClient(GObject.Object):
     socket_path: str
     connected: bool; api: int            # api 0 = 拡張なし
     capabilities: dict                   # capabilities の応答 (commands, eq_presets)
-    def request(self, cmd, callback=None, *, timeout=None, **fields) -> None
-        # 1 要求 1 接続。スレッドプール (最大 4) で送り、callback(Response) を main loop で呼ぶ。
+    def request(self, cmd, callback=None, *, timeout=None, lane=None, parse=None, **fields) -> None
+        # 1 要求 1 接続。callback(Response) を main loop で呼ぶ。送る列は 3 つ:
+        #  - 順番の列 (ORDERED_COMMANDS: toggle / next / seek_to / queue_edit / replace など状態を
+        #    変えるもの): 1 本のスレッドが前の応答を待ってから次を送る (cliamp は接続ごとの
+        #    goroutine なので、続けて送ると届く順が入れ替わる)。1 つが offline / timeout なら
+        #    待っているものも同じ失敗ですぐ返す。
+        #  - 状態の読み取り (playlist / capabilities / device list): 2 本のプール。
+        #  - カタログ系: 最大 4 本のプール。load_provider とローカルのプレイリストの編集を先に。
+        #    lane を付けた要求 (検索) は、同じ lane の後の要求が来たら送らずに "cancelled"。
+        # 状態系の待ち時間は頼んだ時点から数え、待つうちに切れたら送らずに timeout
+        # (遅い検索の後ろで一時停止が 10 秒遅れて効く、といったことを起こさない)。
         # timeout 既定: 状態系 5 秒、カタログ系 130 秒。
+        # parse: worker のスレッドで応答を読む関数。渡すと callback(Response, 結果)。
     def start(self) -> None              # 状態の定期取得を始める (専用スレッド・専用接続)
     def stop(self) -> None
     def set_poll_interval(self, seconds: float) -> None   # 表示中 0.4 秒、隠れているとき 1.5 秒
@@ -188,21 +198,37 @@ class PlayerStore(GObject.Object):
     connected: bool; api: int; supports(cmd) -> bool
     def position_now(self) -> float      # 最後の status から経過時間で補間した位置 (再生中のみ進む)
     def current_track(self) -> Track | None
+    switching: bool                      # 曲の切り替え中 (読み込み中で位置と長さが前の曲のもの)
+    def can_seek(self) -> bool           # シークできるか (再生バー・ミニ・フルスクリーン・キーで共通)
+    def continues_by_reshuffle(self) -> bool   # シャッフル + リピート (すべて) で一巡の後も続くか
     # 操作 (すぐ手元の状態を楽観的に変え、次の status で本物に合わせる)
     def toggle(); play(); pause(); stop(); next(); prev()
     def seek_to(seconds); seek_by(delta)
     def set_volume_db(db); volume_step(delta_db)
     def set_shuffle(on: bool); set_repeat(mode: str); cycle_repeat()
     def set_speed(x: float); set_eq_preset(name); set_eq_band(index, db)
-    def list_devices(callback(list[tuple[str, bool]]))   # (名前, 使用中)
-    def set_device(name)
-    def play_index(i); replace(tracks, index=0, source=None)
-    def enqueue(tracks, mode="next"); queue_edit(mode, index=None, to=None); remove(index)
+    def list_devices(callback(list[Device], error: str))   # Device(name, label, active)
+    def set_device(name)                                     # name は sink 名 (label ではない)
+    def play_index(i, path=None); play_queued(i); replace(tracks, index=0, source=None)
+    def enqueue(tracks, mode="next"); queue_edit(mode, index=None, to=None, path=None)
+    def remove(index, path=None)
     def refresh_playlist(); refresh_history()
 ```
 
 `gen` が変わったら store が自分で `playlist` を取り直して `playlist-changed` を出す。
-`track-changed` のときは `history` も (少し遅らせて) 取り直す。
+gen が同じ (曲の中身は同じ) で位置・シャッフル・リピートだけが変わったときは
+`limit: 1` で取り、index / queue / up_next / source だけを入れ替える (曲の並びは同じ
+リストのまま。数千曲を読み直さない)。全部を取るときは worker のスレッドで解析する。
+取れなかったら間を空けて (1→2→4…30 秒) 取り直す。
+`track-changed` のときは `history` も (少し遅らせて) 取り直す (取っている間に頼まれた
+ものは後でもう 1 度、失敗も間を空けて取り直す)。
+添字で曲を指す操作 (play_index / remove / queue_edit) は見えていた曲の `path` も送り、
+cliamp が "stale" と断ったら (写しが古い) すぐ取り直す。
+待ち行列の曲を今すぐ鳴らすのは `play_queued` (前の待ち行列を外して next)。`play_index` は
+待ち行列から外さないので、その曲がもう 1 度鳴り、間のリストの曲が飛ぶ。
+シークは応答の後も、届く位置がシーク先に着くまで (最大 3 秒) 楽観的な位置を保つ
+(HTTP の流れは応答の後で繋ぎ直す)。曲の切り替え中 (switching) は位置 0・長さは新しい
+曲のものを見せ、シークを送らない。
 
 ### catalog.py
 
@@ -218,11 +244,13 @@ class Catalog:
     def load(self, provider, id, index=0, name="", callback=None)   # load_provider
     def playlist_add(self, name, tracks, callback=None)
     def playlist_delete(self, name, callback=None)
-    def playlist_remove_track(self, name, index, callback=None)
+    def playlist_remove_track(self, name, index, callback=None, path=None)
 ```
 
 失敗は `Response` (kind 付き) をそのまま callback に渡す。結果は短時間
-覚えておく (検索は同じ語で 10 分、プレイリスト一覧は 5 分)。
+覚えておく (検索は同じ語で 10 分、プレイリスト一覧は 5 分)。期限切れは足すたびに
+まとめて捨て、検索は新しい 200 件、歌詞は 300 件、曲の一覧は 100 件まで。
+検索ページは `lane` を付けて検索し、打ち直しで古い語の検索が worker を塞がないようにする。
 
 ### artwork.py
 
@@ -243,7 +271,11 @@ class ArtworkLoader:
    `thumbnail_url` (認証不要)。
 4. 手元のファイル: 埋め込みの絵 (mutagen があれば) → 同じフォルダの cover/folder.(jpg|png)。
 5. 取れなければ代わりの絵 (色のグラデーション + 音符)。
-取得した絵は正方形に切り抜き、最大 600px で PNG としてキャッシュする。
+取得した絵は正方形に切り抜き、最大 600px でキャッシュする (透けない絵は JPEG、透ける絵は
+PNG。件数 4000 と大きさ 256 MiB の両方で古いものから消し、200 枚保存するごとか 1 時間ごとに
+見直す)。絵は読みながら縮める (巨大な SVG / JPEG は 1200px 以下で描き、縮められない形で
+4000 万画素を超えるものは読まない)。手元の絵 (埋め込み・file://・キャッシュ) とネットワークは
+別の列で読み、ネットワークは 1 回の操作 4 秒・全体 12 秒・同じホストへ 2 本まで。
 
 ### radio.py
 
@@ -276,7 +308,7 @@ class GuiState:   # ~/.local/state/cliamp-music/state.json。壊れていたら�
 class AppContext:
     app; window; client; store; catalog; artwork; radio; state
     def navigate(self, page_id: str, **params)   # サイドバーの項目 = 根を差し替え、それ以外 = push
-    def toast(self, text: str)
+    def toast(self, text: str) -> Adw.Toast | None   # 窓が無い・文が空・1.5 秒以内の同じ文なら None
     def play_tracks(self, tracks, index=0, source=None)       # store.replace + 失敗時のトースト
     def play_now(self, track)                                  # enqueue(mode="now")
     def load_provider(self, provider, id, index=0, name="")
@@ -287,6 +319,12 @@ class AppContext:
         #       ステーションを作成 (YouTube の曲) / リンクをコピー (URL の曲) / ブラウザで開く /
         #       context が "nowplaying" なら「リストから削除」、"local:<name>" なら「プレイリストから削除」、
         #       "queue" なら「待ち行列から外す」
+        # ラジオの局 (live) には「プレイリストに追加」を出さない (TOML に live も局の絵も残らない)。
+        # 「プレイリストから削除」は先にファイルを読み直し、見ていた曲を外す (添字の別の曲を
+        # 消さない)。最後の曲を外すと cliamp はプレイリストごと消すので、一覧を取り直し
+        # 「空になったので削除しました」と知らせる (詳細のページは自分で閉じる)。
+    local_playlists: list[str]; local_playlists_loaded: bool   # 実際に取れた一覧か
+    def refresh_local_playlists(self, force=True, then=None)   # then(names | None)
 ```
 
 ### ページ
@@ -316,19 +354,34 @@ Adw.ApplicationWindow.music.music-window   既定 1180x760、最小 760x520
   └ Gtk.Stack root ("main" / "fullscreen")
     ├ main: Adw.OverlaySplitView (.music-split)   760sp 以下で畳む
     │   ├ sidebar: Sidebar (幅 220)
-    │   └ content: Gtk.Box (横)
-    │       ├ Gtk.Overlay (.music-content)
-    │       │   ├ Adw.NavigationView (ページ)
-    │       │   ├ 下端のフェード (再生バーの後ろを地の色へ溶かす帯、高さ 110)
-    │       │   └ PlayerBar (中央下、下余白 14、最大幅 780、左右の余白 28)
-    │       └ Gtk.Revealer (右から滑り込む、幅 300) → Gtk.Stack (LyricsPanel / QueuePanel)
+    │   └ content: Gtk.Overlay (再生バーを右パネルより上に浮かべる)
+    │       ├ Adw.OverlaySplitView (.music-panel-split、終わり側、幅 300)   1080sp 以下で重ねる
+    │       │   ├ content: Gtk.Box (縦)
+    │       │   │   ├ Adw.Banner (拡張の無い cliamp のときの細い帯)
+    │       │   │   └ Gtk.Overlay (.music-content)
+    │       │   │       ├ Adw.NavigationView (ページ)
+    │       │   │       ├ 未接続の全面の空状態
+    │       │   │       └ 下端のフェード (再生バーの後ろを地の色へ溶かす帯、高さ 110)
+    │       │   └ sidebar: Gtk.Stack (LyricsPanel / QueuePanel)
+    │       └ PlayerBar (内容の列の中央下、下余白 14、最大幅 780、左右の余白 28)
     └ fullscreen: FullscreenPlayer
 ```
 
+右パネルは Revealer ではなく終わり側の Adw.OverlaySplitView に入れる。広い窓では右から
+滑り込んで内容を押し縮め、1080sp 以下では内容の上に重ねる (狭い窓でパネルを開いたときに
+内容の列が再生バーの最小幅より細くなり、窓が勝手に広がるのを避けるため)。再生バーは
+パネルの割り当ての外に置く: 重ねたパネルは内容全体にクリックを奪う覆いを掛けるので、
+内容の中に置くとバーが押せなくなる。重ねている間、バーはパネルの左に収まればそこへ縮め、
+収まらなければ列の幅のままパネルの上に出す (パネルの一覧は下に余白を足して最後まで送れる)。
+
 未接続のとき: ナビゲーションの上に全面の空状態「cliamp に接続できません」と
-「cliamp を起動」ボタン (`systemctl --user start cliamp.service`)。拡張の無い
-cliamp (api 0) のときは上端に細い帯「この cliamp は拡張 IPC に対応していません。
-再生の操作だけ使えます」。
+「cliamp を起動」ボタン (`systemctl --user start cliamp.service`。環境変数
+CLIAMP_MUSIC_START_COMMAND で替えられる)。拡張の無い cliamp (api 0) のときは上端に細い帯
+「この cliamp は拡張 IPC に対応していません。再生の操作だけ使えます」。そのうえで:
+ホームは棚をすべて隠して説明だけを出し、検索とラジオは範囲・検索欄・節を隠して空状態
+(「この cliamp は拡張 IPC に対応していません」と api 1 が要ることの説明) を出す。
+シーク (Shift+Ctrl+←/→、再生バー・ミニプレーヤー・フルスクリーンのつまみ) は
+`supports("seek_to")` のときだけ、イコライザは `supports("eq")` のときだけ使える。
 
 ### サイドバー (sidebar.py)
 
@@ -362,7 +415,11 @@ macOS 27 の形: 窓の端まで続く帯 (浮かない)、赤い記号、選択
 4. その下に細い再生位置の線 (3px、ホバーで 5px とつまみ)。ドラッグで `seek_to`。
    ホバーで経過時間と残り時間を小さく出す。ライブ配信では線を出さず「ライブ」
 5. 「…」: 再生速度 ▸ (0.5〜2.0)、イコライザ…、再生中のリストを表示、リンクをコピー、ブラウザで開く
-6. 別の塊: 歌詞 (右パネル)、次に再生 (右パネル)、出力先 (`device list` の一覧)、音量 (押すと横のスライダーのポップオーバー)
+6. 別の塊: 歌詞 (右パネル)、次に再生 (右パネル)、出力先 (`device list` の一覧。見出しは説明か、
+   sink 名から作った「アナログ出力」「HDMI / DisplayPort」「Bluetooth (…)」。印は選んだ出力先。
+   取れないときは理由 (pactl が無いなど) を出す)、音量 (押すと横のスライダーのポップオーバー。
+   つまみはフルスクリーンと同じく dB に比例)。再生速度はメニューに無い速さ (1.1× など) なら
+   どの項目にも印を付けない
 
 狭い幅では 6 の出力先と 5 を先に隠し、次に 2 の副題を隠す。
 
@@ -371,11 +428,19 @@ macOS 27 の形: 窓の端まで続く帯 (浮かない)、赤い記号、選択
 - 歌詞: 22px/700 の行。今の行は明るく、他は 3 次色。今の行を上から 1/3 に保って
   滑らかに送る。行を押すとその時刻へ `seek_to`。同期していない歌詞は全行同じ色で
   送らない。無ければ「歌詞が見つかりません」。取得はパネルを開いているときだけ。
-- 次に再生: 上に 2 つの横長カプセル「シャッフル」「リピート」(オンで赤の塗り)。
-  その下に「履歴」(最近再生した 10 曲) → 「次に再生」(見出しの右に赤い「消去」=
-  待ち行列を空にする)。待ち行列 (`queue`) の曲、続いて `up_next` の曲。行は 48px
-  (絵 38px 角 4、曲名 13px、副題 11px、「…」)。行をダブルクリックで `play_index`。
-  最初に開いたときは「次に再生」の見出しまでスクロールしておく。
+- 歌詞のスクロールバーは出さない (ホイール・タッチパッドでは送れる。行を送るたびに重ねの
+  スクロールバーが浮かぶため)。
+- 次に再生 (フルスクリーンの次に再生と同じ組み立て): 上に 2 つの横長カプセル
+  「シャッフル」「リピート」(オンで赤の塗り)。その下に「履歴」(最近再生した 10 曲)。
+  待ち行列 (`queue`) があれば「次に再生」(見出しの右に赤い「消去」= 待ち行列を空にする) と
+  その曲、続いて見出し (出どころの名前か「再生中のリスト」、副題「このあと続けて再生されます」)
+  と `up_next` の曲。待ち行列が無ければ見出しは「次に再生」(副題は出どころの名前) と
+  `up_next` の曲。行は 48px (絵 38px 角 4、曲名 13px、副題 11px、「…」)。待ち行列の行の
+  ダブルクリックは `store.play_queued`、続きの行は `play_index` (見えていた曲の path 付き)。
+  シャッフル + リピート (すべて) で `up_next` が尽きても「次に再生する曲はありません」とは
+  言わず「このあとシャッフルし直して続けて再生します」と書く。行は鍵 (種類・添字・曲) で
+  使い回し、変わった行だけ外して足す。最初に開いたときは最初の「次に再生」の見出しまで
+  スクロールしておく。
 
 ### ホーム (pages/home.py)
 
@@ -398,7 +463,7 @@ macOS 27 の形: 窓の端まで続く帯 (浮かない)、赤い記号、選択
   ロック、ヒップホップ、ジャズ、クラシック、エレクトロニック、Lo-fi、作業用BGM、
   K-POP、90年代)。タイルを押すとその語で検索。
 - 結果: 左に「トップの結果」(大きな絵 + 曲名 + アーティスト + 再生ボタン)、右に
-  「曲」の最初の 4 行。その下に「曲」の全件 (40px の絵、曲名、アーティスト、時間、「…」)。
+  「曲」の最初の 4 行。その下に「すべての曲 (N)」の全件 (40px の絵、曲名、アーティスト、時間、「…」)。
   行のダブルクリック/Enter で結果全体を `replace` してその曲から再生。
 - 検索中はスピナー、失敗は理由を空状態で出す。
 
@@ -415,29 +480,44 @@ macOS 27 の形: 窓の端まで続く帯 (浮かない)、赤い記号、選択
   行: 絵 40px、曲名、アーティスト、「3 時間前」、時間。
 - 再生中のリスト (nowplaying.py): 詳細ページの形 (下)。題は `source.name` か
   「再生中のリスト」。行は番号付き、再生中の行は番号の代わりに赤い動くバー。
-  ダブルクリックで `play_index`。リストが変われば作り直す。
-- すべてのプレイリスト (playlists.py): プレイリストのカードの格子 (ローカル + 各プロバイダー)。
+  ダブルクリックで `play_index` (見えていた曲の path 付き)。リストが変わったときは差分だけ
+  (足した曲は末尾に足し、消した曲の行だけ外し、番号を付け直す。待ち行列の位置だけの変化では
+  行に触らない)。スクロール位置・選択・フォーカス・開いているメニューを失わない。
+- すべてのプレイリスト (playlists.py): 題は「プレイリスト」(サイドバーの項目は
+  「すべてのプレイリスト」)。プレイリストのカードの格子 (ローカル + 各プロバイダー)。
 - プレイリストの詳細: 左上に 250px の絵 (角 10、柔らかい影。先頭 4 曲の 2x2 か代わりの絵)、
   右に題 (26px/700)、提供元 (26px/400、赤)、情報の行「12 曲 · 48 分」(11px/600 副次色)、
   ボタン: シャッフルの丸 (34px) / 「▶ 再生」カプセル (34x120) / 「…」の丸。
-  下に曲の行 (43px、番号・曲名・時間・「…」、区切り線は曲名の列から)。
+  下に曲の行 (43px、番号・曲名・時間・「…」、区切り線は曲名の列から)。行のダブルクリックは
+  見えている並びをそのまま `replace` で送る (`load_provider` はプロバイダーに取り直させて
+  添字で選ぶので、見た後で並びが変わると別の曲が鳴る。replace の無い cliamp と 1 万曲を
+  超えるリストだけ `load_provider`)。ローカルのプレイリストが消えたら (最後の曲を外した・
+  TUI で消した) ページを閉じる。ファイルの場所 (`open …/X.toml`) は見せない。
 
 ### フルスクリーンプレーヤー (fullscreen.py、Shift+Ctrl+F、Esc で戻る)
 
-背景はアートワークを大きくぼかして暗くしたもの。左の列に 360px の絵、曲名、
+背景はアートワークを大きくぼかして暗くしたもの。左の列に絵、曲名、
 「アーティスト — アルバム」、再生位置 (経過 / 残り)、操作の列 (シャッフル・前・
-再生・次・リピート)、音量。右に大きな歌詞 (34px/800、今の行から離れるほど薄く)
-か次に再生。左上にガラスのカプセル (✕ / ミニプレーヤー)、右下に「歌詞 | 次に再生」の切り替え。
+再生・次・リピート)、音量。右に大きな歌詞 (今の行から離れるほど薄く) か次に再生。
+左上にガラスのカプセル (✕ / ミニプレーヤー)、右下に「歌詞 | 次に再生」の切り替え。
+大きさは窓 (画面) の大きさで段を選ぶ: 窓 (1180x760 ほど) では絵 360px・歌詞 34px/800、
+1400x900 以上 (1920x1080 のフルスクリーン) では 440px・42px、2200x1300 以上では 560px・52px
+(Apple のフルスクリーンと同じく高さのおよそ 4 割)。1060x720 以下では 300px・30px、
+860x600 以下では 240px・26px。次に再生はパネルと同じ (待ち行列の行は play_queued、
+一巡の後も続くときの書き添え)。
 
 ### ミニプレーヤー (miniplayer.py、Shift+Ctrl+M)
 
 別の小さな窓 (320x320)。アートワークが全面、マウスを乗せると下からぼかしの帯に
-曲名・位置・操作が出る。「…」で横長 (400x110) との切り替え。
+曲名・位置・操作が出る。「…」で横長 (400x110) との切り替え。隠れている帯はフォーカスも
+受けない (見えない「…」に Space や Tab が届かない)。歌詞・次に再生のボタンはメインの窓の
+右パネルを開く (フルスクリーンプレーヤーからは出てから)。
 
 ### イコライザ (equalizer.py、Ctrl+Alt+E)
 
 小さな窓。プリセットの選択 (`eq_presets` + 「カスタム」)、10 本の縦のスライダー
-(−12〜+12 dB、`EQ_BANDS` のラベル)。動かすと 80ms まとめて `eq` を送る。
+(−12〜+12 dB、`EQ_BANDS` の見出し)、フラットに戻す、再生速度。動かすと 80ms まとめて
+`eq` を送る。On のスイッチとプリアンプは無い (cliamp に無いため)。
 
 ## 5. 見た目の基準値 (style/base.css の変数)
 
@@ -468,11 +548,11 @@ macOS 27 の形: 窓の端まで続く帯 (浮かない)、赤い記号、選択
 
 | キー | 動作 |
 |---|---|
-| Space | 再生/一時停止 (文字入力中は除く) |
+| Space | 再生/一時停止 (どの窓でも。文字入力中と開いているメニューの中は除く) |
 | Ctrl+→ / Ctrl+← | 次へ / 前へ |
 | Shift+Ctrl+→ / ← | 10 秒進む / 戻る (Ctrl+Alt+矢印は GNOME の作業領域の切り替えと重なるため使わない) |
 | Ctrl+↑ / Ctrl+↓ | 音量 ±2 dB |
-| Ctrl+. | 停止 |
+| Ctrl+. | 停止 (文字入力中は除く。入力欄では GtkText の絵文字の選択) |
 | Ctrl+L | 再生中の曲をリストで表示 |
 | Ctrl+F | 検索 |
 | Ctrl+Alt+U | 次に再生 (右パネル) |
@@ -483,3 +563,10 @@ macOS 27 の形: 窓の端まで続く帯 (浮かない)、赤い記号、選択
 | Ctrl+R | ページを更新 |
 | Ctrl+0 | メインの窓 |
 | Ctrl+W / Ctrl+Q | 窓を閉じる / 終了 |
+
+Ctrl+→ / Ctrl+← / Shift+Ctrl+→ / ← と Ctrl+. は、いま前にある (active な) 窓のフォーカスが
+文字の入力欄にある間は止めて入力欄に譲る (アプリのショートカットは入力欄より先に働くため。
+隠れたメインの窓の入力欄がミニプレーヤーやイコライザのショートカットを止めることはない)。
+Shift+Ctrl+→ / ← とつまみのシークは、曲の切り替え中 (読み込み中) には送らない。
+窓が隠れている (X11 の最小化、Wayland の SUSPENDED = 最小化・覆われた・別のワークスペース)
+間は状態を 1.5 秒ごとに取る (見えている間は 0.4 秒)。

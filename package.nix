@@ -9,6 +9,7 @@
 {
   lib,
   stdenvNoCC,
+  runCommand,
   makeWrapper,
   wrapGAppsHook4,
   gobject-introspection,
@@ -19,6 +20,8 @@
   glib,
   gdk-pixbuf,
   librsvg,
+  webp-pixbuf-loader,
+  libjxl,
   adwaita-icon-theme,
   hicolor-icon-theme,
 }:
@@ -32,6 +35,17 @@ let
   ]);
   appId = "org.nixos.Music";
   appDir = "share/${appId}";
+  # gdk-pixbuf の読み込み口の一覧 (GDK_PIXBUF_MODULE_FILE)。wrapGAppsHook4 は librsvg の
+  # loaders.cache (bmp gif ico … svg だけ) を --set するので、そのままでは利用者の画面の一覧
+  # (webp・jxl を含む) を捨ててしまい、Radio Browser の WebP の favicon が読めない。
+  # 読み込み口ごとの一覧は絶対パスなので、つなげるだけで 1 つの一覧になる
+  # (setup hook は loaders.cache という名前のものしか拾わないので、buildInputs に足しても効かない)。
+  pixbufLoaders = runCommand "cliamp-music-pixbuf-loaders.cache" { } ''
+    cat ${librsvg}/${gdk-pixbuf.binaryDir}/loaders.cache \
+        ${webp-pixbuf-loader}/${gdk-pixbuf.binaryDir}/webp-loaders.cache \
+        ${libjxl}/${gdk-pixbuf.binaryDir}/jxl-loaders.cache > "$out"
+    grep -q svg "$out" && grep -q webp "$out"
+  '';
 in
 stdenvNoCC.mkDerivation {
   pname = "cliamp-music";
@@ -111,11 +125,13 @@ stdenvNoCC.mkDerivation {
     runHook postInstall
   '';
 
+  # gappsWrapperArgs の後の --set が勝つ (librsvg だけの一覧を、WebP も読める一覧に替える)
   preFixup = ''
     makeWrapper ${lib.getExe pythonEnv} "$out/bin/cliamp-music" \
       --add-flags "-m cliamp_music" \
       --prefix PYTHONPATH : "$out/${appDir}" \
-      "''${gappsWrapperArgs[@]}"
+      "''${gappsWrapperArgs[@]}" \
+      --set GDK_PIXBUF_MODULE_FILE ${pixbufLoaders}
   '';
 
   # 画面の要らない単体試験と、包んだ実行ファイルの自己診断。画面を使う
@@ -129,6 +145,8 @@ stdenvNoCC.mkDerivation {
     export XDG_CACHE_HOME="$TMPDIR/cache" XDG_STATE_HOME="$TMPDIR/state"
     # 検査で import したときの __pycache__ を $out に残さない。
     export PYTHONDONTWRITEBYTECODE=1
+    # アプリと同じ読み込み口で試す (WebP の試験を飛ばさない)
+    export GDK_PIXBUF_MODULE_FILE=${pixbufLoaders} CLIAMP_MUSIC_REQUIRE_WEBP=1
     unset DISPLAY WAYLAND_DISPLAY
     ${pythonEnv.interpreter} -m unittest discover -s tests -v
 
@@ -139,7 +157,7 @@ stdenvNoCC.mkDerivation {
     runHook postInstallCheck
   '';
 
-  passthru = { inherit pythonEnv; };
+  passthru = { inherit pythonEnv pixbufLoaders; };
 
   meta = {
     description = "macOS 27 Music-style GTK frontend for the cliamp terminal music player";

@@ -24,6 +24,7 @@ from .catalog import Catalog  # noqa: E402
 from .client import CliampClient  # noqa: E402
 from .protocol import (  # noqa: E402
     RECENTLY_PLAYED,
+    STALE,
     Response,
     Source,
     Track,
@@ -51,8 +52,10 @@ class AppContext(GObject.Object):
     """アプリの部品 (app, window, client, store, catalog, artwork, radio, state) の束。
 
     省いた部品は既定の設定で作る。window は窓を作った後で代入する。
-    シグナル "local-playlists-changed": ローカルのプレイリストの一覧が変わった
-    (新規プレイリストを作ったときなど。サイドバーの取り直しに使う)。
+    シグナル "local-playlists-changed": ローカルのプレイリストの一覧か中身が変わった
+    (新規プレイリストを作った・曲を外したときなど。サイドバーと詳細ページの取り直しに使う)。
+    cliamp は最後の曲を外したプレイリストをファイルごと消すので、外した後は一覧を
+    取り直してから知らせる (消えたプレイリストのページは自分で閉じる)。
     """
 
     __gtype_name__ = "CliampMusicAppContext"
@@ -74,6 +77,7 @@ class AppContext(GObject.Object):
         self.radio = radio or RadioBrowser()
         self.state = state or GuiState()
         self._local_playlists: list[str] = []
+        self._local_playlists_loaded = False
         self._playlist_menus: deque[Gio.Menu] = deque(maxlen=32)
         self.store.connect("connection-changed", self._on_connection)
         if self.store.connected:
@@ -146,29 +150,46 @@ class AppContext(GObject.Object):
         """覚えているローカルのプレイリスト名 (書き込めるものだけ)。"""
         return list(self._local_playlists)
 
-    def refresh_local_playlists(self, force: bool = True) -> None:
+    @property
+    def local_playlists_loaded(self) -> bool:
+        """local_playlists が今の cliamp から実際に取れた一覧か (最初の空や未接続ではない)。"""
+        return self._local_playlists_loaded and self.store.connected
+
+    def refresh_local_playlists(self, force: bool = True, then=None) -> None:
+        """ローカルのプレイリストの一覧を取り直す。一覧が変われば "local-playlists-changed"。
+
+        then(names) は取り終えたときに呼ぶ (names は取れた一覧、取れなければ None)。"""
         if not self.store.supports("playlists"):
             # 拡張の無い cliamp に繋ぎ直したときは、前の cliamp の一覧を残さない
+            self._local_playlists_loaded = False
             if self._local_playlists:
                 self._local_playlists = []
                 for menu in list(self._playlist_menus):
                     self._fill_playlist_menu(menu)
                 self.emit("local-playlists-changed")
+            if then is not None:
+                then(None)
             return
 
         def done(result) -> None:
             if isinstance(result, Response):
+                if then is not None:
+                    then(None)
                 return
             names = [info.name for info in result if info.id != RECENTLY_PLAYED]
+            self._local_playlists_loaded = True
             if names != self._local_playlists:
                 self._local_playlists = names
                 for menu in list(self._playlist_menus):
                     self._fill_playlist_menu(menu)
                 self.emit("local-playlists-changed")
+            if then is not None:
+                then(names)
 
         self.catalog.playlists("local", done, force=force)
 
     def _on_connection(self, _store) -> None:
+        self._local_playlists_loaded = False
         if self.store.connected:
             # 繋ぎ直した cliamp は別物かもしれない (再起動・拡張の有無・サインイン)。
             # 覚えているカタログの結果を捨ててから取り直す
@@ -294,18 +315,22 @@ class AppContext(GObject.Object):
             [track], "end", callback=self._toast_done(f"「{title}」を最後に再生します", "追加できませんでした")),
             supports("enqueue"))
 
-        playlists = Gio.Menu()
-        self._fill_playlist_menu(playlists)
-        self._playlist_menus.append(playlists)
-        add = Gio.Menu()
-        add.append_submenu("プレイリストに追加", playlists)
-        menu.append_section(None, add)
-        can_add = supports("playlist_add")
-        action("add-to-playlist", lambda v: self.add_to_playlist(v.get_string(), [track]), can_add,
-               GLib.VariantType.new("s"))
-        action("new-playlist", lambda _v: self.ask_new_playlist([track]), can_add)
-        if can_add:
-            self.refresh_local_playlists(force=False)
+        # ラジオなど終わりの無い流れ (live) はプレイリストに入れない: ローカルのプレイリスト
+        # (TOML) には live も局の絵も残らず、ふつうの曲として読み戻されるため
+        # (「プレイリストとして保存」も live を除く)
+        if not track.live:
+            playlists = Gio.Menu()
+            self._fill_playlist_menu(playlists)
+            self._playlist_menus.append(playlists)
+            add = Gio.Menu()
+            add.append_submenu("プレイリストに追加", playlists)
+            menu.append_section(None, add)
+            can_add = supports("playlist_add")
+            action("add-to-playlist", lambda v: self.add_to_playlist(v.get_string(), [track]), can_add,
+                   GLib.VariantType.new("s"))
+            action("new-playlist", lambda _v: self.ask_new_playlist([track]), can_add)
+            if can_add:
+                self.refresh_local_playlists(force=False)
 
         if track.youtube_id:
             station = Gio.Menu()
@@ -326,15 +351,17 @@ class AppContext(GObject.Object):
         if index is not None:
             if context == "nowplaying":
                 removal = ("リストから削除", "remove", lambda _v: self.store.remove(
-                    index, callback=self._toast_failure("削除できませんでした")), supports("remove"))
+                    index, callback=self._toast_failure("削除できませんでした"), path=track.path),
+                    supports("remove"))
             elif context.startswith("local:") and len(context) > len("local:"):
                 playlist_name = context[len("local:"):]
                 removal = ("プレイリストから削除", "remove-from-playlist",
-                           lambda _v: self._remove_from_playlist(playlist_name, index),
+                           lambda _v: self._remove_from_playlist(playlist_name, index, track),
                            supports("playlist_remove_track"))
             elif context == "queue":
                 removal = ("待ち行列から外す", "dequeue", lambda _v: self.store.queue_edit(
-                    "remove", index=index, callback=self._toast_failure("外せませんでした")), supports("queue_edit"))
+                    "remove", index=index, callback=self._toast_failure("外せませんでした"), path=track.path),
+                    supports("queue_edit"))
         if removal is not None:
             label, action_name, handler, enabled = removal
             section = Gio.Menu()
@@ -349,12 +376,61 @@ class AppContext(GObject.Object):
 
         return done
 
-    def _remove_from_playlist(self, name: str, index: int) -> None:
-        def done(response: Response) -> None:
-            if response.ok:
-                self.toast(f"「{name}」から削除しました")
-                self.emit("local-playlists-changed")
-            else:
-                self.toast(f"削除できませんでした: {response.message}")
+    def _remove_from_playlist(self, name: str, index: int, track: Track | None = None) -> None:
+        """ローカルのプレイリストから index の曲を外す。
 
-        self.catalog.playlist_remove_track(name, index, done)
+        cliamp は添字で外すので、先に今のファイルの中身を読み直し、その位置の曲が見ていた曲
+        (track) と違えば (TUI で並べ替えた・消したなど) 同じ曲のいちばん近い位置を外す
+        (見ていない曲を消さない)。最後の曲を外すと cliamp はプレイリストごと消すので、
+        一覧を取り直してから知らせる。"""
+        if track is None:
+            self._remove_at(name, index)
+            return
+
+        def checked(result) -> None:
+            if isinstance(result, Response):
+                self.toast(f"削除できませんでした: {result.message}")
+                return
+            paths = [t.path for t in result]
+            if 0 <= index < len(paths) and paths[index] == track.path:
+                self._remove_at(name, index, track)
+                return
+            candidates = [i for i, path in enumerate(paths) if path == track.path]
+            if not candidates:
+                self.toast(f"「{name}」の中身が変わっていたので、削除しませんでした")
+                self.emit("local-playlists-changed")
+                return
+            self._remove_at(name, min(candidates, key=lambda i: abs(i - index)), track)
+
+        self.catalog.tracks("local", name, checked, force=True)
+
+    def _remove_at(self, name: str, index: int, track: Track | None = None, retried: bool = False) -> None:
+        def done(response: Response) -> None:
+            if not response.ok and response.error == STALE and track is not None and not retried:
+                # 読み直した後でまた動いた (TUI で編集中など)。もう 1 度だけ読み直して選び直す
+                def again(result) -> None:
+                    paths = [] if isinstance(result, Response) else [t.path for t in result]
+                    candidates = [i for i, path in enumerate(paths) if path == track.path]
+                    if not candidates:
+                        self.toast(f"「{name}」の中身が変わっていたので、削除しませんでした")
+                        self.emit("local-playlists-changed")
+                        return
+                    self._remove_at(name, min(candidates, key=lambda i: abs(i - index)), track, True)
+
+                self.catalog.tracks("local", name, again, force=True)
+                return
+            if not response.ok:
+                self.toast(f"削除できませんでした: {response.message}")
+                return
+
+            def listed(names) -> None:
+                if names is not None and name not in names:
+                    # 空になったのでファイルごと消えた (一覧が変わったので知らせは出ている)
+                    self.toast(f"「{name}」は空になったので削除しました")
+                    return
+                self.toast(f"「{name}」から削除しました")
+                self.emit("local-playlists-changed")  # 中身が変わった (一覧の名前は同じ)
+
+            self.refresh_local_playlists(force=True, then=listed)
+
+        self.catalog.playlist_remove_track(name, index, done, path=track.path if track is not None else None)

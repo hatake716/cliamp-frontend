@@ -28,7 +28,7 @@
 
 撮る画面 (NAME): home, search, search-results, radio, recent, playlists, playlist,
 nowplaying, lyrics, queue, fullscreen-lyrics, fullscreen-queue, mini-square, mini-compact,
-equalizer, stress, narrow, collapsed, collapsed-sidebar, disconnected, reconnected, legacy,
+equalizer, stress, narrow, collapsed, collapsed-sidebar, panel-over, disconnected, reconnected, legacy,
 legacy-playlists, legacy-search。
 """
 
@@ -63,7 +63,7 @@ FAILURE_PATTERNS = (
 # 角丸の合成を作る画面 (窓全体を撮ったもの)
 FRAMED = ("home", "search", "search-results", "radio", "recent", "playlists", "playlist",
           "nowplaying", "lyrics", "queue", "fullscreen-lyrics", "fullscreen-queue", "stress",
-          "narrow", "collapsed-sidebar", "disconnected", "legacy", "mini-square", "mini-compact",
+          "narrow", "collapsed-sidebar", "panel-over", "disconnected", "legacy", "mini-square", "mini-compact",
           "equalizer")
 
 LONG_TITLE = "夜明け前のプラットホームで君を待つ & <特別版> — とても長い日本語の曲名が再生バーに入りきらないとき"
@@ -410,8 +410,9 @@ class FakeProcess:
         self.stop()
         if os.path.exists(self.socket_path):
             os.unlink(self.socket_path)
+        # 利用者の radios.toml の局とお気に入りもある cliamp として撮る (ラジオの棚が並ぶ)
         cmd = [sys.executable, str(ROOT / "tests" / "fake_cliamp.py"), "--socket", self.socket_path,
-               "--art-dir", str(self.art_dir), *extra]
+               "--art-dir", str(self.art_dir), "--radios-toml", *extra]
         self.proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                      preexec_fn=_die_with_parent)
         deadline = time.monotonic() + 10
@@ -795,8 +796,9 @@ def child_main(args: argparse.Namespace) -> int:
 
     def scene_queue():
         window = win()
-        tracks = library()
-        store().enqueue([tracks[7], tracks[10]], "next")
+        # 待ち行列 (「次に再生」の節) に 2 曲。enqueue next は待ち行列を使わず続きの先頭に並べる
+        store().queue_edit("add", index=7)
+        store().queue_edit("add", index=10)
         yield Until(lambda: len(store().playlist.queue) >= 2, 5, "待ち行列に入らない")
         app().activate_action("show-queue", None)
         yield Until(lambda: window.panel == "queue", 3, "Ctrl+Alt+U で次に再生が開かない")
@@ -831,8 +833,8 @@ def child_main(args: argparse.Namespace) -> int:
         yield 1.6
         capture(window, "fullscreen-lyrics")
         player.set_mode("queue")
-        tracks = library()
-        store().enqueue([tracks[5], tracks[8]], "next")
+        store().queue_edit("add", index=5)
+        store().queue_edit("add", index=8)
         yield Until(lambda: len(store().playlist.queue) >= 2, 5, "待ち行列に入らない")
         yield 1.2
         capture(window, "fullscreen-queue")
@@ -927,6 +929,20 @@ def child_main(args: argparse.Namespace) -> int:
         yield 0.6
         check(page_id() == "radio" and not window.split.get_show_sidebar(),
               "畳んだサイドバーで選んでもページが変わらないか、サイドバーが閉じません")
+        # 右パネルを内容の上に重ねる幅 (1080sp 以下): 再生バーはパネルの左に縮めて押せるまま
+        resize(1000)
+        yield Until(lambda: not window.split.get_collapsed() and window.panel_split.get_collapsed(), 3,
+                    "幅 1000 で右パネルが重ねにならない")
+        window.show_panel("queue")
+        yield 1.2
+        bar = window.player_bar
+        ok, bounds = bar.compute_bounds(window)
+        ok2, panel = window.panel_stack.compute_bounds(window)
+        check(ok and ok2 and bounds.get_x() + bounds.get_width() <= panel.get_x() + 1,
+              "重ねた右パネルの下に再生バーが潜っています")
+        capture(window, "panel-over")
+        window.show_panel("")
+        yield 0.4
         resize(1180)
         yield Until(lambda: not window.split.get_collapsed(), 3, "幅を戻してもサイドバーが戻らない")
         window.navigate("home")

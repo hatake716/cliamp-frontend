@@ -23,6 +23,7 @@ from __future__ import annotations
 import random
 import sys
 import weakref
+from dataclasses import replace as dc_replace
 from typing import Callable, Iterable
 
 import gi
@@ -782,10 +783,30 @@ class DetailHeader(Gtk.Box):
         self.set_spacing(20 if narrow else 30)
 
 
+def row_key(track: Track) -> Track:
+    """行の見た目を決める中身 (比べる鍵)。待ち行列の位置 (queued) と再生時刻 (played_at) は
+    行に出ないので除く (待ち行列を変えただけで行を作り直さない)。"""
+    if track.queued or track.played_at:
+        return dc_replace(track, queued=0, played_at="")
+    return track
+
+
+def _close_row_menus(row: Gtk.Widget) -> None:
+    more = getattr(row, "more", None)
+    if isinstance(more, Gtk.MenuButton) and more.get_active():
+        more.popdown()
+    popover = getattr(row, "_context_popover", None)
+    if popover is not None and popover.get_visible():
+        popover.popdown()
+
+
 class ChunkedRows:
     """TrackList に行を少しずつ足す (数千曲のリストでも画面を止めない)。
 
     `build(tracks)` で並びを入れ替える。最初の chunk 行はその場で、残りは idle で足す。
+    `update(tracks)` は差分だけを当てる: 前後の同じ行 (row_key が同じ) は残し、間だけを
+    外して足し、番号と index を付け直す。末尾に足しただけ (次に再生・mix の追加) なら
+    足すだけ。スクロール位置・選択・開いているメニュー (その行が残るとき) を失わない。
     make_row(index, track) は行を返す (ページの weak_handler を渡す)。on_progress(built)
     は足すたびに呼ぶ (再生中の行の印を付け直すため)。"""
 
@@ -816,6 +837,93 @@ class ChunkedRows:
         self.built = 0
         clear_box(self.list)
         self._step(self._serial)
+
+    def update(self, tracks: list[Track]) -> None:
+        """並びを tracks に合わせる (差分だけ)。行がまだ無ければ build と同じ。"""
+        new = list(tracks)
+        old = self.tracks
+        if not old or self.list.get_first_child() is None:
+            self.build(new)
+            return
+        old_keys = [row_key(t) for t in old]
+        new_keys = [row_key(t) for t in new]
+        limit = min(len(old), len(new))
+        prefix = 0
+        while prefix < limit and old_keys[prefix] == new_keys[prefix]:
+            prefix += 1
+        rows = self.list.rows() if hasattr(self.list, "rows") else []
+        if self.built < len(old):
+            # まだ作っている途中
+            if prefix < self.built:
+                # 作った行の途中から変わった: そこから先を作り直す
+                self._keep_focus(rows, prefix, len(rows))
+                for row in rows[prefix:]:
+                    _close_row_menus(row)
+                    self.list.remove(row)
+                self.built = prefix
+                rows = rows[:prefix]
+            self.cancel()
+            self.tracks = new
+            self._retrack(rows, 0)
+            self._step(self._serial)
+            return
+        suffix = 0
+        while (suffix < limit - prefix
+               and old_keys[len(old) - 1 - suffix] == new_keys[len(new) - 1 - suffix]):
+            suffix += 1
+        removed_end = len(old) - suffix
+        self._keep_focus(rows, prefix, removed_end)
+        for row in rows[prefix:removed_end]:
+            _close_row_menus(row)
+            self.list.remove(row)
+        if suffix == 0:
+            # 末尾が変わった (足しただけも含む): 続きとして少しずつ作る
+            self.cancel()
+            self.tracks = new
+            self.built = prefix
+            self._retrack(rows[:prefix], 0)
+            self._step(self._serial)
+            return
+        for offset, track in enumerate(new[prefix:len(new) - suffix]):
+            row = self.make_row(prefix + offset, track)
+            if row is not None:
+                self.list.insert(row, prefix + offset)
+        self.tracks = new
+        self.built = len(new)
+        self._retrack(self.list.rows() if hasattr(self.list, "rows") else [], 0)
+        if self.on_progress is not None:
+            self.on_progress(self.built)
+
+    def _retrack(self, rows: list, start: int) -> None:
+        """行の index・番号・曲を今の並びに合わせる (開いているメニューは添字が変われば閉じる)。"""
+        for i in range(start, min(len(rows), len(self.tracks))):
+            row = rows[i]
+            track = self.tracks[i]
+            if getattr(row, "index", i) != i:
+                _close_row_menus(row)
+                row.index = i
+                if hasattr(row, "set_number"):
+                    row.set_number(i + 1)
+            if getattr(row, "track", track) is not track:
+                row.track = track
+
+    def _keep_focus(self, rows: list, start: int, end: int) -> None:
+        """外す行にフォーカスがあれば、隣の残る行へ移す (GTK は先頭の行へ移し、一覧が
+        先頭までスクロールしてしまう)。"""
+        if start >= end:
+            return
+        root = self.list.get_root()
+        focus = root.get_focus() if root is not None and hasattr(root, "get_focus") else None
+        if focus is None:
+            return
+        for row in rows[start:end]:
+            if focus is row or focus.is_ancestor(row):
+                neighbour = rows[start - 1] if start > 0 else (rows[end] if end < len(rows) else None)
+                if neighbour is not None:
+                    neighbour.grab_focus()
+                else:
+                    root.set_focus(None)
+                return
 
     def _step(self, serial: int) -> bool:
         self._idle = 0
@@ -1112,7 +1220,7 @@ class HomePage(PageBase):
                     card.art.set_subject(self.ctx.artwork, subject)
             return
         self._pick_keys = keys
-        self.picks.remove_all()
+        self.picks.remove_all(reset_scroll=False)
         for kind, subject, overline, title in items:
             card = TallCard(self.ctx.artwork, subject, overline, title, weak_handler(self._on_pick),
                             kind="station" if kind == "radio" else "track")
@@ -1141,12 +1249,19 @@ class HomePage(PageBase):
             return
         self._recent_keys = keys
         self._recent_tracks = tracks
-        self.recent.remove_all()
-        for i, track in enumerate(tracks):
-            card = MediaCard(self.ctx.artwork, track, track.display_title, track.artist or track.album,
-                             170, on_activate=weak_handler(self._on_recent))
+        # 曲が変わるたびに履歴の先頭が入れ替わる。カードは曲ごとに使い回し、並べ替えるだけにする
+        # (見ている送り位置を先頭へ戻さず、絵も読み直さない)
+        existing = {getattr(card, "recent_key", None): card for card in self.recent.items()}
+        cards = []
+        for i, (key, track) in enumerate(zip(keys, tracks)):
+            card = existing.pop(key, None)
+            if card is None:
+                card = MediaCard(self.ctx.artwork, track, track.display_title, track.artist or track.album,
+                                 170, on_activate=weak_handler(self._on_recent))
+                card.recent_key = key
             card.track_index = i
-            self.recent.append(card)
+            cards.append(card)
+        self.recent.set_items(cards)
         self.recent.set_visible(bool(tracks))
 
     def _on_recent(self, card) -> None:

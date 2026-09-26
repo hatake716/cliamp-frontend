@@ -226,6 +226,46 @@ class ParseOthers(unittest.TestCase):
         self.assertFalse(plain.synced)
         self.assertEqual(plain.index_at(30), -1)
 
+    def test_path_raw_round_trip_and_local_path(self):
+        """UTF-8 でない名前のファイル: path_raw をそのまま送り返し、ファイルはそのバイト列で開く。"""
+        import base64
+        import os
+
+        raw = base64.b64encode(b"/music/\x83e\x83X.flac").decode()
+        track = p.Track.from_wire({"path": "/music/\ufffde\ufffdX.flac", "path_raw": raw, "title": "t"})
+        self.assertEqual(track.to_wire()["path_raw"], raw)
+        self.assertEqual(os.fsencode(track.local_path), b"/music/\x83e\x83X.flac")
+        self.assertNotIn("path_raw", p.Track(path="/music/a.flac").to_wire())
+        self.assertEqual(p.Track(path="/m/a.flac", path_raw="!!").local_path, "/m/a.flac")  # 壊れていれば path
+
+    def test_stale_message(self):
+        response = p.Response(False, {"ok": False, "error": "stale"}, "stale", "error")
+        self.assertIn("もう一度", response.message)
+
+    def test_device_list_prefers_descriptions(self):
+        data = {"device": "* alsa_output.pci-0000_0c_00.4.analog-stereo\n  bluez_output.AC_80_0A_12_34_56.1",
+                "devices": [{"name": "alsa_output.pci-0000_0c_00.4.analog-stereo",
+                             "description": "Starship/Matisse HD Audio Controller Analog Stereo", "active": True},
+                            {"name": "bluez_output.AC_80_0A_12_34_56.1", "description": "WH-1000XM5"}]}
+        devices = p.parse_device_list(data)
+        self.assertEqual([d.label for d in devices], ["Starship/Matisse HD Audio Controller Analog Stereo",
+                                                      "WH-1000XM5"])
+        self.assertEqual(devices[1].name, "bluez_output.AC_80_0A_12_34_56.1")
+        self.assertEqual([d.active for d in devices], [True, False])
+
+    def test_device_list_without_descriptions(self):
+        devices = p.parse_device_list({"device": "* alsa_output.pci-0000_0c_00.4.analog-stereo\n"
+                                                 "  alsa_output.pci-0000_03_00.1.hdmi-stereo-extra1\n"
+                                                 "  alsa_output.usb-Focusrite_Scarlett_2i2-00.analog-stereo\n"
+                                                 "  my_custom_sink"})
+        self.assertEqual([d.label for d in devices],
+                         ["アナログ出力", "HDMI / DisplayPort 2", "USB オーディオ (アナログ出力)", "my_custom_sink"])
+        self.assertEqual(devices[0].name, "alsa_output.pci-0000_0c_00.4.analog-stereo")
+        self.assertTrue(devices[0].active)
+        # 見出しが重なれば sink 名を添えて見分ける
+        twins = p.parse_device_list({"device": "* alsa_output.a.analog-stereo\n  alsa_output.b.analog-stereo"})
+        self.assertEqual(twins[0].label, "アナログ出力 — alsa_output.a.analog-stereo")
+
     def test_devices(self):
         devices = p.parse_devices("* 既定の出力\n  HDMI 2\n\n  USB DAC ")
         self.assertEqual(devices, [("既定の出力", True), ("HDMI 2", False), ("USB DAC", False)])
@@ -237,6 +277,15 @@ class ParseOthers(unittest.TestCase):
 
 
 class Helpers(unittest.TestCase):
+    def test_volume_slider_mapping_is_linear_in_db(self):
+        """再生バーとフルスクリーンの音量のつまみは同じ換算 (-6 dB は 2/3 の位置)。"""
+        self.assertAlmostEqual(p.volume_fraction(-6.0), 24 / 36)
+        self.assertAlmostEqual(p.volume_fraction(-12.0), 0.5)
+        self.assertEqual(p.volume_fraction(-40), 0.0)
+        self.assertEqual(p.fraction_to_volume(0.5), -12.0)
+        for db in (-30, -18, -6, 0, 6):
+            self.assertAlmostEqual(p.fraction_to_volume(p.volume_fraction(db)), db)
+
     def test_volume_matches_cliamp_mpris(self):
         """cliamp の mediactl/volume.go と同じ換算 (lin = 10^((dB-6)/20)、-30 dB 以下は 0)。"""
         self.assertEqual(p.db_to_linear(-30), 0.0)

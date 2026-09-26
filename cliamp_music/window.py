@@ -5,21 +5,26 @@
       └ Gtk.Stack root ("main" / "fullscreen")
         ├ main: Adw.OverlaySplitView (.music-split)           760sp 以下で畳む
         │   ├ sidebar: Sidebar (幅 220)
-        │   └ content: Adw.OverlaySplitView (.music-panel-split、右パネル、幅 300)
-        │       ├ content: Gtk.Box (縦)
-        │       │   ├ Adw.Banner (拡張の無い cliamp のときの細い帯)
-        │       │   └ Gtk.Overlay (.music-content)
-        │       │       ├ Adw.NavigationView (ページ)
-        │       │       ├ 未接続の全面の空状態
-        │       │       ├ 下端のフェード (再生バーの後ろを地の色へ溶かす帯、高さ 110)
-        │       │       └ PlayerBar (中央下、下余白 14、最大幅 780、左右の余白 28)
-        │       └ sidebar: Gtk.Stack (LyricsPanel / QueuePanel)
+        │   └ content: Gtk.Overlay (再生バーを右パネルより上に浮かべる)
+        │       ├ Adw.OverlaySplitView (.music-panel-split、右パネル、幅 300)
+        │       │   ├ content: Gtk.Box (縦)
+        │       │   │   ├ Adw.Banner (拡張の無い cliamp のときの細い帯)
+        │       │   │   └ Gtk.Overlay (.music-content)
+        │       │   │       ├ Adw.NavigationView (ページ)
+        │       │   │       ├ 未接続の全面の空状態
+        │       │   │       └ 下端のフェード (再生バーの後ろを地の色へ溶かす帯、高さ 110)
+        │       │   └ sidebar: Gtk.Stack (LyricsPanel / QueuePanel)
+        │       └ PlayerBar (内容の列の中央下、下余白 14、最大幅 780、左右の余白 28)
         └ fullscreen: fullscreen.FullscreenPlayer (最初に開くときに作る)
 
-右パネルは DESIGN の Gtk.Revealer の代わりに、終わり側の Adw.OverlaySplitView に
+右パネルは (Revealer ではなく) 終わり側の Adw.OverlaySplitView に
 入れる。広い窓では右から滑り込んで内容を押し縮め (Revealer と同じ見た目)、
 1080sp 以下では内容の上に重ねる。狭い窓でパネルを開いたときに、内容の列が
 再生バーの最小幅より細くなって窓が勝手に広がるのを避けるため。
+再生バーは右パネルの割り当て (OverlaySplitView) の外に置く。重ねて出したパネルは
+内容全体にクリックを奪う覆い (shield) を掛けるので、内容の中に置くとバーが押せなくなる。
+重ねて出している間は、バーはパネルの左に収まればそこへ縮め、収まらなければ内容の列の
+幅のままパネルの上に出す (パネルの一覧は下に余白を足して最後の行まで送れる)。
 
 公開する操作 (ctx.window として pages / panels / app から使う):
 - navigate(page_id, **params): サイドバーの項目は根を差し替え、それ以外は積む。
@@ -54,7 +59,7 @@ from .pages import Bindings, create_page, is_sidebar_page, page_key  # noqa: E40
 from .panels import LyricsPanel, QueuePanel  # noqa: E402
 from .playerbar import BAR_HEIGHT, PlayerBar  # noqa: E402
 from .sidebar import Sidebar  # noqa: E402
-from .widgets import CircleButton, EmptyState  # noqa: E402
+from .widgets import CircleButton, EmptyState, inside_popover, space_toggles  # noqa: E402
 
 MIN_WIDTH, MIN_HEIGHT = 760, 520
 SIDEBAR_WIDTH = 220
@@ -112,22 +117,6 @@ def _descendants(widget: Gtk.Widget, depth: int = 0, limit: int = 8):
         if depth < limit:
             yield from _descendants(child, depth + 1, limit)
         child = child.get_next_sibling()
-
-
-def _is_text_input(widget: Gtk.Widget | None) -> bool:
-    while widget is not None:
-        if isinstance(widget, (Gtk.Editable, Gtk.Text, Gtk.TextView)):
-            return True
-        widget = widget.get_parent()
-    return False
-
-
-def _inside_popover(widget: Gtk.Widget | None) -> bool:
-    while widget is not None:
-        if isinstance(widget, Gtk.Popover):
-            return True
-        widget = widget.get_parent()
-    return False
 
 
 class MusicWindow(Adw.ApplicationWindow):
@@ -200,10 +189,17 @@ class MusicWindow(Adw.ApplicationWindow):
         self.panel_split.set_pin_sidebar(True)
         self.panel_split.set_enable_show_gesture(False)
         self.panel_split.connect("notify::show-sidebar", self._on_panel_split_shown)
-        self.split.set_content(self.panel_split)
+        self.panel_split.connect("notify::show-sidebar", MusicWindow._on_panel_layout)
+        self.panel_split.connect("notify::collapsed", MusicWindow._on_panel_layout)
+        # 再生バーは右パネルの割り当ての外 (上) に浮かべる
+        self.bar_layer = Gtk.Overlay()
+        self.bar_layer.add_css_class("music-bar-layer")
+        self.bar_layer.set_child(self.panel_split)
+        self.split.set_content(self.bar_layer)
 
         column = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         column.add_css_class("music-content-column")
+        self.column = column
         self.banner = Adw.Banner()
         self.banner.set_title(UNSUPPORTED_BANNER)
         self.banner.set_use_markup(False)
@@ -234,9 +230,12 @@ class MusicWindow(Adw.ApplicationWindow):
         self.fade.set_size_request(-1, FADE_HEIGHT)
         self.content.add_overlay(self.fade)
 
-        self.player_bar = PlayerBar(ctx)
-        self.content.add_overlay(self.player_bar)
         self.content.connect("get-child-position", MusicWindow._place_overlay_child)
+        self.player_bar = PlayerBar(ctx)
+        self.bar_layer.add_overlay(self.player_bar)
+        self.bar_layer.connect("get-child-position", MusicWindow._place_bar)
+        self._bar_tick = 0
+        self._bar_tick_until = 0
 
         self.panel_stack = Gtk.Stack()
         self.panel_stack.add_css_class("music-panel-stack")
@@ -335,19 +334,70 @@ class MusicWindow(Adw.ApplicationWindow):
     # --- 再生バーとフェードの置き場 ----------------------------------------------------
 
     @staticmethod
+    def bar_geometry(x0: float, avail: float, height: int, minimum: int, *, panel_over: bool) -> tuple[int, int, int]:
+        """再生バーの (x, y, 幅)。x0・avail は内容の列の左端と幅。
+
+        panel_over: 右パネルを内容の上に重ねて出している。バーがパネルの左に収まる (PlayerBar.TINY
+        より広く取れる) ならそこへ縮め、収まらなければ列の幅のままパネルの上に出す。"""
+        if panel_over and avail - PANEL_WIDTH - 2 * BAR_SIDE_MARGIN > PlayerBar.TINY:
+            avail -= PANEL_WIDTH
+        bar_width = min(BAR_MAX_WIDTH, avail - 2 * BAR_SIDE_MARGIN)
+        if bar_width < minimum:
+            bar_width = min(avail - 16, max(minimum, bar_width))
+        bar_width = int(max(1, bar_width))
+        x = int(x0 + max(0, (avail - bar_width) // 2))
+        return x, max(0, height - BAR_HEIGHT - BAR_BOTTOM_MARGIN), bar_width
+
+    @staticmethod
+    def _place_bar(layer: Gtk.Overlay, widget: Gtk.Widget, allocation: Gdk.Rectangle) -> bool:
+        if not isinstance(widget, PlayerBar):
+            return False
+        window = layer.get_root()
+        column = getattr(window, "column", None)
+        x0, avail = 0.0, float(layer.get_width())
+        if column is not None:
+            ok, bounds = column.compute_bounds(layer)
+            if ok and bounds.get_width() > 0:
+                x0, avail = bounds.get_x(), bounds.get_width()
+        panel_split = getattr(window, "panel_split", None)
+        panel_over = bool(panel_split is not None and panel_split.get_collapsed()
+                          and panel_split.get_show_sidebar())
+        minimum = widget.measure(Gtk.Orientation.HORIZONTAL, -1)[0]
+        x, y, width = MusicWindow.bar_geometry(x0, avail, layer.get_height(), minimum, panel_over=panel_over)
+        allocation.x, allocation.y, allocation.width, allocation.height = x, y, width, BAR_HEIGHT
+        return True
+
+    @staticmethod
+    def _on_panel_layout(split, _pspec) -> None:
+        """右パネルの開け閉めと畳み方が変わった: バーを置き直す (滑り込む間は毎こま)。"""
+        window = split.get_root()
+        if not isinstance(window, MusicWindow) or not hasattr(window, "panel_stack"):
+            return
+        stack = window.panel_stack
+        if split.get_collapsed():
+            stack.add_css_class("under-bar")
+        else:
+            stack.remove_css_class("under-bar")
+        window.bar_layer.queue_allocate()
+        clock = window.bar_layer.get_frame_clock()
+        now = clock.get_frame_time() if clock is not None else GLib.get_monotonic_time()
+        window._bar_tick_until = now + 600_000  # パネルの滑り込み (Adwaita の動き) の間
+        if not window._bar_tick:
+            window._bar_tick = window.bar_layer.add_tick_callback(MusicWindow._bar_tick_step)
+
+    @staticmethod
+    def _bar_tick_step(layer: Gtk.Overlay, clock) -> bool:
+        window = layer.get_root()
+        layer.queue_allocate()
+        if not isinstance(window, MusicWindow) or clock.get_frame_time() > window._bar_tick_until:
+            if isinstance(window, MusicWindow):
+                window._bar_tick = 0
+            return GLib.SOURCE_REMOVE
+        return GLib.SOURCE_CONTINUE
+
+    @staticmethod
     def _place_overlay_child(overlay: Gtk.Overlay, widget: Gtk.Widget, allocation: Gdk.Rectangle) -> bool:
         width, height = overlay.get_width(), overlay.get_height()
-        if isinstance(widget, PlayerBar):
-            minimum = widget.measure(Gtk.Orientation.HORIZONTAL, -1)[0]
-            bar_width = min(BAR_MAX_WIDTH, width - 2 * BAR_SIDE_MARGIN)
-            if bar_width < minimum:
-                bar_width = min(width - 16, max(minimum, bar_width))
-            bar_width = max(1, bar_width)
-            allocation.width = bar_width
-            allocation.height = BAR_HEIGHT
-            allocation.x = max(0, (width - bar_width) // 2)
-            allocation.y = max(0, height - BAR_HEIGHT - BAR_BOTTOM_MARGIN)
-            return True
         if widget.has_css_class("music-bar-fade"):
             allocation.x = 0
             allocation.width = width
@@ -696,25 +746,21 @@ class MusicWindow(Adw.ApplicationWindow):
         self = controller.get_widget()
         modifiers = state & Gtk.accelerator_get_default_mod_mask()
         if keyval == Gdk.KEY_Escape and not modifiers and self.fullscreen_shown:
-            if _inside_popover(self.get_focus()):
+            if inside_popover(self.get_focus()):
                 return False  # 開いているメニューを先に閉じる
             self.show_fullscreen(False)
             return True
-        if keyval == Gdk.KEY_space and not modifiers:
-            focus = self.get_focus()
-            if _is_text_input(focus) or _inside_popover(focus):
-                return False
-            self.ctx.store.toggle()
-            return True
-        return False
+        # Space は再生/一時停止 (ミニプレーヤー・イコライザと同じ判断)
+        return space_toggles(self, keyval, state)
 
     @staticmethod
     def _on_focus_changed(self, _pspec) -> None:
-        # 文字の入力中は Ctrl+矢印 (次へ・前へ・10 秒送り) を入力欄に譲る。
-        # アプリのショートカットは入力欄より先に働くので、その間だけ止める。
+        # 文字の入力中は Ctrl+矢印 (次へ・前へ・10 秒送り) と Ctrl+. を入力欄に譲る。
+        # 判断はアプリが「いま前にある窓」のフォーカスで行う (隠れたメインの窓の入力欄が
+        # ミニプレーヤーのショートカットを止めないように)
         app = self.get_application()
-        if app is not None and hasattr(app, "set_text_input_active"):
-            app.set_text_input_active(_is_text_input(self.get_focus()))
+        if app is not None and hasattr(app, "refresh_text_input"):
+            app.refresh_text_input()
 
     # --- 閉じる --------------------------------------------------------------------
 

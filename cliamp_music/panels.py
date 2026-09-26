@@ -9,13 +9,21 @@
 - 状態: 読み込み中 / 見つからない / 同期なし / 拡張なし (api 0) / ラジオ (ICY の曲名で探す)。
 - 曲ごとに結果を覚える (最大 64 曲)。
 
-次に再生:
+次に再生 (フルスクリーンの UpNextView と Apple の「次に再生」と同じ組み立て):
 - 上に横長のカプセル「シャッフル」「リピート」(オンで赤の塗り)。
-- 「履歴」(最近再生した 10 曲、古い順に下へ) → 「次に再生」(右に赤い「消去」)。
-  待ち行列 (queue) の曲、続いて up_next の曲。行のダブルクリックで play_index。
-- 開いたときは「次に再生」の見出しまでスクロールしておく (上へ戻すと履歴)。
-- リストが変わったとき: 同じなら何もしない。先頭が何曲か減っただけ (次の曲へ
-  進んだ) ならその行だけ外して末尾を足す。それ以外は作り直す。
+- 「履歴」(最近再生した 10 曲、古い順に下へ)。
+- 待ち行列があれば「次に再生」(右に赤い「消去」) と待ち行列の曲。続いて見出し
+  (出どころの名前か「再生中のリスト」、副題「このあと続けて再生されます」) と up_next の曲。
+  待ち行列が無ければ見出しは「次に再生」(副題は出どころの名前) と up_next の曲。
+- 待ち行列の曲のダブルクリックは store.play_queued (その曲より前の待ち行列を外して
+  next。play_index は待ち行列から外さないので同じ曲が 2 度鳴る)。続きの曲は play_index。
+- シャッフルとリピート (すべて) では、cliamp の up_next は今の一巡の残りだけ (混ぜ直した
+  後の並びはまだ決まっていない)。尽きても「次に再生する曲はありません」とは言わず、
+  「このあとシャッフルし直して続けて再生します」と書く。
+- 開いたときは最初の「次に再生」の見出しまでスクロールしておく (上へ戻すと履歴)。
+- リストが変わったとき: 行を鍵 (種類・添字・曲) で使い回し、変わった行だけ外して足す
+  (選んだ行とフォーカスが残る)。まとめて入れ替わる (シャッフルなど) ときは、見える分を
+  先に作り、残りは少しずつ足す。
 """
 
 from __future__ import annotations
@@ -36,6 +44,11 @@ from .widgets import EmptyState, LoadingState, SectionHeader, TrackList, TrackRo
 
 LYRICS_CACHE_SIZE = 64
 HISTORY_ROWS = 10
+# 次に再生の行を一度に作る数 (残りは idle で少しずつ)
+QUEUE_SYNC_ROWS = 30
+QUEUE_CHUNK_ROWS = 20
+EMPTY_NEXT = "次に再生する曲はありません"
+RESHUFFLE_NOTE = "このあとシャッフルし直して続けて再生します"
 # 手でスクロールしたあと、自動の送りを止めておく秒数
 USER_SCROLL_HOLD = 4.0
 # 今の行を置く高さ (上から)
@@ -168,7 +181,9 @@ class LyricsPanel(Gtk.Box):
         self.append(self.stack)
 
         self.scroller = Gtk.ScrolledWindow()
-        self.scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        # 縦は EXTERNAL: ホイールやタッチパッドでは動くが、スクロールバーは出さない (行を送る
+        # たびに重ねのスクロールバーが浮かび、パネルの端に明るい線が出続けるため。Apple も出さない)
+        self.scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.EXTERNAL)
         self.scroller.add_css_class("music-lyrics-scroller")
         self.lines_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         self.lines_box.add_css_class("music-lyrics")
@@ -546,6 +561,82 @@ class _PanelToggle(Gtk.ToggleButton):
         self.update_property([Gtk.AccessibleProperty.LABEL], [label])
 
 
+class _KeyedRows:
+    """TrackList の行を鍵で使い回す (次に再生の一覧)。
+
+    sync(items) で [(鍵, 作り方)] に合わせる。鍵の同じ行は外さずに動かすだけにするので、
+    選んだ行・フォーカス・開いているメニューが残る。新しく作る行が多いときは最初の
+    QUEUE_SYNC_ROWS 行だけその場で作り、残りは idle で少しずつ (後の sync で打ち切る)。"""
+
+    def __init__(self, listbox: Gtk.ListBox):
+        self.list = listbox
+        self.keys: list = []
+        self._idle = 0
+        self._serial = 0
+
+    def cancel(self) -> None:
+        self._serial += 1
+        if self._idle:
+            GLib.source_remove(self._idle)
+            self._idle = 0
+
+    def sync(self, items: list) -> None:
+        keys = [key for key, _make in items]
+        if keys == self.keys and not self._idle:
+            return
+        self.cancel()
+        rows = self.list.rows()
+        by_key = {}
+        if len(rows) == len(self.keys):
+            for key, row in zip(self.keys, rows):
+                by_key.setdefault(key, row)
+        made = 0
+        pending = None
+        for pos, (key, make) in enumerate(items):
+            current = self.list.get_row_at_index(pos)
+            reuse = by_key.pop(key, None)
+            if reuse is not None and current is reuse:
+                continue
+            if reuse is not None:
+                self.list.remove(reuse)  # 動かす (解放しない)
+                self.list.insert(reuse, pos)
+                continue
+            if made >= QUEUE_SYNC_ROWS:
+                pending = pos
+                break
+            self.list.insert(make(), pos)
+            made += 1
+        # 使わなかった行 (と、作り切れなかった分の後ろにある行) を外す
+        stop = len(items) if pending is None else pending
+        while (extra := self.list.get_row_at_index(stop)) is not None:
+            self.list.remove(extra)
+            _release_row(extra)
+        self.keys = keys if pending is None else keys[:pending]
+        if pending is not None:
+            serial = self._serial
+            rest = items[pending:]
+
+            def more() -> bool:
+                if serial != self._serial:
+                    return GLib.SOURCE_REMOVE
+                chunk, remaining = rest[:QUEUE_CHUNK_ROWS], rest[QUEUE_CHUNK_ROWS:]
+                for key, make in chunk:
+                    self.list.append(make())
+                    self.keys.append(key)
+                rest[:] = remaining
+                if rest:
+                    return GLib.SOURCE_CONTINUE
+                self._idle = 0
+                return GLib.SOURCE_REMOVE
+
+            self._idle = GLib.idle_add(more, priority=GLib.PRIORITY_LOW)
+
+    def clear(self) -> None:
+        self.cancel()
+        _clear(self.list)
+        self.keys = []
+
+
 class QueuePanel(Gtk.Box):
     """次に再生のパネル。`QueuePanel(ctx)`、`set_active(on)`。"""
 
@@ -558,10 +649,10 @@ class QueuePanel(Gtk.Box):
         self.add_css_class("music-queue-panel")
         self._active = False
         self._syncing = False
-        self._row_keys: list[tuple[str, int, str]] = []
         self._history_keys: list[str] = []
         self._want_scroll = True
         self._repeat_shown = None
+        self._modes_shown = None
 
         toggles = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8, homogeneous=True)
         toggles.add_css_class("music-panel-toggles")
@@ -596,24 +687,44 @@ class QueuePanel(Gtk.Box):
         self.history_empty = _label("まだ履歴がありません", "music-queue-note")
         content.append(self.history_empty)
 
-        self.next_header = SectionHeader("次に再生")
-        self.next_header.add_css_class("music-queue-header")
-        self.next_header.add_css_class("next")
+        # 待ち行列 (「次に再生」と赤い「消去」)。待ち行列があるときだけ出す
+        self.queue_header = SectionHeader("次に再生")
+        self.queue_header.add_css_class("music-queue-header")
+        self.queue_header.add_css_class("next")
         self.clear_button = Gtk.Button(label="消去")
         self.clear_button.add_css_class("music-link-button")
         self.clear_button.add_css_class("flat")
         self.clear_button.set_tooltip_text("待ち行列を空にする")
         self.clear_button.connect("clicked", QueuePanel._on_clear, ctx)
-        self.next_header.add_end(self.clear_button)
+        self.queue_header.add_end(self.clear_button)
+        content.append(self.queue_header)
+        self.queue_list = TrackList(selectable=True)
+        self.queue_list.add_css_class("music-queue-list")
+        self.queue_list.add_css_class("queued")
+        content.append(self.queue_list)
+
+        # 続きの曲 (up_next)
+        self.next_header = SectionHeader("次に再生")
+        self.next_header.add_css_class("music-queue-header")
+        self.next_header.add_css_class("next")
         content.append(self.next_header)
+        self.next_subtitle = _label("", "music-queue-subtitle")
+        content.append(self.next_subtitle)
         self.next_list = TrackList(selectable=True)
         self.next_list.add_css_class("music-queue-list")
         content.append(self.next_list)
-        self.next_empty = _label("次に再生する曲はありません", "music-queue-note")
+        self.next_empty = _label(EMPTY_NEXT, "music-queue-note")
         content.append(self.next_empty)
+        # シャッフルで一巡の後も続くときの添え書き (並びの最後に)
+        self.continue_note = _label(RESHUFFLE_NOTE, "music-queue-note")
+        self.continue_note.add_css_class("music-queue-continue")
+        content.append(self.continue_note)
         self.content = content
         self.scroller.set_child(content)
         self.stack.add_named(self.scroller, "list")
+
+        self._queue_rows = _KeyedRows(self.queue_list)
+        self._next_rows = _KeyedRows(self.next_list)
 
         self.empty = EmptyState("music-queue-symbolic", "次に再生")
         self.empty.add_css_class("music-panel-empty")
@@ -695,6 +806,9 @@ class QueuePanel(Gtk.Box):
     def _on_status(self, _store) -> None:
         if self._visible_now():
             self._sync_toggles()
+            modes = (self.ctx.store.status.shuffle, self.ctx.store.status.repeat)
+            if modes != self._modes_shown:
+                self._update_notes()
 
     def _on_connection(self, _store) -> None:
         if self._visible_now():
@@ -745,64 +859,83 @@ class QueuePanel(Gtk.Box):
             self.history_list.append(row)
         self.history_empty.set_visible(not tracks)
 
-    def _wanted_rows(self) -> list[tuple[str, int, Track]]:
+    def _wanted(self) -> tuple[list[tuple[int, Track]], list[tuple[int, Track]]]:
+        """(待ち行列の曲, 続きの曲)。どちらも (リスト上の添字, 曲)。"""
         pl = self.ctx.store.playlist
-        out: list[tuple[str, int, Track]] = []
+        queue: list[tuple[int, Track]] = []
         seen = set()
         for index in pl.queue:
             track = pl.track_at(index)
             if track is not None:
-                out.append(("queue", index, track))
+                queue.append((index, track))
                 seen.add(index)
-        for index in pl.up_next:
-            if index in seen:
-                continue
-            track = pl.track_at(index)
-            if track is not None:
-                out.append(("next", index, track))
-        return out
+        upcoming = [(index, pl.track_at(index)) for index in pl.up_next
+                    if index not in seen and pl.track_at(index) is not None]
+        return queue, upcoming
 
     def _update_queue(self) -> None:
-        wanted = self._wanted_rows()
-        keys = [(kind, index, track_key(track)) for kind, index, track in wanted]
-        self.clear_button.set_visible(bool(self.ctx.store.playlist.queue))
-        self.next_empty.set_visible(not wanted)
-        if keys == self._row_keys:
-            return
-        old = self._row_keys
-        rows = self.next_list.rows()
-        # 次の曲へ進んだ: 先頭が何曲か減り、残りは同じ並び
-        dropped = next((k for k in range(1, min(len(old), 8) + 1)
-                        if old[k:] == keys[:len(old) - k]), None) if old else None
-        if dropped is not None and len(rows) == len(old):
-            for row in rows[:dropped]:
-                self.next_list.remove(row)
-                _release_row(row)
-            for kind, index, track in wanted[len(old) - dropped:]:
-                self.next_list.append(self._make_row(kind, index, track))
+        queue, upcoming = self._wanted()
+        pl = self.ctx.store.playlist
+        has_queue = bool(queue)
+        self.queue_header.set_visible(has_queue)
+        self.queue_list.set_visible(has_queue)
+        self.clear_button.set_visible(has_queue)
+        if has_queue:
+            # 待ち行列の後の見出しは出どころ (Apple と同じ)。区切りの線は待ち行列の見出しに
+            self.next_header.set_title(pl.source.name or "再生中のリスト")
+            self.next_header.remove_css_class("next")
+            self.next_header.add_css_class("continued")
+            subtitle = "このあと続けて再生されます"
         else:
-            _clear(self.next_list)
-            for kind, index, track in wanted:
-                self.next_list.append(self._make_row(kind, index, track))
-        self._row_keys = keys
+            self.next_header.set_title("次に再生")
+            self.next_header.add_css_class("next")
+            self.next_header.remove_css_class("continued")
+            subtitle = pl.source.name
+        self.next_subtitle.set_text(subtitle or "")
+        show_next = bool(upcoming) or not has_queue
+        self.next_header.set_visible(show_next)
+        self.next_subtitle.set_visible(show_next and bool(subtitle))
+        self.next_list.set_visible(bool(upcoming))
+        self._queue_rows.sync([(("queue", index, track_key(track)),
+                                (lambda index=index, track=track: self._make_row("queue", index, track)))
+                               for index, track in queue])
+        self._next_rows.sync([(("next", index, track_key(track)),
+                               (lambda index=index, track=track: self._make_row("next", index, track)))
+                              for index, track in upcoming])
+        self._update_notes()
+
+    def _update_notes(self) -> None:
+        """空のとき・一巡の終わりの添え書き (シャッフルとリピートで変わる)。"""
+        store = self.ctx.store
+        st = store.status
+        self._modes_shown = (st.shuffle, st.repeat)
+        queue, upcoming = self._wanted()
+        reshuffle = store.continues_by_reshuffle()
+        empty = not queue and not upcoming
+        self.next_empty.set_text(RESHUFFLE_NOTE if reshuffle else EMPTY_NEXT)
+        self.next_empty.set_visible(empty)
+        # 並びが尽きた後も続くことを最後に添える (200 曲で切った一覧のときは出さない)
+        self.continue_note.set_visible(reshuffle and not empty and len(store.playlist.up_next) < 200)
 
     def _make_row(self, kind: str, index: int, track: Track) -> TrackRow:
+        activate = _play_queued_row(self.ctx.store) if kind == "queue" else _play_index_row(self.ctx.store)
         row = TrackRow(self.ctx, track, variant="queue", index=index,
                        menu_context="queue" if kind == "queue" else "nowplaying",
-                       on_activate=_play_index_row(self.ctx.store))
+                       on_activate=activate)
         if kind == "queue":
             row.add_css_class("queued")
         return row
 
     def _scroll_to_next_header(self) -> None:
-        """「次に再生」の見出しを上端に (並べ終わってから)。"""
+        """最初の「次に再生」の見出しを上端に (並べ終わってから)。"""
         self._want_scroll = False
         tries = [0]
 
         def apply(widget, _clock) -> bool:
             if not isinstance(widget, QueuePanel):
                 return GLib.SOURCE_REMOVE
-            ok, bounds = widget.next_header.compute_bounds(widget.content)
+            header = widget.queue_header if widget.queue_header.get_visible() else widget.next_header
+            ok, bounds = header.compute_bounds(widget.content)
             adj = widget.scroller.get_vadjustment()
             if not ok or adj.get_page_size() <= 0 or adj.get_upper() <= adj.get_page_size() and tries[0] < 3:
                 tries[0] += 1
@@ -816,7 +949,17 @@ class QueuePanel(Gtk.Box):
 
     @property
     def row_count(self) -> int:
-        return len(self._row_keys)
+        return len(self._queue_rows.keys) + len(self._next_rows.keys)
+
+    @property
+    def _row_keys(self) -> list[tuple[str, int, str]]:
+        """並んでいる行の鍵 (種類 "queue" / "next", 添字, 曲の鍵)。待ち行列の行が先。"""
+        return list(self._queue_rows.keys) + list(self._next_rows.keys)
+
+    def do_unrealize(self) -> None:
+        self._queue_rows.cancel()
+        self._next_rows.cancel()
+        Gtk.Box.do_unrealize(self)
 
 
 def _clear(listbox: Gtk.ListBox) -> None:
@@ -852,7 +995,19 @@ def _play_index_row(store):
     # 行は store (長生き) だけを掴む。パネル (self) は掴まない
     def activate(row) -> None:
         if row.index is not None:
-            store.play_index(row.index)
+            track = getattr(row, "track", None)
+            store.play_index(row.index, path=track.path if track is not None else None)
+
+    return activate
+
+
+def _play_queued_row(store):
+    """待ち行列の行: その曲より前の待ち行列を外し、next で鳴らす (play_index は待ち行列から
+    外さないので、同じ曲がもう 1 度鳴り、リストの位置も飛ぶ)。"""
+
+    def activate(row) -> None:
+        if row.index is not None:
+            store.play_queued(row.index)
 
     return activate
 

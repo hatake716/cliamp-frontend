@@ -16,10 +16,24 @@
 - TUI の `play` は停止中に何もしない。停止中の再生は `toggle`。
 - `playlists local` は cliamp と同じく、履歴があれば仮想の "Recently Played" を先頭に返す
   (その後にローカルのプレイリスト「ドライブ」「Focus」)。
+- ローカルのプレイリスト (TOML) と履歴 (history.toml) は、Go が書く欄だけを持つ
+  (live・meta は残らず、stream は path が URL かで決め直す)。最後の曲を外すと
+  プレイリストのファイルごと消える。
+- 誤りの文言・引数の確かめ方・enqueue / remove / queue_edit / load_provider の細部は
+  ipc/gui.go・ui/model/ipc_gui.go に合わせた (tests/test_conformance.py が本物と比べる)。
+- `providers` は radio の search が false、local の名前は "Local"、偽の真偽も省かない。
+- radio の既定は素の cliamp と同じ l:0 (cliamp radio、15 の配信に展開) と c:N (カタログ)。
+  radios_toml=True (--radios-toml) で利用者の局 l:1..l:3 とお気に入り f:0 も出す。
+- `device list` は PulseAudio の sink 名 (alsa_output.… など)。"* " は既定の sink で、
+  切り替えても動かない (本物は move-sink-input で切り替えるため)。
+  device_descriptions=True で説明付きの devices 配列も返す (パッチの拡張の形)。
 
 試験の道具: `isolate_display()` (利用者の画面に繋がない)、`temp_socket_path()`、
+`temp_dir(prefix)` (どちらも試験の終わりに消える)、
 `run_loop(until, timeout)` (GLib の main loop を回す)。FakeCliamp の `requests` に
-受けた要求が残り、`delays` で応答を遅らせられる。
+受けた要求が残り、`delays` で応答を遅らせられる。`seek_delay` (秒) で seek_to を
+本物の HTTP の流れのように遅れて効かせ、`switch_keeps_old=True` で読み込み中の
+曲の切り替えを本物と同じく「前の曲の位置と長さのまま playing」にする。
 
 単体でも動く:
     python3 tests/fake_cliamp.py --socket /tmp/fake.sock [--legacy] [--art-dir DIR]
@@ -116,13 +130,24 @@ LIBRARY = [
     ("おやすみ、ロボット", "青い灯台", "港町ラジオ", 238, "J-Pop", 2021, "yt"),
 ]
 
+# cliamp に組み込みの局 (l:0)。本物は https://radio.cliamp.stream/streams.m3u を読み、
+# 中の配信 (15 本) へ展開する (resolveWrapperURLs)。題は M3U の EXTINF。
+CLIAMP_RADIO = ("cliamp radio", "https://radio.cliamp.stream/streams.m3u")
+CLIAMP_STREAMS = ["Lofi", "Meditative", "Synthwave", "EDM", "Omarchy", "Chillout", "Ambient",
+                  "Deep House", "Drum & Bass", "Jazz", "Classical", "Retro", "Focus", "Rock", "Sleep"]
+# 利用者の radios.toml の局 (l:1 から)。radios_toml=True のときだけ。
 STATIONS = [
-    ("cliamp radio", "https://radio.cliamp.stream/streams/lofi.mp3"),
     ("Harbor Jazz FM", "https://stream.example.net/harbor-jazz.mp3"),
     ("Tokyo Lo-fi Radio", "https://stream.example.net/tokyo-lofi.aac"),
     ("Classic 24", "https://stream.example.net/classic24.ogg"),
 ]
 FAVORITES = [("Tokyo Lo-fi Radio", "https://stream.example.net/tokyo-lofi.aac", "128k", "Japan")]
+# Radio Browser のカタログ (c:N)。TUI がカタログを読んだ後にだけ出る。名前は formatCatalogName の形
+CATALOG_STATIONS = [
+    ("Jazz Sakura (asia dream radio)", "http://stream.example.net/jazz-sakura", "128k", "Japan"),
+    ("SomaFM Groove Salad", "http://stream.example.net/groove-salad", "128k", "The United States Of America"),
+    ("Radio Swiss Classic", "http://stream.example.net/swiss-classic", "192k", "Switzerland"),
+]
 
 ICY_TITLES = [
     "Tape Garden - Coffee & Static",
@@ -131,7 +156,13 @@ ICY_TITLES = [
     "真夜中ポスト - シティライト・ブルース",
 ]
 
-DEVICES = ["既定の出力", "Built-in Audio アナログステレオ", "HDMI / DisplayPort 2 (ディスプレイ)"]
+# PulseAudio / PipeWire の sink (pactl list sinks の Name と Description)。本物の `device list`
+# は Name だけを返す (ui/model/update.go の DeviceMsg、daemon.go の handleDevice)。
+DEVICES = [
+    ("alsa_output.pci-0000_0c_00.4.analog-stereo", "内蔵オーディオ アナログステレオ"),
+    ("alsa_output.pci-0000_03_00.1.hdmi-stereo", "Navi 32 HDMI/DP Audio デジタルステレオ (HDMI)"),
+    ("bluez_output.AC_80_0A_12_34_56.1", "WH-1000XM5"),
+]
 
 # 偽の歌詞 (この試験のために書いたもの)。
 LYRIC_LINES = [
@@ -157,10 +188,12 @@ SEARCH_TEMPLATES = [
 UPLOADERS = ["Aurora Lane", "青い灯台", "Kite Theory", "真夜中ポスト", "Tape Garden",
              "ミナト・レイ", "Music Channel JP", "Mira Okafor", "喫茶ムーンライト"]
 
-# 値が偽でも省かない欄 (Go のポインタと、omitempty の無い TrackInfo の path)。
-_KEEP = frozenset({"ok", "shuffle", "mono", "buffering", "synced", "path"})
+# 値が偽でも省かない欄 (Go のポインタと、omitempty の無い TrackInfo の path・LyricLine の t と text)。
+_KEEP = frozenset({"ok", "shuffle", "mono", "buffering", "synced", "path", "t", "text"})
 # 中身を省かない欄 (Go の map[string]string。値が空でも残る)。
 _OPAQUE = frozenset({"meta"})
+# 要素の欄を省かない配列 (ProviderInfo は omitempty の無い構造体)。
+_OPAQUE_LISTS = frozenset({"providers"})
 
 
 def fake_youtube_id(seed: str) -> str:
@@ -194,10 +227,86 @@ def omit(value, key: str | None = None):
             out[k] = v
         return out
     if isinstance(value, list):
+        if key in _OPAQUE_LISTS:
+            return [dict(v) if isinstance(v, dict) else v for v in value]
         return [omit(v) for v in value]
     if isinstance(value, float) and value.is_integer() and abs(value) < 1e15:
         return int(value)
     return value
+
+
+_YTDL_HOSTS = frozenset({"soundcloud.com", "bandcamp.com", "music.163.com", "bilibili.com", "b23.tv"})
+
+
+def _search_prefix(path: str, name: str) -> bool:
+    if not path.startswith(name):
+        return False
+    rest = path[len(name):]
+    colon = rest.find(":")
+    return colon >= 0 and all("0" <= c <= "9" for c in rest[:colon])
+
+
+def is_url(path: str) -> bool:
+    """playlist.IsURL: http(s) か yt-dlp の検索式 (ytsearch[N]: / scsearch[N]:)。"""
+    path = path or ""
+    return (path.startswith(("http://", "https://")) or _search_prefix(path, "ytsearch")
+            or _search_prefix(path, "scsearch"))
+
+
+def is_ytdl(path: str) -> bool:
+    """playlist.IsYTDL: yt-dlp で再生する URL (YouTube・YouTube Music・SoundCloud・Bandcamp など)。"""
+    from urllib.parse import urlsplit
+
+    if not is_url(path):
+        return False
+    if _search_prefix(path, "ytsearch") or _search_prefix(path, "scsearch"):
+        return True
+    try:
+        host = (urlsplit(path).hostname or "").lower()
+    except ValueError:
+        return False
+    for prefix in ("www.", "m."):
+        if host.startswith(prefix):
+            host = host[len(prefix):]
+    if host in ("youtube.com", "youtu.be", "music.youtube.com") or host in _YTDL_HOSTS:
+        return True
+    return host.endswith((".bilibili.com", ".bandcamp.com"))
+
+
+def go_quote(text: str) -> str:
+    """Go の %q に近い引用 (日本語はそのまま)。"""
+    return json.dumps(text, ensure_ascii=False)
+
+
+# history.toml に書かれる欄 (history.go の writeEntry)。
+_HISTORY_FIELDS = ("path", "title", "artist", "album", "genre", "year", "track_number", "duration")
+# ローカルのプレイリストの TOML に書かれる欄 (external/local/provider.go の writeTrack)。
+_LOCAL_FIELDS = _HISTORY_FIELDS + ("feed", "bookmark")
+
+
+def _persisted(track: dict, fields: tuple[str, ...]) -> dict:
+    """Go が TOML に書いて読み戻したときの形。空の欄は落ち、stream は path が URL かで決め直す。
+    UTF-8 でない path (path_raw) は TOML でもそのまま残る。"""
+    out = {"path": str(track.get("path") or ""), "title": str(track.get("title") or "")}
+    if track.get("path_raw"):
+        out["path_raw"] = track["path_raw"]
+    for name in fields:
+        if name in ("path", "title"):
+            continue
+        value = track.get(name)
+        if value:
+            out[name] = value
+    if is_url(out["path"]):
+        out["stream"] = True
+    return out
+
+
+def history_track(track: dict) -> dict:
+    return _persisted(track, _HISTORY_FIELDS)
+
+
+def local_track(track: dict) -> dict:
+    return _persisted(track, _LOCAL_FIELDS)
 
 
 def go_json(obj) -> bytes:
@@ -213,7 +322,7 @@ def rfc3339(moment: datetime) -> str:
 
 
 TRACK_FIELDS = ("path", "title", "artist", "album", "genre", "year", "track_number",
-                "duration", "stream", "live", "feed", "unplayable", "bookmark", "meta")
+                "duration", "stream", "live", "feed", "unplayable", "bookmark", "meta", "path_raw")
 
 
 def to_track(info: dict) -> dict:
@@ -241,9 +350,18 @@ class FakePlaylist:
         self.queue: list[int] = []
         self.queued_idx = -1
         self.gen = 1
+        # 待ち行列の曲が鳴っている間に order[pos] が消され、後ろが詰まってきた (まだ鳴って
+        # いない曲が pos にある) ときは、次の順送りを pos から始める (playlist の resumeAtPos)
+        self.resume_at_pos = False
 
     def bump(self) -> None:
         self.gen += 1
+
+    def resume_slot(self) -> int:
+        """次に順送りで鳴らす order の位置の候補の先頭 (orderResumeSlot)。"""
+        if self.resume_at_pos and self.queued_idx >= 0:
+            return self.pos
+        return self.pos + 1
 
     def replace(self, tracks: list[dict]) -> None:
         self.tracks = list(tracks)
@@ -251,9 +369,58 @@ class FakePlaylist:
         self.pos = 0
         self.queue = []
         self.queued_idx = -1
+        self.resume_at_pos = False
         if self.shuffle and self.tracks:
             self.do_shuffle()
         self.bump()
+
+    def add_next(self, *tracks: dict) -> int:
+        """AddNext: 末尾に足し、再生順ではいまの曲のすぐ後ろ (待ち行列より後) に並べる。"""
+        start = len(self.tracks)
+        if not tracks:
+            return start
+        self.tracks.extend(tracks)
+        at = self.resume_slot() if self.order else 0
+        self.order[at:at] = list(range(start, len(self.tracks)))
+        self.bump()
+        return start
+
+    def place_next(self, *idxs: int) -> None:
+        """PlaceNext: シャッフル中だけ、idxs を再生順でいまの曲のすぐ後ろへ動かす。"""
+        if not self.shuffle or not self.order or not idxs:
+            return
+        start = self.resume_slot()
+        moving = [i for i in dict.fromkeys(idxs) if i in self.order[start:]]
+        if not moving:
+            return
+        self.order = self.order[:start] + moving + [i for i in self.order[start:] if i not in moving]
+        self.bump()
+
+    def play_next(self, *tracks: dict) -> int:
+        """PlayNext (enqueue next): AddNext。1 曲リピートでは順送りしないので待ち行列へ。"""
+        if self.repeat != "one":
+            return self.add_next(*tracks)
+        start = len(self.tracks)
+        self.add(*tracks)
+        for i in range(len(tracks)):
+            self.queue_add(start + i)
+        return start
+
+    def add_now(self, *tracks: dict) -> int:
+        """AddNow (enqueue now): 足して (シャッフル中はすぐ後ろへ並べて) 先頭の曲を選ぶ。"""
+        start = len(self.tracks)
+        self.add(*tracks)
+        self.place_next(*range(start, len(self.tracks)))
+        self.set_index(start)
+        return start
+
+    def add_and_select(self, *tracks: dict) -> int:
+        """AddAndSelect (止まっているときの enqueue end): 先頭の曲だけすぐ後ろへ並べて選ぶ。"""
+        start = len(self.tracks)
+        self.add(*tracks)
+        self.place_next(start)
+        self.set_index(start)
+        return start
 
     def add(self, *tracks: dict) -> None:
         start = len(self.tracks)
@@ -308,6 +475,7 @@ class FakePlaylist:
             return False
         self.pos = slot
         self.queued_idx = -1
+        self.resume_at_pos = False
         return True
 
     def next(self) -> bool:
@@ -317,17 +485,22 @@ class FakePlaylist:
             if self.playable(idx):
                 self.queue = self.queue[i + 1:]
                 self.queued_idx = idx
+                self.bump()  # 待ち行列が変わる (Next は gen を増やす)
                 return True
-        self.queue = []
+        if self.queue:
+            self.queue = []
+            self.bump()
         if self.repeat == "one":
             if self.playable(self.order[self.pos]):
                 self.queued_idx = -1
+                self.resume_at_pos = False
                 return True
             return False
-        slot = self._first_playable(self.pos + 1, len(self.order))
+        slot = self._first_playable(self.resume_slot(), len(self.order))
         if slot is None and self.repeat == "all":
-            if self.shuffle and self.pos + 1 >= len(self.order):
+            if self.shuffle and self.resume_slot() >= len(self.order):
                 self.do_shuffle()
+                self.bump()  # nextShuffleWrap: 混ぜ直すと並びが変わる
                 slot = self._first_playable(1, len(self.order))
                 if slot is None:
                     slot = self._first_playable(0, 1)
@@ -337,6 +510,7 @@ class FakePlaylist:
             return False
         self.queued_idx = -1
         self.pos = slot
+        self.resume_at_pos = False
         return True
 
     def prev(self) -> bool:
@@ -349,10 +523,12 @@ class FakePlaylist:
             return False
         self.queued_idx = -1
         self.pos = slot
+        self.resume_at_pos = False
         return True
 
     def set_index(self, i: int) -> None:
         self.queued_idx = -1
+        self.resume_at_pos = False
         if i in self.order:
             self.pos = self.order.index(i)
 
@@ -383,8 +559,11 @@ class FakePlaylist:
             self.bump()
 
     def move_queue(self, a: int, b: int) -> bool:
-        if not (0 <= a < len(self.queue) and 0 <= b < len(self.queue)) or a == b:
+        """playlist.MoveQueueTo: 範囲外は False、同じ位置は何もせず True (gen も増えない)。"""
+        if not (0 <= a < len(self.queue) and 0 <= b < len(self.queue)):
             return False
+        if a == b:
+            return True
         item = self.queue.pop(a)
         self.queue.insert(b, item)
         self.bump()
@@ -404,6 +583,12 @@ class FakePlaylist:
         self.order = order
         if 0 <= removed_pos < self.pos:
             self.pos -= 1
+        elif removed_pos == self.pos and self.queued_idx >= 0 and self.queued_idx != idx:
+            # 待ち行列の曲が鳴っている間に、その前のリストの曲を消した: 詰まってきた次の曲は
+            # まだ鳴っていないので、次の順送りは pos から
+            self.resume_at_pos = True
+        if self.pos >= len(self.order):
+            self.resume_at_pos = False
         self.pos = max(0, min(self.pos, len(self.order) - 1))
         self.queue = [q - 1 if q > idx else q for q in self.queue if q != idx]
         if self.queued_idx == idx:
@@ -433,16 +618,24 @@ class FakePlaylist:
 
     def cycle_repeat(self) -> None:
         self.repeat = {"off": "all", "all": "one", "one": "off"}[self.repeat]
+        self.bump()  # CycleRepeat はいつも gen を増やす
+
+    def set_repeat(self, mode: str) -> None:
+        if mode != self.repeat:
+            self.bump()  # SetRepeat は変わったときだけ
+        self.repeat = mode
 
     def upcoming(self, limit: int = 200) -> list[int]:
-        """再生順で今の曲の後に来る曲 (待ち行列の曲は除く)。"""
+        """playlist.Upcoming: 再生順で今の位置の後に来る曲。待ち行列の曲と再生できない曲は除く。
+
+        待ち行列から鳴っている曲 (queued_idx) は待ち行列から外れているので、リスト上の
+        後ろの位置にあれば含む (本物と同じ)。シャッフル中の回り込みは含めない。"""
         if not self.order:
             return []
-        after = self.order[self.pos + 1:]
+        after = self.order[self.resume_slot():]
         if self.repeat == "all" and not self.shuffle:
             after += self.order[: self.pos]
-        current = self.index()
-        return [i for i in after if i not in self.queue and i != current][:limit]
+        return [i for i in after if i not in self.queue and self.playable(i)][:limit]
 
 
 class FakeCliamp:
@@ -454,14 +647,25 @@ class FakeCliamp:
       latency   カタログ系のコマンドすべてに足す遅れ。
     """
 
+    # ローカルのプレイリストの置き場 (誤りの文言に出る。本物は ~/.config/cliamp/playlists)
+    PLAYLIST_DIR = "/home/fake/.config/cliamp/playlists"
+
     def __init__(self, socket_path: str, *, legacy: bool = False, art_dir: str | None = None,
                  spotify_needs_auth: bool = False, latency: float = 0.0, buffer_secs: float = 0.0,
-                 initial_state: str = "playing", empty: bool = False, seed: int = 7):
+                 initial_state: str = "playing", empty: bool = False, seed: int = 7,
+                 radios_toml: bool = False, device_descriptions: bool = False,
+                 switch_keeps_old: bool = False):
         self.socket_path = socket_path
         self.legacy = legacy
         self.spotify_needs_auth = spotify_needs_auth
         self.latency = latency
         self.buffer_secs = buffer_secs
+        self.radios_toml = radios_toml
+        self.device_descriptions = device_descriptions
+        # 読み込み中の曲の切り替えで、前の曲の位置・長さ・playing を出し続ける (本物の TUI)
+        self.switch_keeps_old = switch_keeps_old
+        # seek_to を受け付けてから効くまでの秒 (HTTP の流れの再接続。0 ならすぐ)
+        self.seek_delay = 0.0
         self.delays: dict[str, float] = {}
         self.requests: list[dict] = []
         self.lock = threading.RLock()
@@ -483,12 +687,15 @@ class FakeCliamp:
         self.eq = [0.0] * 10
         self.eq_preset_idx = 0
         self.eq_custom = ""
-        self.device = 0
+        self.default_device = 0  # 既定の sink ("* ")。GUI の切り替えでは動かない
+        self.device = 0  # cliamp の流れがいま出ている sink
+        self._seek_pending: tuple[float, float] | None = None  # (効く時刻, 位置)
+        self._old: tuple[float, float, float] | None = None  # 読み込み中に出す前の曲 (位置, 時刻, 長さ)
         self.source: dict = {}
         self.history: list[tuple[dict, str]] = []
         self.local_playlists: dict[str, list[dict]] = {
-            "ドライブ": [self.library[i] for i in (1, 2, 5, 10, 17, 21, 12)],
-            "Focus": [self.library[i] for i in (9, 14, 7, 16, 27, 22)],
+            "ドライブ": [local_track(self.library[i]) for i in (1, 2, 5, 10, 17, 21, 12)],
+            "Focus": [local_track(self.library[i]) for i in (9, 14, 7, 16, 27, 22)],
         }
         self.spotify_lists = {
             "YOUR MUSIC": ("Your Music", "Library", [self._spotify_track(i) for i in (0, 3, 13, 23, 25)]),
@@ -551,7 +758,19 @@ class FakeCliamp:
         ago = [timedelta(minutes=10), timedelta(hours=2), timedelta(hours=5), timedelta(days=1, hours=1),
                timedelta(days=2), timedelta(days=4), timedelta(days=9), timedelta(days=40)]
         picks = (13, 0, 5, 22, 2, 9, 18, 25)
-        self.history = [(dict(self.library[i]), rfc3339(now - delta)) for i, delta in zip(picks, ago)]
+        self.history = [(history_track(self.library[i]), rfc3339(now - delta)) for i, delta in zip(picks, ago)]
+
+    def _stand_in_art(self, track: dict) -> dict:
+        """撮影用 (--art-dir) の絵を読み戻した曲に付け直す。
+
+        本物の履歴とローカルのプレイリストは meta を持たない (絵は path から GUI が探す)。
+        撮影ではネットワークに出ないので、手元の絵を同じ path の曲に割り当てて見せる。"""
+        if not self._art or track.get("meta"):
+            return track
+        for i, known in enumerate(self.library):
+            if known["path"] == track.get("path"):
+                return dict(track, meta={"art": self._art[i % len(self._art)]})
+        return track
 
     # --- 待ち受け -------------------------------------------------------------
 
@@ -698,6 +917,8 @@ class FakeCliamp:
 
     def position(self, now: float | None = None) -> float:
         now = time.monotonic() if now is None else now
+        if self._seek_pending is not None and now < self._seek_pending[0]:
+            return self._pos_base  # 繋ぎ直しの間は古い位置のまま止まる (gapless.Replace(nil))
         if self.state == "playing" and not self._buffering(now):
             return max(0.0, self._pos_base + max(0.0, now - self._t_base) * self.speed)
         return self._pos_base
@@ -708,10 +929,19 @@ class FakeCliamp:
             return 0.0
         return float(track.get("duration") or 0)
 
-    def _play_current(self, at: float) -> None:
+    def _old_position(self, now: float) -> float:
+        """読み込み中に本物が出す、前の曲の (まだ鳴っている) 位置。"""
+        pos, base, duration = self._old
+        value = pos + max(0.0, now - base) * self.speed
+        return min(value, duration) if duration > 0 else value
+
+    def _play_current(self, at: float, keep_old: tuple[float, float, float] | None = None) -> None:
+        self._old = keep_old if self.buffer_secs > 0 else None
         self.state = "playing"
         self._pos_base = 0.0
         self._scrobbled = False
+        self._seek_pending = None
+        self._playing_duration = self._duration()
         if self.buffer_secs > 0:
             self._buffering_until = at + self.buffer_secs
             self._t_base = at + self.buffer_secs
@@ -725,6 +955,12 @@ class FakeCliamp:
 
     def _tick(self, now: float) -> None:
         """再生位置を今に進め、曲の終わりを過ぎていれば次へ (何曲分でも)。"""
+        if self._seek_pending is not None and now >= self._seek_pending[0]:
+            at, target = self._seek_pending
+            self._seek_pending = None
+            self._seek_abs(target, at)
+        if self._old is not None and not self._buffering(now):
+            self._old = None
         for _ in range(1000):
             if self.state != "playing":
                 return
@@ -745,20 +981,47 @@ class FakeCliamp:
                 self._t_base = now
 
     def _scrobble(self) -> None:
-        """半分まで聞いた曲を履歴へ (cliamp の maybeScrobble と同じ条件)。"""
+        """半分まで聞いた曲を履歴へ (cliamp の maybeScrobble と history.Record と同じ)。
+
+        history.toml に書く欄だけを残す。直前の行と同じ曲を 5 分以内にもう一度記録したときは
+        時刻を新しくし、空の欄は前の行から埋める (mergeTrackMeta)。"""
         self._scrobbled = True
         track, _ = self.pl.current()
         if track is None or track.get("live"):
             return
         now = datetime.now(timezone.utc)
-        if self.history and self.history[0][0].get("path") == track.get("path"):
-            self.history[0] = (self.history[0][0], rfc3339(now))
-        else:
-            self.history.insert(0, (dict(track), rfc3339(now)))
-            del self.history[200:]
+        entry = history_track(track)
+        if self.history and self.history[0][0].get("path") == entry["path"]:
+            top, at = self.history[0]
+            try:
+                last = datetime.fromisoformat(at.replace("Z", "+00:00"))
+            except ValueError:
+                last = None
+            if last is not None and now - last < timedelta(minutes=5):
+                merged = dict(top)
+                merged.update({k: v for k, v in entry.items() if v})
+                self.history[0] = (merged, rfc3339(now))
+                return
+        self.history.insert(0, (entry, rfc3339(now)))
+        del self.history[200:]
 
-    def _start_track(self, now: float) -> None:
-        self._play_current(now)
+    def _start_track(self, now: float, previous: tuple[str, float, float] | None = None) -> None:
+        """操作 (next / prev / play_index / enqueue now など) で曲を始める。
+
+        previous は操作の前の (状態, 位置, 長さ)。switch_keeps_old なら、本物の TUI と同じく
+        読み込み中は前の曲の位置と長さで playing を出し続ける (Stop せずに裏で読み込むため)。"""
+        keep = None
+        if self.switch_keeps_old and previous is not None and previous[0] == "playing":
+            keep = (previous[1], now, previous[2])
+        self._play_current(now, keep)
+
+    def _before(self, now: float) -> tuple[str, float, float]:
+        """曲を替える操作の前の (状態, 位置, 長さ)。読み込み中は前の曲のものを引き継ぐ。"""
+        if self._buffering(now):
+            if self._old is not None:
+                return ("playing", self._old_position(now), self._old[2])
+            return ("loading", 0.0, 0.0)
+        return (self.state, self.position(now), getattr(self, "_playing_duration", self._duration()))
 
     # --- 返す形 -----------------------------------------------------------------
 
@@ -787,11 +1050,18 @@ class FakeCliamp:
     def _cmd_status(self, req, now):
         track, idx = self.pl.current()
         buffering = self._buffering(now)
+        state, position, duration = self.state, self.position(now), self._duration()
+        if buffering:
+            if self._old is not None:
+                # 本物の TUI: 前の曲がまだ鳴っていて、位置と長さはその曲のもの
+                state, position, duration = "playing", self._old_position(now), self._old[2]
+            else:
+                state = "stopped"  # 止まった状態から読み込み中
         resp = {
             "ok": True,
-            "state": "stopped" if buffering else self.state,
-            "position": round(self.position(now), 3),
-            "duration": self._duration(),
+            "state": state,
+            "position": round(position, 3),
+            "duration": duration,
             "volume": self.volume,
             "index": idx,
             "total": len(self.pl),
@@ -851,21 +1121,25 @@ class FakeCliamp:
         self._pos_base = 0.0
         self._t_base = now
         self._buffering_until = 0.0
+        self._old = None
+        self._seek_pending = None
         return {"ok": True}
 
     def _cmd_next(self, req, now):
+        before = self._before(now)
         if self.pl.next():
-            self._start_track(now)
+            self._start_track(now, before)
         else:
             self._cmd_stop(req, now)
         return {"ok": True}
 
     def _cmd_prev(self, req, now):
+        before = self._before(now)
         if self.position(now) > 3 and self.state != "stopped":
             self._pos_base = 0.0
             self._t_base = now
         elif self.pl.prev():
-            self._start_track(now)
+            self._start_track(now, before)
         return {"ok": True}
 
     def _cmd_volume(self, req, now):
@@ -885,7 +1159,19 @@ class FakeCliamp:
         return {"ok": True}
 
     def _cmd_seek_to(self, req, now):
-        self._seek_abs(float(req.get("value") or 0), now)
+        target = float(req.get("value") or 0)
+        if target < 0:
+            return {"ok": False, "error": "seek_to requires a non-negative position"}
+        if self._buffering(now) and self._old is not None:
+            # 読み込み中の seek は前の曲 (まだ鳴っている流れ) に効き、新しい曲では失われる
+            self._old = (target, now, self._old[2])
+            return {"ok": True}
+        if self.seek_delay > 0 and self.state == "playing":
+            # 本物の HTTP の流れ: すぐ受け付け、古い位置で止まったまま繋ぎ直し、後で効く
+            self._freeze(now)
+            self._seek_pending = (now + self.seek_delay, target)
+            return {"ok": True}
+        self._seek_abs(target, now)
         return {"ok": True}
 
     def _cmd_load(self, req, now):
@@ -927,7 +1213,7 @@ class FakeCliamp:
     def _cmd_repeat(self, req, now):
         name = str(req.get("name") or "").lower()
         if name in ("off", "all", "one"):
-            self.pl.repeat = name
+            self.pl.set_repeat(name)
         else:
             self.pl.cycle_repeat()
         return {"ok": True, "repeat": self.pl.repeat.capitalize()}
@@ -969,12 +1255,19 @@ class FakeCliamp:
         name = str(req.get("name") or "")
         if not name:
             return {"ok": False, "error": "device requires a name (or 'list')"}
+        names = [sink for sink, _ in DEVICES]
         if name.lower() == "list":
-            lines = [("* " if i == self.device else "  ") + d for i, d in enumerate(DEVICES)]
-            return {"ok": True, "device": "\n".join(lines)}
-        if name not in DEVICES:
-            return {"ok": False, "error": f"switch device: device {name!r} not found"}
-        self.device = DEVICES.index(name)
+            # "* " は既定の sink (pactl の Default Sink)。cliamp の流れの行き先ではない
+            lines = [("* " if i == self.default_device else "  ") + sink for i, sink in enumerate(names)]
+            reply = {"ok": True, "device": "\n".join(lines)}
+            if self.device_descriptions:
+                reply["devices"] = [{"name": sink, "description": text, "active": i == self.default_device}
+                                    for i, (sink, text) in enumerate(DEVICES)]
+            return reply
+        if name not in names:
+            return {"ok": False, "error": f"switch device: sink {go_quote(name)} not found"}
+        # 本物は cliamp の sink-input を move-sink-input で動かす (既定の sink は変えない)
+        self.device = names.index(name)
         return {"ok": True, "device": name}
 
     def _cmd_bands(self, req, now):
@@ -1011,22 +1304,44 @@ class FakeCliamp:
         if index is None:
             return {"ok": False, "error": "play_index requires an index"}
         if not 0 <= index < len(self.pl):
-            return {"ok": False, "error": f"index {index} out of range"}
+            return {"ok": False, "error": "index out of range"}
+        if self._stale(index, req):
+            return {"ok": False, "error": "stale"}
+        if self._buffering(now) and index == self.pl.index():
+            return {"ok": True}  # その曲をいま読み込んでいる (TUI の Enter と同じく何もしない)
+        before = self._before(now)
         self.pl.set_index(index)
         if self.pl.activate_selected():
-            self._start_track(now)
+            self._start_track(now, before)
         return {"ok": True}
 
-    def _tracks_from(self, req) -> list[dict]:
-        return [to_track(t) for t in req.get("tracks") or [] if isinstance(t, dict) and t.get("path")]
+    def _tracks_from(self, req, cmd: str) -> tuple[list[dict], dict | None]:
+        """ipc/gui.go の tracksFromRequest: path の無い曲は誤り。yt-dlp でない http(s) には stream を立てる。"""
+        out = []
+        for i, item in enumerate(req.get("tracks") or []):
+            if not isinstance(item, dict) or not str(item.get("path") or "").strip():
+                return [], {"ok": False, "error": f"{cmd}: track {i} has no path"}
+            if item.get("path_raw"):
+                try:
+                    base64.b64decode(str(item["path_raw"]), validate=True)
+                except ValueError:
+                    return [], {"ok": False, "error": f"{cmd}: track {i} has a bad path_raw"}
+            track = to_track(item)
+            if not track.get("stream") and is_url(track["path"]) and not is_ytdl(track["path"]):
+                track["stream"] = True
+            out.append(track)
+        return out, None
 
     def _cmd_replace(self, req, now):
-        tracks = self._tracks_from(req)
+        tracks, error = self._tracks_from(req, "replace")
+        if error:
+            return error
         if not tracks:
             return {"ok": False, "error": "replace requires tracks"}
-        index = self._index(req) or 0
+        index = self._index(req)
+        index = 0 if index is None else index
         if not 0 <= index < len(tracks):
-            return {"ok": False, "error": f"index {index} out of range"}
+            return {"ok": False, "error": "index out of range"}
         self._cmd_stop(req, now)
         self.pl.replace(tracks)
         self.pl.start_at(index)
@@ -1036,50 +1351,59 @@ class FakeCliamp:
             self._start_track(now)
         return {"ok": True, "total": len(self.pl), "gen": self.pl.gen}
 
-    def _queue_next(self, track: dict, now: float) -> None:
-        self.pl.add(track)
-        self.pl.queue_add(len(self.pl) - 1)
-        if self.state == "stopped":
-            self._cmd_next({}, now)
-
     def _cmd_enqueue(self, req, now):
-        tracks = self._tracks_from(req)
+        """ui/model/ipc_gui.go の guiEnqueue と同じ並べ方 (playlist/gui.go の PlayNext / AddNow /
+        AddAndSelect)。どれも末尾に足す (既存の曲の添字は動かない)。
+
+        next: 待ち行列を使わず、再生順でいまの曲のすぐ後ろに並べる (1 曲リピートだけ待ち行列へ)。
+        now: 先頭の曲をすぐ鳴らし、残りは足した順にそのすぐ後ろで鳴る。
+        end: 足すだけ。止まっていれば足した先頭の曲から鳴らす。"""
+        tracks, error = self._tracks_from(req, "enqueue")
+        if error:
+            return error
         if not tracks:
             return {"ok": False, "error": "enqueue requires tracks"}
-        mode = str(req.get("mode") or "next").lower()
+        raw = str(req.get("mode") or "")
+        mode = raw.lower() or "next"
+        if mode not in ("next", "end", "now"):
+            return {"ok": False, "error": f"enqueue: unknown mode {go_quote(raw)}"}
+        idle = self.state == "stopped" and not self._buffering(now)
+        if mode == "next" and len(self.pl) == 0:
+            mode = "end"  # 空のリストに「次に再生」は、末尾に足して先頭から鳴らすのと同じ
         if mode == "now":
             self._cmd_stop(req, now)
-            self.pl.add(tracks[0])
-            self.pl.set_index(len(self.pl) - 1)
+            self.pl.add_now(*tracks)
             if self.pl.activate_selected():
                 self._start_track(now)
-            for track in tracks[1:]:
-                self._queue_next(track, now)
-        elif mode == "next":
-            for track in tracks:
-                self._queue_next(track, now)
         elif mode == "end":
-            for track in tracks:
-                was_empty = len(self.pl) == 0
-                self.pl.add(track)
-                if was_empty or self.state == "stopped":
-                    self.pl.set_index(len(self.pl) - 1)
-                    if self.pl.activate_selected():
-                        self._start_track(now)
+            if idle:
+                self.pl.add_and_select(*tracks)
+                if self.pl.activate_selected():
+                    self._start_track(now)
+            else:
+                self.pl.add(*tracks)
         else:
-            return {"ok": False, "error": f"unknown enqueue mode {mode!r}"}
-        return {"ok": True, "total": len(self.pl)}
+            self.pl.play_next(*tracks)
+            if idle:
+                self._cmd_next({}, now)
+        return {"ok": True, "total": len(self.pl), "gen": self.pl.gen}
+
+    def _stale(self, index: int, req) -> bool:
+        """ipc.PathMismatch: 要求の path が空でなく、その添字の曲の path と違う。"""
+        want = str(req.get("path") or "")
+        return bool(want) and 0 <= index < len(self.pl) and self.pl.tracks[index].get("path") != want
 
     def _cmd_queue_edit(self, req, now):
-        mode = str(req.get("mode") or "").lower()
+        raw = str(req.get("mode") or "")
+        mode = raw.lower()
         index = self._index(req)
-        if mode == "clear":
-            self.pl.clear_queue()
-        elif mode in ("add", "remove"):
+        if mode in ("add", "remove"):
             if index is None:
                 return {"ok": False, "error": f"queue_edit {mode} requires an index"}
             if not 0 <= index < len(self.pl):
-                return {"ok": False, "error": f"index {index} out of range"}
+                return {"ok": False, "error": "index out of range"}
+            if self._stale(index, req):
+                return {"ok": False, "error": "stale"}
             if mode == "add":
                 self.pl.queue_add(index)
             else:
@@ -1088,38 +1412,58 @@ class FakeCliamp:
             to = req.get("to")
             if index is None or not isinstance(to, int) or isinstance(to, bool):
                 return {"ok": False, "error": "queue_edit move requires index and to"}
+            if 0 <= index < len(self.pl.queue) and self._stale(self.pl.queue[index], req):
+                return {"ok": False, "error": "stale"}
             if not self.pl.move_queue(index, to):
                 return {"ok": False, "error": "queue position out of range"}
+        elif mode == "clear":
+            self.pl.clear_queue()
         else:
-            return {"ok": False, "error": f"unknown queue_edit mode {mode!r}"}
-        return {"ok": True, "queue": list(self.pl.queue)}
+            return {"ok": False, "error": f"queue_edit: unknown mode {go_quote(raw)}"}
+        return {"ok": True, "queue": list(self.pl.queue), "gen": self.pl.gen}
 
     def _cmd_remove(self, req, now):
         index = self._index(req)
         if index is None:
             return {"ok": False, "error": "remove requires an index"}
         if not 0 <= index < len(self.pl):
-            return {"ok": False, "error": f"index {index} out of range"}
-        if index == self.pl.index():
-            return {"ok": False, "error": "cannot remove the playing track"}
+            return {"ok": False, "error": "index out of range"}
+        if self._stale(index, req):
+            return {"ok": False, "error": "stale"}
+        # 消せないのは再生中・一時停止中・読み込み中の今の曲だけ (止まっていれば消せる)
+        if index == self.pl.index() and (self.state != "stopped" or self._buffering(now)):
+            return {"ok": False, "error": "cannot remove the current track"}
         self.pl.remove(index)
         return {"ok": True, "total": len(self.pl), "gen": self.pl.gen}
 
     # --- カタログ系 ---------------------------------------------------------------
 
     def _cmd_providers(self, req, now):
+        # radio は Searcher でない (search は YouTube へ退避するだけ) ので search は false。
+        # ProviderInfo は omitempty の無い構造体なので、偽の真偽も省かない (omit の _OPAQUE_LISTS)
         return {"ok": True, "providers": [
-            {"key": "radio", "name": "Radio", "search": True, "playlists": True},
-            {"key": "local", "name": "Local Playlists", "search": True, "playlists": True},
-            {"key": "spotify", "name": "Spotify", "search": True, "playlists": True},
+            {"key": "radio", "name": "Radio", "search": False, "playlists": True, "virtual": False},
+            {"key": "local", "name": "Local", "search": True, "playlists": True, "virtual": False},
+            {"key": "spotify", "name": "Spotify", "search": True, "playlists": True, "virtual": False},
             {"key": "youtube", "name": "YouTube", "search": True, "playlists": False, "virtual": True},
         ]}
 
     def _local_tracks(self, name: str) -> list[dict] | None:
         if name == "Recently Played":
-            return [dict(t) for t, _ in self.history]
+            return [self._stand_in_art(dict(t)) for t, _ in self.history]
         if name in self.local_playlists:
-            return [dict(t) for t in self.local_playlists[name]]
+            return [self._stand_in_art(dict(t)) for t in self.local_playlists[name]]
+        return None
+
+    def _toml_path(self, name: str) -> str:
+        return f"{self.PLAYLIST_DIR}/{name}.toml"
+
+    def _local_name_error(self, name: str) -> dict | None:
+        """external/local の予約名と safePath の確かめ (誤りの応答か None)。"""
+        if name == "Recently Played":
+            return {"ok": False, "error": '"Recently Played" is a virtual history playlist and cannot be modified'}
+        if not name or name in (".", "..") or any(c in name for c in "/\\"):
+            return {"ok": False, "error": f"invalid playlist name {go_quote(name)}"}
         return None
 
     @staticmethod
@@ -1128,15 +1472,24 @@ class FakeCliamp:
 
     @staticmethod
     def _unknown_provider(provider: str) -> dict:
-        return {"ok": False, "error": f"unknown provider {provider!r}"}
+        return {"ok": False, "error": f"unknown provider: {provider}"}
+
+    def _radio_lists(self) -> list[dict]:
+        lists = [{"id": "l:0", "name": CLIAMP_RADIO[0]}]
+        if self.radios_toml:
+            lists += [{"id": f"l:{i + 1}", "name": name} for i, (name, _) in enumerate(STATIONS)]
+            lists += [{"id": f"f:{i}", "name": f"★ {name} [{rate}] · {country}"}
+                      for i, (name, _, rate, country) in enumerate(FAVORITES)]
+        lists += [{"id": f"c:{i}", "name": f"{name} [{rate}] · {country}"}
+                  for i, (name, _, rate, country) in enumerate(CATALOG_STATIONS)]
+        return lists
 
     def _cmd_playlists(self, req, now):
         provider = str(req.get("provider") or "")
+        if not provider:
+            return {"ok": False, "error": "playlists requires a provider"}
         if provider == "radio":
-            lists = [{"id": f"l:{i}", "name": name} for i, (name, _) in enumerate(STATIONS)]
-            lists += [{"id": f"f:{i}", "name": f"★ {name} [{rate}] · {country}"}
-                      for i, (name, _, rate, country) in enumerate(FAVORITES)]
-            return {"ok": True, "playlists": lists}
+            return {"ok": True, "playlists": self._radio_lists()}
         if provider == "local":
             lists = []
             if self.history:
@@ -1154,8 +1507,8 @@ class FakeCliamp:
                 {"id": pid, "name": name, "section": section, "track_count": len(tracks),
                  "duration": sum(t["duration"] for t in tracks)}
                 for pid, (name, section, tracks) in self.spotify_lists.items()]}
-        if provider == "youtube":
-            return {"ok": True}
+        if provider in ("youtube", "url"):
+            return {"ok": False, "error": f"provider {provider} has no playlists"}
         return self._unknown_provider(provider)
 
     def _resolve_url(self, url: str) -> list[dict] | None:
@@ -1188,46 +1541,78 @@ class FakeCliamp:
             mix.append(track)
         return mix
 
+    def _radio_tracks(self, pid: str) -> list[dict] | None:
+        """radio の局の曲。l:0 は組み込みの M3U を 15 本の配信に展開したもの (resolveWrapperURLs)。"""
+        def station(name: str, url: str) -> dict:
+            return self._with_art({"path": url, "title": name, "stream": True, "live": True}, name)
+
+        if pid == "l:0":
+            return [station(name, f"https://radio.cliamp.stream/{name.lower().replace(' & ', '-').replace(' ', '-')}"
+                                  f"/stream") for name in CLIAMP_STREAMS]
+        kind, _, number = pid.partition(":")
+        if not number.isdigit():
+            return None
+        n = int(number)
+        if kind == "l" and self.radios_toml and 1 <= n <= len(STATIONS):
+            return [station(*STATIONS[n - 1])]
+        if kind == "f" and self.radios_toml and n < len(FAVORITES):
+            name, url, _, _ = FAVORITES[n]
+            return [station(name, url)]
+        if kind == "c" and n < len(CATALOG_STATIONS):
+            name, url, _, _ = CATALOG_STATIONS[n]
+            return [station(name, url)]
+        return None
+
     def _provider_tracks(self, provider: str, pid: str) -> dict:
         if provider == "radio":
-            if pid.startswith("l:") and pid[2:].isdigit() and int(pid[2:]) < len(STATIONS):
-                name, url = STATIONS[int(pid[2:])]
-            elif pid.startswith("f:") and pid[2:].isdigit() and int(pid[2:]) < len(FAVORITES):
-                name, url, _, _ = FAVORITES[int(pid[2:])]
-            else:
-                return {"ok": False, "error": f"station {pid!r} not found"}
-            return {"ok": True, "tracks": [self._with_art({"path": url, "title": name, "stream": True, "live": True},
-                                                          name)]}
+            tracks = self._radio_tracks(pid)
+            if tracks is None:
+                return {"ok": False, "error": f"station {go_quote(pid)} not found"}
+            return {"ok": True, "tracks": tracks}
         if provider == "local":
             tracks = self._local_tracks(pid)
             if tracks is None:
-                return {"ok": False, "error": f"open {pid}.toml: no such file or directory"}
+                bad = self._local_name_error(pid) if pid != "Recently Played" else None
+                if bad is not None and "invalid" in bad["error"]:
+                    return bad
+                return {"ok": False, "error": f"open {self._toml_path(pid)}: no such file or directory"}
             return {"ok": True, "tracks": tracks}
         if provider == "spotify":
             if self.spotify_needs_auth:
                 return self._needs_auth()
             if pid not in self.spotify_lists:
-                return {"ok": False, "error": f"spotify: playlist {pid!r} not found"}
+                return {"ok": False, "error": f"spotify: playlist {go_quote(pid)} not found"}
             return {"ok": True, "tracks": [dict(t) for t in self.spotify_lists[pid][2]]}
         if provider == "url":
-            tracks = self._resolve_url(pid)
+            url = pid.strip()
+            if not url.startswith(("http://", "https://")):
+                return {"ok": False, "error": f"url: not an http(s) URL: {go_quote(url)}"}
+            tracks = self._resolve_url(url)
             if tracks is None:
-                return {"ok": False, "error": f"resolve: unsupported URL {pid!r}"}
+                return {"ok": False, "error": f"resolve: unsupported URL {go_quote(url)}"}
             return {"ok": True, "tracks": tracks}
         if provider == "youtube":
-            return {"ok": False, "error": "youtube has no playlists"}
+            return {"ok": False, "error": "provider youtube has no playlists"}
         return self._unknown_provider(provider)
 
     def _cmd_tracks(self, req, now):
-        return self._provider_tracks(str(req.get("provider") or ""), str(req.get("id") or ""))
+        provider = str(req.get("provider") or "")
+        pid = str(req.get("id") or "")
+        if not provider or not pid:
+            return {"ok": False, "error": "tracks requires a provider and an id"}
+        return self._provider_tracks(provider, pid)
 
     def _cmd_search(self, req, now):
-        provider = str(req.get("provider") or "youtube")
+        provider = str(req.get("provider") or "") or "youtube"  # 空なら youtube (本物と同じ)
         query = str(req.get("query") or "").strip()
         limit = int(req.get("limit") or 25)
         limit = max(1, min(50, limit))
         if not query:
             return {"ok": False, "error": "search requires a query"}
+        if provider == "url":
+            return {"ok": False, "error": "provider url does not support search"}
+        if provider not in ("youtube", "radio", "soundcloud", "local", "spotify"):
+            return self._unknown_provider(provider)
         if "__fail__" in query:
             return {"ok": False, "error": "yt-dlp: exit status 1"}
         if "noresults" in query.lower() or "該当なし" in query:
@@ -1240,7 +1625,7 @@ class FakeCliamp:
                     hay = " ".join(str(t.get(k, "")) for k in ("title", "artist", "album")).casefold()
                     if q in hay and t["path"] not in seen:
                         seen.add(t["path"])
-                        found.append(dict(t))
+                        found.append(self._stand_in_art(dict(t)))
             return {"ok": True, "tracks": found[:limit]}
         if provider == "spotify":
             if self.spotify_needs_auth:
@@ -1255,8 +1640,6 @@ class FakeCliamp:
                      "artist": artist, "album": f"{query} (Single)", "year": 2020 + i % 6,
                      "duration": rng.randint(150, 330), "track_number": 1}, f"{query}|{i}"))
             return {"ok": True, "tracks": tracks}
-        if provider not in ("youtube", "radio", "soundcloud"):
-            return self._unknown_provider(provider)
         # radio のように Searcher でないプロバイダーは yt-dlp の YouTube 検索へ退避する。
         rng = random.Random("youtube|" + query)
         tracks = []
@@ -1271,28 +1654,31 @@ class FakeCliamp:
     def _cmd_load_provider(self, req, now):
         provider = str(req.get("provider") or "")
         pid = str(req.get("id") or "")
+        if not provider or not pid:
+            return {"ok": False, "error": "load_provider requires a provider and an id"}
         result = self._provider_tracks(provider, pid)
         if not result.get("ok"):
             return result
         tracks = result.get("tracks") or []
         if not tracks:
             return {"ok": False, "error": "no tracks"}
-        index = self._index(req) or 0
+        index = self._index(req)
+        index = 0 if index is None else index
         if not 0 <= index < len(tracks):
-            index = 0
+            return {"ok": False, "error": "index out of range"}  # 再生は止めない・リストは替えない
         self._cmd_stop(req, now)
         self.pl.replace([to_track(t) for t in tracks])
         self.pl.start_at(index)
         self.source = {"provider": provider, "id": pid, "name": str(req.get("name") or pid)}
         if self.pl.activate_selected():
             self._start_track(now)
-        return {"ok": True, "total": len(self.pl)}
+        return {"ok": True, "total": len(self.pl), "gen": self.pl.gen}
 
     def _cmd_lyrics(self, req, now):
         title = str(req.get("title") or "")
         artist = str(req.get("artist") or "")
-        if not title:
-            return {"ok": False, "error": "lyrics requires a title"}
+        if not title.strip() and not artist.strip():
+            return {"ok": False, "error": "lyrics requires an artist or a title"}
         pos = next((i for i, t in enumerate(self.library) if t["title"].casefold() == title.casefold()), None)
         kind = pos % 3 if pos is not None else int(hashlib.sha1(f"{artist}|{title}".encode()).hexdigest(), 16) % 3
         if kind == 2:
@@ -1306,38 +1692,57 @@ class FakeCliamp:
 
     def _cmd_history(self, req, now):
         limit = int(req.get("limit") or 50)
-        return {"ok": True, "tracks": [self._trackinfo(t, played_at=at) for t, at in self.history[:limit]]}
-
-    @staticmethod
-    def _valid_name(name: str) -> bool:
-        return bool(name) and name not in (".", "..", "Recently Played") and not any(c in name for c in "/\\")
+        return {"ok": True, "tracks": [self._trackinfo(self._stand_in_art(dict(t)), played_at=at)
+                                       for t, at in self.history[:limit]]}
 
     def _cmd_playlist_add(self, req, now):
+        """ipc/gui.go の順で確かめ、external/local の AddTracks と同じく TOML の欄だけを足す。"""
         name = str(req.get("name") or "")
-        if not self._valid_name(name):
-            return {"ok": False, "error": f"invalid playlist name {name!r}"}
-        tracks = self._tracks_from(req)
+        if not name:
+            return {"ok": False, "error": "playlist_add requires a name"}
+        tracks, error = self._tracks_from(req, "playlist_add")
+        if error:
+            return error
         if not tracks:
             return {"ok": False, "error": "playlist_add requires tracks"}
-        self.local_playlists.setdefault(name, []).extend(tracks)
+        bad = self._local_name_error(name)
+        if bad is not None:
+            return bad
+        self.local_playlists.setdefault(name, []).extend(local_track(t) for t in tracks)
         return {"ok": True}
 
     def _cmd_playlist_delete(self, req, now):
         name = str(req.get("name") or "")
+        if not name:
+            return {"ok": False, "error": "playlist_delete requires a name"}
+        bad = self._local_name_error(name)
+        if bad is not None:
+            return bad
         if name not in self.local_playlists:
-            return {"ok": False, "error": f"playlist {name!r} not found"}
+            return {"ok": False, "error": f"remove {self._toml_path(name)}: no such file or directory"}
         del self.local_playlists[name]
         return {"ok": True}
 
     def _cmd_playlist_remove_track(self, req, now):
         name = str(req.get("name") or "")
         index = self._index(req)
+        if not name or index is None:
+            return {"ok": False, "error": "playlist_remove_track requires a name and an index"}
+        bad = self._local_name_error(name)
+        if bad is not None:
+            return bad
         tracks = self.local_playlists.get(name)
         if tracks is None:
-            return {"ok": False, "error": f"playlist {name!r} not found"}
-        if index is None or not 0 <= index < len(tracks):
-            return {"ok": False, "error": "index out of range"}
+            return {"ok": False, "error": f"open {self._toml_path(name)}: no such file or directory"}
+        if not 0 <= index < len(tracks):
+            return {"ok": False, "error": f"track index {index} out of range"}
+        want = str(req.get("path") or "")
+        if want and tracks[index].get("path") != want:
+            return {"ok": False, "error": "stale"}
         del tracks[index]
+        if not tracks:
+            # external/local の RemoveTrack: 空になったプレイリストはファイルごと消える
+            del self.local_playlists[name]
         return {"ok": True}
 
 
@@ -1351,11 +1756,19 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--buffer", type=float, default=0.0, help="曲の読み込み待ち (秒)")
     parser.add_argument("--state", choices=("playing", "paused", "stopped"), default="playing")
     parser.add_argument("--empty", action="store_true", help="再生中のリストを空で始める")
+    parser.add_argument("--radios-toml", action="store_true",
+                        help="利用者の radios.toml の局とお気に入りも出す (l:1〜、f:0)")
+    parser.add_argument("--device-descriptions", action="store_true",
+                        help="device list に説明付きの devices 配列も付ける")
+    parser.add_argument("--switch-keeps-old", action="store_true",
+                        help="読み込み中の曲の切り替えで前の曲の位置と長さを出す (本物の TUI)")
     args = parser.parse_args(argv)
 
     server = FakeCliamp(args.socket, legacy=args.legacy, art_dir=args.art_dir,
                         spotify_needs_auth=args.spotify_needs_auth, latency=args.latency,
-                        buffer_secs=args.buffer, initial_state=args.state, empty=args.empty)
+                        buffer_secs=args.buffer, initial_state=args.state, empty=args.empty,
+                        radios_toml=args.radios_toml, device_descriptions=args.device_descriptions,
+                        switch_keeps_old=args.switch_keeps_old)
     server.start()
     print(f"fake-cliamp: {args.socket} で待ち受けています (api {0 if args.legacy else 1})",
           file=sys.stderr, flush=True)
@@ -1392,16 +1805,28 @@ def isolate_display() -> None:
         os.environ.pop("DISPLAY", None)
 
 
-def temp_socket_path(name: str = "cliamp.sock") -> str:
-    """Unix ソケットの長さの上限 (108 バイト) に収まる一時的なパス。"""
+def temp_dir(prefix: str = "cm-", parent: str | None = None) -> str:
+    """一時ディレクトリ。試験の終わり (プロセスの終わり) に消す。
+
+    後始末を試験ごとにしないのは、絵の読み込みなどの裏のスレッドが試験の後にも
+    書き込むことがあるため (消した後に書くと、そのスレッドで例外になる)。"""
+    import atexit
+    import shutil
     import tempfile
 
-    base = tempfile.mkdtemp(prefix="cm-")
-    path = os.path.join(base, name)
-    if len(path.encode()) > 100:
-        base = tempfile.mkdtemp(prefix="cm-", dir="/tmp")
-        path = os.path.join(base, name)
+    path = tempfile.mkdtemp(prefix=prefix, dir=parent)
+    atexit.register(shutil.rmtree, path, True)
     return path
+
+
+def temp_socket_path(name: str = "cliamp.sock") -> str:
+    """Unix ソケットの長さの上限 (108 バイト) に収まる一時的なパス (終わりに消す)。"""
+    import tempfile
+
+    base = tempfile.gettempdir()
+    if len(os.path.join(base, "cm-xxxxxxxx", name).encode()) > 100:
+        base = "/tmp"
+    return os.path.join(temp_dir("cm-", base), name)
 
 
 def run_loop(until, timeout: float = 5.0) -> bool:

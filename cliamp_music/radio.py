@@ -26,6 +26,8 @@ BASE_URL = "https://de1.api.radio-browser.info/json"
 TIMEOUT = 10.0
 CACHE_TTL = 1800.0
 SEARCH_TTL = 600.0
+CACHE_SWEEP = 64  # 覚えている URL がこれを超えたら期限切れを捨てる
+SEARCH_CACHE_MAX = 100  # 局名の検索を覚えておく数
 
 StationsCallback = Callable[[list[Track] | str], object]
 
@@ -185,7 +187,15 @@ class RadioBrowser:
 
     def _finish(self, url: str, result: list[Track] | str, ttl: float) -> bool:
         if isinstance(result, list):
-            self._cache[url] = (time.monotonic() + ttl, result)
+            now = time.monotonic()
+            self._cache.pop(url, None)
+            self._cache[url] = (now + ttl, result)
+            if len(self._cache) > CACHE_SWEEP:
+                # 期限の切れたものを捨て、局名の検索は新しいものだけを残す (打ちながら探すと増える)
+                self._cache = {k: v for k, v in self._cache.items() if v[0] > now}
+                searches = [k for k in self._cache if "/stations/byname/" in k]
+                for old in searches[: max(0, len(searches) - SEARCH_CACHE_MAX)]:
+                    del self._cache[old]
         for callback in self._waiting.pop(url, []):
             _call(callback, list(result) if isinstance(result, list) else result)
         return GLib.SOURCE_REMOVE

@@ -33,7 +33,7 @@ gi.require_version("Graphene", "1.0")
 from gi.repository import Adw, Gdk, Gio, GLib, GObject, Graphene, Gsk, Gtk, Pango  # noqa: E402
 
 from .pages import Bindings  # noqa: E402
-from .protocol import db_to_linear, format_time, linear_to_db  # noqa: E402
+from .protocol import VOLUME_MIN_DB, format_time, fraction_to_volume, volume_fraction  # noqa: E402
 from .widgets import Artwork, CircleButton, ToggleCircle  # noqa: E402
 
 SPEEDS = ("0.5", "0.75", "1.0", "1.25", "1.5", "2.0")
@@ -60,6 +60,13 @@ def _label(text: str = "", css: str | tuple[str, ...] = (), xalign: float = 0.0,
 def _speed_key(speed: float) -> str:
     """いまの速さに最も近いメニューの項目。"""
     return min(SPEEDS, key=lambda s: abs(float(s) - (speed or 1.0)))
+
+
+def _speed_state(speed: float) -> str:
+    """再生速度のメニューで印を付ける項目。メニューに無い速さ (イコライザで 1.1× など) なら
+    どれにも印を付けない ("")。近い項目に印を付けると、フルスクリーンの「1.1×」と食い違う。"""
+    key = _speed_key(speed)
+    return key if abs(float(key) - (speed or 1.0)) <= 0.001 else ""
 
 
 def _speed_label(key: str) -> str:
@@ -735,18 +742,19 @@ class PlayerBar(Adw.BreakpointBin):
         items.append("読み込み中…", "bar.device-loading")
         action = self.actions.lookup_action("device")
 
-        def done(devices) -> None:
+        def done(devices, error: str = "") -> None:
             items.remove_all()
             if not devices:
-                items.append("出力先が見つかりません", "bar.device-loading")
+                items.append(error or "出力先が見つかりません", "bar.device-loading")
                 return
             active = ""
-            for name, used in devices:
-                item = Gio.MenuItem.new(name.replace("_", "__"), None)
-                item.set_action_and_target_value("bar.device", GLib.Variant.new_string(name))
+            for device in devices:
+                # 見出しは説明 (無ければ sink 名から作ったもの)。切り替えには sink 名を送る
+                item = Gio.MenuItem.new(device.label.replace("_", "__"), None)
+                item.set_action_and_target_value("bar.device", GLib.Variant.new_string(device.name))
                 items.append_item(item)
-                if used:
-                    active = name
+                if device.active:
+                    active = device.name
             if action is not None:
                 action.set_state(GLib.Variant.new_string(active))
 
@@ -763,8 +771,10 @@ class PlayerBar(Adw.BreakpointBin):
         if self is None or self._volume_syncing:
             return
         self._volume_user_at = time.monotonic()
-        self.ctx.store.set_volume_db(linear_to_db(scale.get_value()))
-        self._update_volume_icon(linear_to_db(scale.get_value()))
+        # フルスクリーンのつまみと同じ換算 (dB に比例)
+        db = round(fraction_to_volume(scale.get_value()), 1)
+        self.ctx.store.set_volume_db(db)
+        self._update_volume_icon(db)
 
     @staticmethod
     def _on_volume_scroll(controller, _dx, dy) -> bool:
@@ -891,15 +901,13 @@ class PlayerBar(Adw.BreakpointBin):
             tip = {"off": "リピート: オフ", "all": "リピート: すべて", "one": "リピート: 1 曲"}.get(st.repeat, "リピート")
             self.repeat.set_tooltip_text(tip)
         speed = self.actions.lookup_action("speed")
-        key = _speed_key(st.speed)
+        key = _speed_state(st.speed)
         if speed.get_state().get_string() != key:
             speed.set_state(GLib.Variant.new_string(key))
         self._update_play()
 
     def _seekable(self) -> bool:
-        st = self.ctx.store.status
-        return (self.ctx.store.connected and st.track is not None and not st.is_live
-                and st.duration > 0 and self.ctx.store.supports("seek_to"))
+        return self.ctx.store.can_seek()
 
     def _update_progress(self) -> None:
         st = self.ctx.store.status
@@ -940,7 +948,7 @@ class PlayerBar(Adw.BreakpointBin):
     def _update_volume(self) -> None:
         st = self.ctx.store.status
         if time.monotonic() - self._volume_user_at > USER_HOLD:
-            value = db_to_linear(st.volume)
+            value = volume_fraction(st.volume)
             if abs(self.volume_scale.get_value() - value) > 0.004:
                 self._volume_syncing = True
                 try:
@@ -951,11 +959,11 @@ class PlayerBar(Adw.BreakpointBin):
 
     def _update_volume_icon(self, db: float) -> None:
         # 変わったときだけ差し替える (MenuButton の記号を替えると開いているポップオーバーが閉じる)
-        muted = db_to_linear(db) <= 0.0
+        muted = db <= VOLUME_MIN_DB + 0.01
         icon = "music-volume-mute-symbolic" if muted else "music-volume-symbolic"
         if self.volume.get_icon_name() != icon:
             self.volume.set_icon_name(icon)
-        tip = f"音量 {int(round(db_to_linear(db) * 100))}%"
+        tip = f"音量 {int(round(volume_fraction(db) * 100))}%"
         if self.volume.get_tooltip_text() != tip:
             self.volume.set_tooltip_text(tip)
 

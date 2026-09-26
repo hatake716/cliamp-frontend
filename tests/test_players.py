@@ -94,6 +94,40 @@ class HelperTest(unittest.TestCase):
         untitled = Track(path="/m/Artist/夜の歌.mp3", artist="A")
         self.assertEqual(fs_mod.lyrics_subject(Status(state="playing", track=untitled)), ("A", "夜の歌"))
 
+    def test_volume_mapping_is_shared_with_the_bar(self):
+        from cliamp_music import protocol
+
+        self.assertIs(fs_mod.volume_fraction, protocol.volume_fraction)
+        self.assertIs(fs_mod.fraction_to_volume, protocol.fraction_to_volume)
+
+    def test_text_input_follows_the_active_window(self):
+        """入力中かは前にある窓のフォーカスで決める (隠れたメインの窓の入力欄では止めない)。"""
+        from cliamp_music.app import text_input_focused
+
+        class Win:
+            def __init__(self, active, focus):
+                self._active, self._focus = active, focus
+
+            def is_active(self):
+                return self._active
+
+            def get_focus(self):
+                return self._focus
+
+        entry = Gtk.Text() if HAVE_DISPLAY else None
+        if entry is None:
+            self.skipTest("画面がありません")
+        self.assertFalse(text_input_focused([Win(False, entry), Win(True, None)]))
+        self.assertTrue(text_input_focused([Win(True, entry), Win(False, None)]))
+        self.assertFalse(text_input_focused([Win(False, entry)]))
+
+    def test_hidden_states(self):
+        from cliamp_music.app import state_hidden
+
+        self.assertTrue(state_hidden(Gdk.ToplevelState.SUSPENDED))  # Wayland (mutter) の最小化・覆われた窓
+        self.assertTrue(state_hidden(Gdk.ToplevelState.MINIMIZED))  # X11
+        self.assertFalse(state_hidden(Gdk.ToplevelState.FOCUSED | Gdk.ToplevelState.MAXIMIZED))
+
     def test_band_and_preset_labels(self):
         self.assertEqual([eq_mod.band_label(b) for b in EQ_BANDS[:5]],
                          ["70 Hz", "180 Hz", "320 Hz", "600 Hz", "1 kHz"])
@@ -344,8 +378,7 @@ class FullscreenTest(PlayerTestBase):
         fs.set_mode("queue")
         self.assertEqual(self.saved_extra()["fullscreen_mode"], "queue")
         self.assertTrue(run_loop(lambda: bool(self.store.playlist.up_next), 5.0))
-        library = list(self.store.playlist.tracks)
-        self.store.enqueue([library[5]], "next")
+        self.store.queue_edit("add", index=5)
         self.assertTrue(run_loop(lambda: bool(self.store.playlist.queue), 5.0))
         run_loop(lambda: False, 0.3)
 
@@ -363,6 +396,202 @@ class FullscreenTest(PlayerTestBase):
         self.assertEqual(len(lists), 2, lists)
         self.assertEqual(lists[0], list(self.store.playlist.queue))
         self.assertEqual(lists[1], list(self.store.playlist.up_next[: fs.queue.MAX_ROWS]))
+
+
+    def test_levels_grow_on_big_screens(self):
+        """本当のフルスクリーン (1920x1080) では絵と歌詞を大きくする (窓の大きさの 360px のままにしない)。"""
+        fs = fs_mod.FullscreenPlayer(self.ctx)
+        window = self.host(fs, 1920, 1080)
+        self.assertTrue(run_loop(lambda: fs._level == "xlarge", 3.0), fs._level)
+        self.assertEqual(fs.art.get_width(), 440)
+        self.assertGreater(fs.lyrics._font_px, 34)
+        self.assertTrue(fs.has_css_class("xlarge"))
+        window.set_default_size(1180, 760)
+        self.assertTrue(run_loop(lambda: fs._level == "large", 3.0), fs._level)
+
+    def test_queue_says_it_continues_after_reshuffle(self):
+        """シャッフル + リピート (すべて) で一巡の最後の曲: up_next は空でも「続く」と書く。"""
+        fs = fs_mod.FullscreenPlayer(self.ctx)
+        self.host(fs)
+        fs.set_active(True)
+        fs.set_mode("queue")
+        self.store.set_shuffle(True)
+        self.store.set_repeat("all")
+        self.assertTrue(run_loop(lambda: self.fake.pl.shuffle and self.fake.pl.repeat == "all", 3.0))
+        self.store.play_index(self.fake.pl.order[-1])
+        self.assertTrue(run_loop(lambda: self.store.status.shuffle and not self.store.playlist.up_next
+                                 and self.store.playlist.index == self.fake.pl.order[-1]
+                                 and not self.store._overrides, 5.0))
+        fs.queue.refresh()
+        self.assertTrue(run_loop(lambda: fs.queue._stack.get_visible_child_name() == "empty", 3.0))
+        self.assertIn("シャッフルし直して", fs.queue._empty.title_label.get_text())
+        # リピートを切ると (up_next は同じ空でも) ふつうの「ありません」に戻る
+        self.store.set_repeat("off")
+        self.assertTrue(run_loop(lambda: "ありません" in fs.queue._empty.title_label.get_text(), 3.0))
+
+    def test_queued_row_plays_without_replaying(self):
+        fs = fs_mod.FullscreenPlayer(self.ctx)
+        self.host(fs)
+        fs.set_active(True)
+        fs.set_mode("queue")
+        self.assertTrue(run_loop(lambda: len(self.store.playlist.tracks) == 12, 5.0))
+        for index in (5, 7):
+            self.store.queue_edit("add", index=index)
+            self.assertTrue(run_loop(lambda index=index: index in self.store.playlist.queue, 3.0))
+        self.assertTrue(run_loop(lambda: self.store.playlist.queue == [5, 7]
+                                 and self.store.playlist.track_at(7).queued == 2, 3.0))
+        fs.queue.refresh(force=True)
+        queue_rows = next(child for child in _children(fs.queue._content) if isinstance(child, Gtk.ListBox))
+        row = queue_rows.rows()[1]
+        self.assertEqual(row.index, 7)
+        queue_rows.emit("row-activated", row)
+        self.assertTrue(run_loop(lambda: self.fake.pl.index() == 7 and not self.fake.pl.queue, 5.0))
+        self.assertEqual(self.fake.requests_for("play_index"), [])
+
+
+def _children(widget):
+    child = widget.get_first_child()
+    while child is not None:
+        yield child
+        child = child.get_next_sibling()
+
+
+class PlayerBarTest(PlayerTestBase):
+    def bar(self):
+        from cliamp_music.playerbar import PlayerBar
+
+        bar = PlayerBar(self.ctx)
+        self.host(bar, 900, 80)
+        return bar
+
+    def test_volume_matches_fullscreen_slider(self):
+        bar = self.bar()
+        self.store.set_volume_db(-6.0)
+        self.assertTrue(run_loop(lambda: self.fake.volume == -6.0 and not self.store._overrides, 3.0))
+        bar._volume_user_at = 0.0
+        self.store.emit("status-changed")
+        fs = fs_mod.VolumeControl(self.store)
+        fs.update(self.store.status)
+        self.assertAlmostEqual(bar.volume_scale.get_value(), fs.slider.fraction, places=2)
+        self.assertAlmostEqual(bar.volume_scale.get_value(), 2 / 3, places=2)
+        self.assertEqual(bar.volume.get_tooltip_text(), "音量 67%")
+        bar.volume_scale.set_value(0.5)
+        self.assertTrue(run_loop(lambda: abs(self.fake.volume - (-12.0)) < 0.2, 3.0), self.fake.volume)
+
+    def test_speed_not_in_menu_checks_nothing(self):
+        bar = self.bar()
+        self.store.set_speed(1.1)
+        self.assertTrue(run_loop(lambda: abs(self.store.status.speed - 1.1) < 1e-6, 3.0))
+        self.store.emit("status-changed")
+        self.assertEqual(bar.actions.lookup_action("speed").get_state().get_string(), "")
+        self.store.set_speed(1.5)
+        self.assertTrue(run_loop(lambda: bar.actions.lookup_action("speed").get_state().get_string() == "1.5", 3.0))
+
+    def test_output_menu_shows_labels_and_sends_sink_names(self):
+        bar = self.bar()
+        with self.fake.lock:
+            self.fake.device_descriptions = True
+        bar.output.set_visible(True)
+        bar.output.popup()
+        items = bar._device_items
+        self.assertTrue(run_loop(lambda: items.get_n_items() == 3, 3.0))
+        label = items.get_item_attribute_value(2, "label", GLib.VariantType.new("s")).get_string()
+        target = items.get_item_attribute_value(2, "target", None).unpack()
+        self.assertEqual(label, "WH-1000XM5")
+        self.assertEqual(target, "bluez_output.AC_80_0A_12_34_56.1")
+        first = items.get_item_attribute_value(0, "label", GLib.VariantType.new("s")).get_string()
+        self.assertEqual(first, "内蔵オーディオ アナログステレオ")
+        bar.output.popdown()
+
+    def test_output_menu_explains_missing_pactl(self):
+        bar = self.bar()
+        with self.fake.lock:
+            self.fake._cmd_device = lambda req, now: {
+                "ok": False, "error": 'list devices: pactl: exec: "pactl": executable file not found in $PATH'}
+        bar.output.set_visible(True)
+        bar.output.popup()
+        items = bar._device_items
+        self.assertTrue(run_loop(lambda: items.get_n_items() == 1 and "pactl" in items.get_item_attribute_value(
+            0, "label", GLib.VariantType.new("s")).get_string(), 3.0))
+        bar.output.popdown()
+
+
+class PanelsTest(PlayerTestBase):
+    def queue_panel(self):
+        from cliamp_music.panels import QueuePanel
+
+        panel = QueuePanel(self.ctx)
+        self.host(panel, 300, 700)
+        panel.set_active(True)
+        self.assertTrue(run_loop(lambda: panel.row_count > 0, 5.0))
+        return panel
+
+    def test_queue_and_continuation_are_separate_sections(self):
+        panel = self.queue_panel()
+        self.assertFalse(panel.queue_header.get_visible())
+        self.assertEqual(panel.next_header.title_label.get_text(), "次に再生")
+        self.store.queue_edit("add", index=9)
+        self.assertTrue(run_loop(lambda: panel.queue_header.get_visible() and len(panel.queue_list.rows()) == 1, 3.0))
+        self.assertEqual(panel.queue_list.rows()[0].index, 9)
+        self.assertEqual(panel.next_header.title_label.get_text(), "ドライブ")
+        self.assertEqual(panel.next_subtitle.get_text(), "このあと続けて再生されます")
+        self.assertTrue(run_loop(lambda: 9 not in self.store.playlist.up_next, 3.0))
+        self.assertTrue(run_loop(lambda: [r.index for r in panel.next_list.rows()] == self.store.playlist.up_next, 3.0))
+        self.assertNotIn(9, [r.index for r in panel.next_list.rows()])
+        self.store.queue_edit("clear")
+        self.assertTrue(run_loop(lambda: not panel.queue_header.get_visible(), 3.0))
+        self.assertFalse(panel.clear_button.get_visible())
+        self.assertEqual(panel.next_header.title_label.get_text(), "次に再生")
+
+    def test_appends_keep_rows_and_selection(self):
+        panel = self.queue_panel()
+        self.store.set_repeat("off")
+        self.assertTrue(run_loop(lambda: self.store.playlist.up_next == list(range(3, 12)), 3.0))
+        self.assertTrue(run_loop(lambda: [r.index for r in panel.next_list.rows()] == list(range(3, 12)), 3.0))
+        rows = panel.next_list.rows()
+        panel.next_list.select_row(rows[3])
+        selected = rows[3]
+        extra = [Track(path=f"https://www.youtube.com/watch?v=appended{i:03d}", title=f"足した {i}") for i in range(5)]
+        self.store.enqueue(extra, "end")
+        self.assertTrue(run_loop(lambda: len(panel.next_list.rows()) == len(rows) + 5, 3.0))
+        self.assertEqual([id(r) for r in panel.next_list.rows()[: len(rows)]], [id(r) for r in rows])
+        self.assertIs(panel.next_list.get_selected_row(), selected)
+
+    def test_reshuffle_note(self):
+        panel = self.queue_panel()
+        self.store.set_shuffle(True)
+        self.store.set_repeat("all")
+        self.assertTrue(run_loop(lambda: self.fake.pl.shuffle and self.fake.pl.repeat == "all", 3.0))
+        self.store.play_index(self.fake.pl.order[-1])
+        self.assertTrue(run_loop(lambda: not self.store.playlist.up_next and not self.store.playlist.queue
+                                 and self.store.playlist.index == self.fake.pl.order[-1], 5.0))
+        self.assertTrue(run_loop(lambda: panel.next_empty.get_visible(), 3.0))
+        self.assertEqual(panel.next_empty.get_text(), "このあとシャッフルし直して続けて再生します")
+        self.store.set_repeat("off")
+        self.assertTrue(run_loop(lambda: panel.next_empty.get_text() == "次に再生する曲はありません", 3.0))
+
+    def test_queued_row_uses_play_queued(self):
+        panel = self.queue_panel()
+        for index in (5, 7):
+            self.store.queue_edit("add", index=index)
+            self.assertTrue(run_loop(lambda index=index: index in self.store.playlist.queue, 3.0))
+        self.assertTrue(run_loop(lambda: len(panel.queue_list.rows()) == 2, 3.0))
+        panel.queue_list.emit("row-activated", panel.queue_list.rows()[1])
+        self.assertTrue(run_loop(lambda: self.fake.pl.index() == 7 and not self.fake.pl.queue, 5.0))
+        self.assertEqual(self.fake.requests_for("play_index"), [])
+        self.assertTrue(run_loop(lambda: not panel.queue_header.get_visible(), 3.0))
+
+    def test_lyrics_scroller_shows_no_scrollbar(self):
+        from cliamp_music.panels import LyricsPanel
+
+        panel = LyricsPanel(self.ctx)
+        self.host(panel, 300, 600)
+        self.assertEqual(panel.scroller.get_policy()[1], Gtk.PolicyType.EXTERNAL)
+        panel.set_active(True)
+        self.play(0, at=44.0)
+        self.assertTrue(run_loop(lambda: panel._current >= 1, 5.0))
+        run_loop(lambda: False, 0.6)
+        self.assertFalse(panel.scroller.get_vscrollbar().get_mapped())
 
 
 class EqualizerTest(PlayerTestBase):
@@ -417,6 +646,14 @@ class EqualizerTest(PlayerTestBase):
         window.preset_dropdown.set_selected(index)
         self.assertTrue(run_loop(lambda: any(r.get("name") == "Jazz" for r in self.fake.requests_for("eq")), 3.0))
         self.assertTrue(run_loop(lambda: self.store.status.eq_preset == "Jazz", 3.0))
+
+    def test_space_toggles_playback(self):
+        window = self.open_eq()
+        keys = _capture_keys(window)
+        self.assertIsNotNone(keys, "イコライザに Space の処理がありません")
+        before = len(self.fake.requests_for("toggle"))
+        self.assertTrue(keys.emit("key-pressed", Gdk.KEY_space, 0, Gdk.ModifierType(0)))
+        self.assertTrue(run_loop(lambda: len(self.fake.requests_for("toggle")) == before + 1, 3.0))
 
     def test_speed_is_sent_after_pause(self):
         window = self.open_eq()
@@ -488,6 +725,57 @@ class MiniPlayerTest(PlayerTestBase):
         _show_main(self.ctx, "queue")
         self.assertEqual(self.window.panels, ["queue"])
         self.assertEqual(self.window.presented, 1)
+        self.assertEqual(self.window.fullscreen_calls, [])
+
+    def test_panel_button_leaves_fullscreen_player(self):
+        """フルスクリーンプレーヤーの下のパネルを開いても見えないので、先に出る。"""
+        from cliamp_music.miniplayer import _show_main
+
+        self.window.fullscreen_shown = True
+        _show_main(self.ctx, "lyrics")
+        self.assertEqual(self.window.fullscreen_calls, [False])
+        self.assertEqual(self.window.panels, ["lyrics"])
+        self.assertEqual(self.window.presented, 1)
+        _show_main(self.ctx)  # パネルなし (メインの窓を出すだけ) では出ない
+        self.assertEqual(self.window.fullscreen_calls, [False])
+
+    def test_space_toggles_and_hidden_band_takes_no_focus(self):
+        from cliamp_music.miniplayer import MiniPlayer
+
+        mini = MiniPlayer(self.ctx)
+        mini.set_mode("square")
+        mini.present()
+        self.windows.append(mini)
+        self.assertTrue(run_loop(lambda: mini.get_mapped(), 5.0))
+        run_loop(lambda: False, 0.2)
+        focus = mini.get_focus()
+        for band in (mini._square_controls, mini._square_top, mini._square_close):
+            self.assertFalse(band.get_can_focus())
+            self.assertFalse(focus is not None and (focus is band or focus.is_ancestor(band)),
+                             "見えない操作の帯にフォーカスがあります")
+        keys = _capture_keys(mini)
+        self.assertIsNotNone(keys, "ミニプレーヤーに Space の処理がありません")
+        before = len(self.fake.requests_for("toggle"))
+        mode = mini.mode
+        for _ in range(2):
+            self.assertTrue(keys.emit("key-pressed", Gdk.KEY_space, 0, Gdk.ModifierType(0)))
+        self.assertTrue(run_loop(lambda: len(self.fake.requests_for("toggle")) == before + 2, 3.0))
+        self.assertFalse(mini.square_more.get_active())
+        self.assertEqual(mini.mode, mode)
+        mini.set_hover(True, force=True)
+        self.assertTrue(mini._square_controls.get_can_focus())
+        mini.set_hover(False)
+        self.assertFalse(mini._square_controls.get_can_focus())
+
+
+def _capture_keys(window):
+    controllers = window.observe_controllers()
+    for i in range(controllers.get_n_items()):
+        controller = controllers.get_item(i)
+        if isinstance(controller, Gtk.EventControllerKey) and \
+                controller.get_propagation_phase() == Gtk.PropagationPhase.CAPTURE:
+            return controller
+    return None
 
 
 if __name__ == "__main__":

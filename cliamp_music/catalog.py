@@ -2,8 +2,10 @@
 history / ローカルのプレイリスト編集) の窓口。
 
 結果は短い間だけ覚えておく (検索は同じ語で 10 分、プレイリスト一覧は 5 分)。
+期限の切れたものは足すたびに (まとめて) 捨て、検索は新しい 200 件だけを覚える。
 同じ要求が重なったときは 1 回だけ送り、待っている全員に同じ結果を渡す。
-失敗は Response (kind 付き) をそのまま callback に渡す。
+失敗は Response (kind 付き) をそのまま callback に渡す。検索の打ち直しで送らずに
+捨てられた古い検索 (kind "cancelled") も同じく渡す。
 
 callback は常に main loop で、呼び出しから戻った後に呼ばれる (キャッシュに
 あっても同期では呼ばない)。
@@ -42,6 +44,11 @@ LOCAL_TRACKS_TTL = 60.0  # TUI 側でも書き換えられるので短め
 SEARCH_TTL = 600.0
 LYRICS_TTL = 1800.0
 LYRICS_MISS_TTL = 600.0
+# 覚えておく数の上限 (種類ごと)。期限より先にこれを超えたら古いものから捨てる
+CACHE_CAPS = {"search": 200, "lyrics": 300, "tracks": 100}
+# 期限切れをまとめて捨てる目安 (件数と間隔)
+SWEEP_ENTRIES = 256
+SWEEP_SECONDS = 60.0
 
 
 def _call(callback: Callable[[Any], object], value: Any) -> bool:
@@ -65,6 +72,8 @@ class Catalog:
         self.client = client
         self._cache: dict[tuple, tuple[float, Any]] = {}
         self._waiting: dict[tuple, list[Callable]] = {}
+        self._lane_latest: dict[str, tuple] = {}
+        self._swept = 0.0
 
     # --- 共通 -------------------------------------------------------------------
 
@@ -72,15 +81,31 @@ class Catalog:
         if callback is not None:
             GLib.idle_add(_call, callback, _copy(value))
 
+    def _store(self, key: tuple, ttl: float, value: Any) -> None:
+        """結果を覚える。期限切れをまとめて捨て、種類ごとの上限を超えたら古いものから捨てる。"""
+        now = time.monotonic()
+        self._cache.pop(key, None)  # 入れ直して並びを新しい順の末尾にする
+        self._cache[key] = (now + ttl, value)
+        if len(self._cache) > SWEEP_ENTRIES or now - self._swept > SWEEP_SECONDS:
+            self._swept = now
+            self._cache = {k: v for k, v in self._cache.items() if v[0] > now}
+        cap = CACHE_CAPS.get(key[0])
+        if cap is not None:
+            same = [k for k in self._cache if k[0] == key[0]]
+            for old in same[: max(0, len(same) - cap)]:
+                del self._cache[old]
+
     def _fetch(self, key: tuple, ttl: float, cmd: str, parse: Callable[[dict], Any],
                callback: Callable, *, force: bool = False, miss: Callable[[Response], tuple[Any, float] | None] | None = None,
-               **fields) -> None:
+               lane: str | None = None, **fields) -> None:
         now = time.monotonic()
         if not force:
             hit = self._cache.get(key)
             if hit is not None and hit[0] > now:
                 self._later(callback, hit[1])
                 return
+        if lane:
+            self._lane_latest[lane] = key
         waiters = self._waiting.get(key)
         if waiters is not None:
             waiters.append(callback)
@@ -88,22 +113,27 @@ class Catalog:
         self._waiting[key] = [callback]
 
         def done(response: Response) -> None:
+            if response.kind == "cancelled" and lane and self._lane_latest.get(lane) == key:
+                # 打ち直しで捨てられた検索に、また同じ語で頼まれていた (「abc」→「abcd」→「abc」)。
+                # 待っている人がいるので送り直す
+                self.client.request(cmd, done, lane=lane, **fields)
+                return
             callbacks = self._waiting.pop(key, [])
             if response.ok:
                 value = parse(response.data)
                 if ttl > 0:
-                    self._cache[key] = (time.monotonic() + ttl, value)
+                    self._store(key, ttl, value)
             else:
                 value = response
                 substitute = miss(response) if miss is not None else None
                 if substitute is not None:
                     value, miss_ttl = substitute
                     if miss_ttl > 0:
-                        self._cache[key] = (time.monotonic() + miss_ttl, value)
+                        self._store(key, miss_ttl, value)
             for cb in callbacks:
                 _call(cb, _copy(value))
 
-        self.client.request(cmd, done, **fields)
+        self.client.request(cmd, done, lane=lane, **fields)
 
     def invalidate(self, provider: str | None = None) -> None:
         """覚えている結果を捨てる (Ctrl+R など)。provider を指定すればそのプロバイダーの分だけ。"""
@@ -143,14 +173,16 @@ class Catalog:
                     provider=provider, id=id)
 
     def search(self, provider: str, query: str, callback: Callable[[list[Track] | Response], object],
-               limit: int = 25, *, force: bool = False) -> None:
+               limit: int = 25, *, force: bool = False, lane: str | None = None) -> None:
+        """lane を渡すと、同じ lane の後の検索が来た時点でまだ送っていないこの検索は送らずに
+        捨てる (Response kind "cancelled"。打ちながらの検索で古い語が worker を塞がないように)。"""
         query = (query or "").strip()
         if not query:
             self._later(callback, [])
             return
         limit = max(1, min(50, int(limit)))
         key = ("search", provider, fold_text(query), limit)
-        self._fetch(key, SEARCH_TTL, "search", parse_tracks, callback, force=force,
+        self._fetch(key, SEARCH_TTL, "search", parse_tracks, callback, force=force, lane=lane,
                     provider=provider, query=query, limit=limit)
 
     def lyrics(self, artist: str, title: str, callback: Callable[[Lyrics | None], object]) -> None:
@@ -200,8 +232,11 @@ class Catalog:
         self._edit("playlist_delete", name, callback)
 
     def playlist_remove_track(self, name: str, index: int,
-                              callback: Callable[[Response], object] | None = None) -> None:
-        self._edit("playlist_remove_track", name, callback, index=int(index))
+                              callback: Callable[[Response], object] | None = None,
+                              path: str | None = None) -> None:
+        """index の曲を外す。path (その位置で見ていた曲) を付けると、パッチ済みの cliamp は
+        違う曲なら "stale" で断る。最後の曲を外すとプレイリストのファイルごと消える。"""
+        self._edit("playlist_remove_track", name, callback, index=int(index), path=path or None)
 
     # --- ライブラリの検索 ---------------------------------------------------------------
 

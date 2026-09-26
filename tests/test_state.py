@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -19,6 +20,7 @@ from cliamp_music.state import GuiState  # noqa: E402
 class GuiStateTest(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.mkdtemp(prefix="cm-state-")
+        self.addCleanup(shutil.rmtree, self.dir, True)
         self.path = os.path.join(self.dir, "sub", "state.json")
 
     def write(self, text: str) -> None:

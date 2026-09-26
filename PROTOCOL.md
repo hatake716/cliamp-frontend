@@ -7,6 +7,10 @@ GUI が必要とするコマンドを **足す** パッチの仕様。パッチ�
 `next`/`prev`/`shuffle`/`repeat` を使っているため)。
 
 - 1 行 1 要求、1 行 1 応答。1 本の接続で複数の要求を順に送ってよい。
+- cliamp が終わるとき (TUI の `q`、daemon の SIGTERM など) は、開いている
+  接続をサーバー側から閉じる。受け手はいつでも EOF や EPIPE を受けうるものと
+  して扱い、繋ぎ直すこと (閉じないと、接続を保って status を送り続ける GUI が
+  いる限り cliamp が終われなかった)。
 - 応答は必ず `{"ok": true|false, ...}`。失敗時は `error` に理由。
 - `omitempty` のため、数値の 0・空文字・false は **省かれる**。受け手は
   欠けた数値を 0、欠けた真偽を false として読むこと (既存の `index`、
@@ -41,11 +45,34 @@ GUI が必要とするコマンドを **足す** パッチの仕様。パッチ�
 | `meta` | {string: string} | ProviderMeta (例 `spotify.id`、`navidrome.id`) |
 | `queued` | int | `playlist` の応答だけ。「次に再生」の待ち行列での 1 始まりの位置 |
 | `played_at` | string (RFC3339) | `history` の応答だけ |
+| `path_raw` | string (base64) | Path が UTF-8 でないときだけ付く、Path の元のバイト列 |
+
+`path` は常に正しい UTF-8 (表示用)。ファイル名が UTF-8 でない (Windows の zip
+から出した Shift_JIS の名前など) と JSON では U+FFFD に置き換わって元に戻せない
+ので、そのときだけ元のバイト列を `path_raw` に base64 (標準、パディング付き) で
+入れる。受け手は `path_raw` もそのまま送り返すこと (`path_raw` があれば cliamp は
+`path` ではなくそちらを使う。壊れた `path_raw` の曲は受け付けない)。手元の
+ファイルを開くときも `path_raw` を戻したバイト列を使う。
 
 GUI から cliamp へ曲を渡すとき (`replace` / `enqueue` / `playlist_add`) も
-同じ形。受け取った TrackInfo をそのまま送り返せば元の Track に戻ること
-(`stream` / `live` / `meta` を含めて往復で失われない)。GUI が自分で作る曲
-(Radio Browser の局など) は `{"path": url, "title": 名前, "stream": true, "live": true}`。
+同じ形。`replace` / `enqueue` で送った TrackInfo は、`playlist` / `status` でそのまま
+戻る (`stream` / `live` / `meta` / `path_raw` を含めて往復で失われない)。GUI が自分で
+作る曲 (Radio Browser の局など) は `{"path": url, "title": 名前, "stream": true, "live": true}`。
+
+ただしファイルに書くもの (`playlist_add` のローカルのプレイリストの TOML、TUI が記録する
+`history` の history.toml) は往復で欠ける:
+
+- ローカルのプレイリストに残るのは path (UTF-8 でない名前もそのまま)・title・artist・album・
+  genre・year・track_number・duration・feed・bookmark だけ。`history` はさらに feed と
+  bookmark も持たない。
+- `live`・`meta`・`unplayable` は残らない。`stream` は持ち越さず、読み戻すときに path が
+  URL (http(s) か yt-dlp の検索式) かで決め直す。
+- そのため GUI はラジオの局 (live) を「プレイリストに追加」させない (読み戻すと局の絵も
+  「ライブ」の印も失う)。
+
+path の無い曲 (空白だけも) を送ると `replace: track N has no path` のように誤りになる
+(N は要求の中の添字)。`stream` の無い http(s) の URL で yt-dlp が再生しないもの (YouTube・
+SoundCloud・Bandcamp などでないもの) には cliamp が `stream: true` を立てる。
 
 ### SourceInfo
 
@@ -57,10 +84,13 @@ GUI が `replace` / `load_provider` で渡したもの。TUI 側でプロバイ�
 
 `{"key": "spotify", "name": "Spotify", "search": true, "playlists": true, "virtual": false}`
 
-- `search`: `search` コマンドが使えるか (`provider.Searcher` を実装しているか、
-  または下の yt-dlp 検索への退避が効くか)。
+- `search`: そのキーで `search` を呼んで、そのプロバイダーの検索になるか
+  (`provider.Searcher` を実装しているもの、`yt` / `youtube` / `ytmusic` / `soundcloud` の
+  キー、疑似プロバイダー `youtube`)。radio などは `search` を呼べば YouTube の検索へ退避する
+  (下) が、その局の検索ではないので false。
 - `playlists`: `playlists` / `tracks` が意味を持つか。
 - `virtual`: cliamp のプロバイダー一覧には無いが、IPC が用意する疑似プロバイダー。
+- ProviderInfo は omitempty を付けない (false の真偽も省かない)。local の名前は `Local`。
 
 疑似プロバイダー:
 
@@ -74,6 +104,11 @@ GUI が `replace` / `load_provider` で渡したもの。TUI 側でプロバイ�
 `search` を `provider.Searcher` でないプロバイダー (radio など) に対して
 呼んだ場合も、TUI の Ctrl+F と同じく yt-dlp の YouTube 検索へ退避する。
 `soundcloud` を指定して Searcher が登録されていなければ `scsearch<N>:` へ退避する。
+`provider` を省いたら `youtube`。`url` は検索できない (`provider url does not support search`)。
+yt-dlp の検索結果は `live` を持たない (24 時間の配信も、長さ 0 のふつうの曲として来る)。
+
+radio の `l:0` は組み込みの cliamp radio。`tracks` では中の M3U を 15 本ほどの配信に
+展開する (再生すると 15 局のリストになり、曲名は Lofi などの配信の名前)。
 
 ### PlaylistInfo
 
@@ -91,6 +126,7 @@ GUI が `replace` / `load_provider` で渡したもの。TUI 側でプロバイ�
 | フィールド | 型 | 用途 |
 |---|---|---|
 | `index` | int (ポインタ。0 が有効値) | `play_index` / `replace` / `queue_edit` / `remove` / `load_provider` / `playlist_remove_track` |
+| `path` (既存) | string | 省略可。`play_index` / `remove` / `queue_edit` (`add`/`remove`/`move`) / `playlist_remove_track` の確かめ用。下の「添字の確かめ」 |
 | `to` | int (ポインタ) | `queue_edit move` の移動先 |
 | `provider` | string | カタログ系 |
 | `id` | string | カタログ系 |
@@ -112,10 +148,10 @@ GUI が `replace` / `load_provider` で渡したもの。TUI 側でプロバイ�
 | `tracks` | [TrackInfo] | `playlist`, `tracks`, `search`, `history` |
 | `queue` | [int] | `playlist`, `queue_edit` (待ち行列の曲の、リスト上の添字を順に) |
 | `up_next` | [int] | `playlist` (再生順で現在の曲の後に来る曲の添字。待ち行列に入っている曲は除く。最大 200) |
-| `gen` | uint64 | `status`, `playlist`, `replace`, `remove` (リストが変わるたびに増える世代番号) |
+| `gen` | uint64 | `status`, `playlist`, `replace`, `remove`, `enqueue`, `queue_edit`, `load_provider` (リストが変わるたびに増える世代番号) |
 | `source` | SourceInfo | `status`, `playlist` |
 | `stream_title` | string | `status` (ICY の曲名。ラジオで曲名が変わる) |
-| `buffering` | bool (ポインタ) | `status` (yt-dlp などの読み込み待ち) |
+| `buffering` | bool (ポインタ) | `status` (yt-dlp・流れの曲の読み込み待ち、ポッドキャストのフィードの展開中) |
 | `providers` | [ProviderInfo] | `providers` |
 | `playlists` | [PlaylistInfo] | `playlists` |
 | `lyrics` | [LyricLine] | `lyrics` |
@@ -125,6 +161,28 @@ GUI が `replace` / `load_provider` で渡したもの。TUI 側でプロバイ�
 `status` の `track` は拡張した TrackInfo になる。`status` の `position` は、
 yt-dlp のシーク待ちの間はシーク先の値を返す (TUI のつまみと同じ)。
 
+`gen` について: 曲の追加・削除・並べ替え・差し替え、待ち行列 (「次へ」で待ち行列から
+取ったときを含む)、ブックマーク、シャッフル (混ぜ直しを含む)、リピートの変更で増える。
+再生が次の曲へ進んだだけでは増えない (`index` と `up_next` は変わる)。GUI は gen が
+手元の写しと同じなら曲の中身は同じとみなし、`playlist` を `limit: 1` で取って
+index / queue / up_next / source だけを入れ替える。
+
+読み込み中 (`buffering: true`) の `state` / `position` / `duration`:
+
+- 止まった状態から yt-dlp・流れの曲を始めたときは `state: "stopped"`。GUI は
+  stopped + buffering を「読み込み中」として扱う。
+- 鳴っている曲から next / prev / play_index で yt-dlp・流れの曲へ移るとき、TUI は前の曲を
+  止めずに裏で読み込む。その間 `track` と `index` は新しい曲だが、`state` は `"playing"`、
+  `position` と `duration` はまだ鳴っている前の曲のもの (Player が前の流れを読むため)。
+  GUI は「最後に読み込みの終わった曲から変わった buffering」と、自分の next / prev /
+  play_index の後の buffering を切り替え中とみなし、位置 0・長さは新しい曲の `duration` と
+  して見せ、シークさせない (この間の `seek_to` は前の曲に効いて失われる)。TUI が URL や
+  フィードを読むだけのときも buffering は立つが、そのときの曲は変わっていないので
+  切り替え中ではない。
+- HTTP の流れ (ポッドキャストの音声、長さの分かる URL の曲) の `seek_to` は、応答した後で
+  繋ぎ直す (`streamSeekAbsolute`)。繋ぎ直すまで `position` は前の位置のまま止まる。GUI は
+  応答の後も、届く位置がシーク先に着くまで (最大 3 秒) シーク先を見せる。
+
 ## コマンド
 
 ### 状態系 (TUI の Update / daemon の Send で処理。3 秒で応答)
@@ -132,42 +190,88 @@ yt-dlp のシーク待ちの間はシーク先の値を返す (TUI のつまみ�
 | コマンド | 要求 | 応答 | 動作 |
 |---|---|---|---|
 | `capabilities` | — | `api`, `commands`, `eq_presets` | 拡張の有無と版。サーバーだけで答える |
-| `seek_to` | `value` (秒) | `{ok}` | 絶対位置へシーク。TUI では `playback.SetPositionMsg` (非同期の `seekAbsolute`) を使い、Update を止めない |
-| `playlist` | `limit` (省略で全件) | `tracks`, `index`, `total`, `queue`, `up_next`, `gen`, `source` | いまのリストの写し |
-| `play_index` | `index` | `{ok}` | TUI の「行で Enter」と同じ (`SetIndex` → `playCurrentTrack`)。範囲外はエラー |
+| `seek_to` | `value` (秒) | `{ok}` | 絶対位置へシーク。TUI では `playback.SetPositionMsg` (非同期の `seekAbsolute`) を使い、Update を止めない。負の値は `seek_to requires a non-negative position` |
+| `playlist` | `limit` (省略で全件。先頭から) | `tracks`, `index`, `total`, `queue`, `up_next`, `gen`, `source` | いまのリストの写し。`up_next` はシャッフル中の回り込みを含めない: シャッフルとリピート (すべて) では今の一巡の残りだけで、尽きると cliamp は混ぜ直して続ける (GUI は「このあとシャッフルし直して続けて再生します」と書く)。待ち行列から鳴っている曲はリスト上の後ろの位置にあれば含む。再生できない曲は含めない |
+| `play_index` | `index`, `path` | `{ok}` | TUI の「行で Enter」と同じ (`SetIndex` → `playCurrentTrack`)。範囲外は `index out of range`。待ち行列からは外さず、リストの位置をその曲へ移す (待ち行列の曲に使うと、その曲がもう 1 度鳴り、間のリストの曲が飛ぶ。GUI は待ち行列の曲には `queue_edit remove` で前の曲を外してから `next` を送る) |
 | `replace` | `tracks`, `index` (既定 0), `source` | `total`, `gen` | リストを差し替え、`index` の曲から再生。シャッフル中は選んだ曲を先頭にして残りを混ぜる。`plMgrLoadAndPlay` と同じく Stop・ClearPreload を先に行う |
-| `enqueue` | `tracks`, `mode` = `next` (既定) / `end` / `now` | `total` | `next`: 末尾に足して待ち行列へ (TUI の `q`)。`end`: 末尾に足す (TUI の `a`)。`now`: 先頭の曲をすぐ再生し、残りは待ち行列へ (TUI の Enter と同じ `playTrackImmediate`) |
-| `queue_edit` | `mode` = `add` / `remove` / `clear` / `move`, `index`, `to` | `queue` | `add`/`remove`: リスト上の添字 `index` の曲を待ち行列へ入れる/外す。`move`: 待ち行列の位置 `index` を位置 `to` へ。`clear`: 空にする。変更後は先読み (gapless) をやり直す |
-| `remove` | `index` | `total`, `gen` | リストから 1 曲消す。再生中の曲は消せない (エラー) |
+| `enqueue` | `tracks`, `mode` = `next` (既定) / `end` / `now` | `total` | 曲はどれもリストの末尾に足す (既存の曲の添字は動かない)。再生順は下のとおり。`next`: いまの曲のすぐ後ろ (待ち行列より後) に、足した順に並べる。待ち行列は使わず、`queue` ではなく `up_next` に出る (待ち行列に入れると、待ち行列で 1 度、リストの順でもう 1 度鳴っていた)。ただし 1 曲リピート中は順送りで進まないので、従来どおり待ち行列に入れる (TUI の `q`)。止まっていればその曲から鳴らす。`end`: 末尾に足す (TUI の `a`)。止まっていれば先頭の曲から鳴らす。`now`: 先頭の曲をすぐ再生し、残りは足した順にそのすぐ後ろで鳴る (TUI の Enter と同じ `playTrackImmediate`)。シャッフル中の `now` と止まっているときの `end` は、足した曲を再生順でいまの曲のすぐ後ろへ置いてから鳴らすので、これから鳴るはずだった曲は飛ばされない。空のリストへの `next` は `end` と同じ。応答は `total` と `gen`。知らない mode は `enqueue: unknown mode "x"` |
+| `queue_edit` | `mode` = `add` / `remove` / `clear` / `move`, `index`, `to`, `path` | `queue`, `gen` | `add`/`remove`: リスト上の添字 `index` の曲を待ち行列へ入れる/外す (入っている曲の `add` は何もしない)。`move`: 待ち行列の位置 `index` を位置 `to` へ (`path` は位置 `index` の曲の path。同じ位置なら何もせず成功)。`clear`: 空にする。変更後は先読み (gapless) をやり直す |
+| `remove` | `index`, `path` | `total`, `gen` | リストから 1 曲消す。今の曲は再生中・一時停止中・読み込み中は消せない (`cannot remove the current track`)。止まっていれば消せ、今の曲は次の曲に移る。待ち行列の曲が鳴っている間に、その前に鳴ったリストの曲を消しても、次に鳴る曲は変わらない |
+
+`replace` / `play_index` / `enqueue` は、daemon でも再生の準備 (yt-dlp なら数秒) を
+待たずに答える。同じ接続の次の要求は、その変更のあとの状態を見る。
+読み込み中 (`buffering`) に別の曲を選んだり止めたりしたときは、あとの操作が
+勝つ (遅れて準備のできた前の曲や、前の曲のシークが鳴り出すことはない)。
+`feed: true` の曲 (ポッドキャストのフィード) は、鳴らすときにエピソードの一覧へ
+展開してリストごと置き換える。展開を待つ間は `status` の `buffering` が立ち、その間に
+別の曲を選ぶ (`replace`、`play_index`、止まっているときの `enqueue` など) と
+展開は取り消される。
+
+#### 添字の確かめ
+
+`play_index` / `remove` / `queue_edit` (`add`/`remove`/`move`) /
+`playlist_remove_track` は曲を添字で指すので、GUI の写しが古い (TUI や
+Open-Voice がリストを動かした、待ち行列の曲が鳴り始めて位置が詰まった) と
+別の曲を操作してしまう。要求に、その添字で見えていた曲の `path` (受け取った
+TrackInfo の `path` のまま) を付けると、cliamp はその曲か確かめ、違えば何も
+変えずに `{"ok": false, "error": "stale"}` を返す。受け手はリストを取り直して
+から選び直すこと (古い添字で送り直さない)。`path` を省けば確かめない (従来どおり)。
+パッチの古い cliamp は `path` を無視する。
 
 ### カタログ系 (IPC の接続ごとの goroutine で処理。Update を通らない。最大 120 秒)
 
 | コマンド | 要求 | 応答 |
 |---|---|---|
 | `providers` | — | `providers` |
-| `playlists` | `provider` | `playlists` / `needs_auth` |
+| `playlists` | `provider` | `playlists` / `needs_auth` (`radio` は TUI の局検索の状態に関わらず、検索していないときと同じ一覧 (`l:` 登録局、`f:` お気に入り、`c:` TUI が読み込んだ Radio Browser の局) を返す) |
 | `tracks` | `provider`, `id` | `tracks` / `needs_auth` |
-| `search` | `provider`, `query`, `limit` (既定 25、最大 50) | `tracks` |
-| `load_provider` | `provider`, `id`, `index`, `name` | `total` (`tracks` の結果で `replace` する。`source` は `{provider, id, name}`) |
+| `search` | `provider` (省略で `youtube`), `query`, `limit` (既定 25、最大 50) | `tracks` |
+| `load_provider` | `provider`, `id`, `index`, `name` | `total`, `gen` (`tracks` の結果で `replace` する。`source` は `{provider, id, name}`。`index` が範囲外なら何も替えずに `index out of range`)。プロバイダーに取り直させて添字で選ぶので、GUI は見えている並びがあるときは `replace` で送る (見た後でリストが変わっていても、見た曲を鳴らすため) |
 | `lyrics` | `artist`, `title` | `lyrics`, `synced` / `error: "not found"` |
 | `history` | `limit` (既定 50) | `tracks` (新しい順、`played_at` 付き) |
-| `playlist_add` | `name`, `tracks` | `{ok}` (ローカルのプレイリスト `~/.config/cliamp/playlists/<name>.toml` に追加。無ければ作る) |
-| `playlist_delete` | `name` | `{ok}` |
-| `playlist_remove_track` | `name`, `index` | `{ok}` |
+| `playlist_add` | `name`, `tracks` | `{ok}` (ローカルのプレイリスト `~/.config/cliamp/playlists/<name>.toml` に追加。無ければ作る。TOML に残る欄は上の「型」を参照) |
+| `playlist_delete` | `name` | `{ok}` (無ければ `remove …/<name>.toml: no such file or directory`) |
+| `playlist_remove_track` | `name`, `index`, `path` | `{ok}` (`path` は上の「添字の確かめ」)。**最後の曲を外すと、プレイリストのファイルごと消える** (external/local の RemoveTrack)。その後の `tracks` は `open …/<name>.toml: no such file or directory`、`playlists` にも出ない |
 
 ラジオの `.m3u` / `.pls` の中継 URL は、TUI と同じく `tracks` の中で実体の
 URL へ展開する。
+
+誤りの文言 (GUI はトーストにそのまま出す): 引数の欠け (`playlists requires a provider`、
+`tracks requires a provider and an id`、`lyrics requires an artist or a title`、
+`playlist_add requires a name`、`playlist_remove_track requires a name and an index` など)、
+`unknown provider: x`、`provider youtube has no playlists`、`invalid playlist name "a/b"`、
+`"Recently Played" is a virtual history playlist and cannot be modified`、
+`track index N out of range`。tests/test_conformance.py が偽と本物の両方で確かめる。
+
+### 既存の `device` (出力先)
+
+`device list` の `device` は改行区切りの PulseAudio / PipeWire の sink 名
+(`alsa_output.pci-….analog-stereo`、`bluez_output.…` など。`pactl list sinks` の Name)。
+先頭の `* ` は **既定の sink** の印で、cliamp の流れの行き先ではない (切り替えは
+`pactl move-sink-input` で流れを動かし、既定の sink は変えないため)。切り替えには sink 名を
+送る。一覧と切り替えには cliamp の PATH に `pactl` が要る (無いと
+`list devices: pactl: exec: "pactl": executable file not found in $PATH`。cliamp.nix が
+pulseaudio の pactl を足す)。GUI は説明の無い sink 名から見出しを作り (アナログ出力・
+HDMI / DisplayPort・Bluetooth など)、印は GUI で選んだ出力先を優先する。応答に説明付きの
+`devices` 配列 (`[{"name", "description", "active"}]`) があればその説明を使う
+(いまのパッチは返さない)。
 
 ### daemon (`--daemon`) での扱い
 
 状態系はすべて daemon でも同じ意味で動く。daemon に無い機能 (履歴の記録、
 Lua、可視化) に依存するものは `{ok:false, error:"not supported in daemon mode"}`
 を返す (待ち時間切れにしない)。カタログ系は daemon でも同じ実装を使う。
+daemon の `seek_to` もすぐ答え、シークしている間の `status` の `position` は
+シーク先を返す。続けて送った `seek_to` は最後のシーク先に落ち着く。
 
 ## GUI 側の約束
 
 - 状態の問い合わせ (`status`) は専用の接続で行い、カタログ系の長い要求と
   同じ接続に並べない (1 本の接続の要求は順番に処理されるため)。
+- cliamp は接続ごとの goroutine で要求を処理するので、別々の接続で続けて送った要求は
+  届く順が入れ替わる。GUI は状態を変える要求 (toggle / next / seek_to / queue_edit /
+  replace など) を 1 本の列で、前の応答を待ってから順に送る。読み取りとカタログ系は
+  別の列で並べて送る (遅い検索の後ろに一時停止を並ばせない)。
 - 既存の `seek` (相対) は yt-dlp の曲で TUI を数秒止めるので使わない。`seek_to` を使う。
 - 既存の `volume` は **絶対値** (dB、-30〜+6)。ヘルプの「adjust」は誤り。
 - TUI では `play` は停止中に何もしない。停止中の再生は `toggle` を送る。

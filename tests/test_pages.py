@@ -218,6 +218,32 @@ class HomePageTest(PageCase):
         self.assertEqual(len(items), before)
         self.assertTrue(all(getattr(c, "kept_marker", False) for c in items), "曲が変わっただけでカードを作り直しました")
 
+    def test_recent_shelf_keeps_scroll_and_cards(self):
+        """履歴の先頭が入れ替わっても (曲が変わるたび) 棚を先頭へ戻さず、カードを使い回す。"""
+        store = self.ctx.store
+        page = self.show(HomePage(self.ctx))
+        self.window.set_default_size(700, 700)  # 棚を横に送れる幅にする
+        self.wait(lambda: len(page.recent.items()) == len({t.path for t in store.history}))
+        for card in page.recent.items():
+            card.kept_marker = True
+        adj = page.recent._scroller.get_hadjustment()
+        self.wait(lambda: adj.get_upper() > adj.get_page_size() + 200)
+        adj.set_value(200)
+        # 新しい曲を履歴の先頭に足した (cliamp が記録した) ことにして知らせる
+        newest = Track(path="https://www.youtube.com/watch?v=newhistory1", title="いま聞いた曲", artist="誰か",
+                       played_at="2026-09-26T10:00:00Z")
+        store.history = [newest] + list(store.history)
+        store.emit("history-changed")
+        run_loop(lambda: False, 0.3)
+        items = page.recent.items()
+        self.assertEqual(items[0].subject.path, newest.path)
+        self.assertTrue(all(getattr(c, "kept_marker", False) for c in items[1:]), "カードを作り直しました")
+        self.assertGreater(adj.get_value(), 0.0, "棚が先頭へ戻りました")
+        # 押したときの添字は並びに合う
+        items[1].emit("clicked")
+        self.wait(lambda: self.requests("replace"))
+        self.assertEqual(self.requests("replace")[-1]["index"], 1)
+
     def test_radio_shelf_and_playlists_shelf(self):
         page = self.show(HomePage(self.ctx))
         self.wait(lambda: len(page.stations.items()) == 2 and len(page.playlists.items()) >= 2)
@@ -355,6 +381,73 @@ class NowPlayingTest(PageCase):
         self.assertEqual(page.header.info_label.get_text().split(" · ")[0], "3 曲")
 
 
+class NowPlayingEditTest(PageCase):
+    """リストを変えても行を作り直さない (スクロール位置・選択・フォーカスを失わない)。"""
+
+    def setUp(self):
+        super().setUp()
+        many = [Track(path=f"https://www.youtube.com/watch?v=many{i:07d}", title=f"曲 {i}", artist="A",
+                      duration=200) for i in range(200)]
+        send_once(self.sock, "replace", tracks=many, index=150, source={"provider": "youtube", "id": "q",
+                                                                        "name": "たくさん"})
+        store = self.ctx.store
+        self.assertTrue(run_loop(lambda: len(store.playlist.tracks) == 200, 5))
+
+    def rows_page(self):
+        page = self.show(NowPlayingListPage(self.ctx))
+        self.window.set_default_size(1100, 600)
+        self.wait(lambda: len(page.list.rows()) == 200 and page.rows.done)
+        adj = page.scroller.get_vadjustment()
+        self.wait(lambda: adj.get_upper() > 5000)
+        row = page.list.rows()[120]
+        ok, bounds = row.compute_bounds(page.body)
+        adj.set_value(bounds.get_y())
+        run_loop(lambda: False, 0.1)
+        return page, adj
+
+    def test_remove_and_append_keep_scroll_and_rows(self):
+        store = self.ctx.store
+        page, adj = self.rows_page()
+        before = adj.get_value()
+        rows = page.list.rows()
+        store.remove(190)
+        self.wait(lambda: len(page.list.rows()) == 199)
+        self.assertAlmostEqual(adj.get_value(), before, delta=2)
+        self.assertEqual([id(r) for r in page.list.rows()[:190]], [id(r) for r in rows[:190]])
+        extra = [Track(path=f"https://www.youtube.com/watch?v=added{i:07d}", title=f"足した {i}") for i in range(3)]
+        store.enqueue(extra, "end")
+        self.wait(lambda: len(page.list.rows()) == 202)
+        self.assertAlmostEqual(adj.get_value(), before, delta=2)
+        self.assertEqual([r.index for r in page.list.rows()], list(range(202)))
+        self.assertEqual(page.list.rows()[201].number, 202)
+
+    def test_queue_changes_do_not_touch_rows(self):
+        store = self.ctx.store
+        page, adj = self.rows_page()
+        before = adj.get_value()
+        for row in page.list.rows():
+            row.kept_marker = True
+        store.queue_edit("add", index=170)
+        self.wait(lambda: store.playlist.track_at(170) is not None and store.playlist.track_at(170).queued == 1)
+        run_loop(lambda: False, 0.2)
+        self.assertTrue(all(getattr(r, "kept_marker", False) for r in page.list.rows()))
+        self.assertAlmostEqual(adj.get_value(), before, delta=2)
+        self.assertEqual(page.list.rows()[170].track.queued, 1)  # 行の曲は新しいものに
+
+    def test_removing_from_the_row_menu_keeps_focus_nearby(self):
+        store = self.ctx.store
+        page, adj = self.rows_page()
+        before = adj.get_value()
+        target = page.list.rows()[125]
+        target.more.grab_focus()
+        store.remove(125)
+        self.wait(lambda: len(page.list.rows()) == 199)
+        focus = self.window.get_focus()
+        self.assertIsNotNone(focus)
+        self.assertIs(focus.get_ancestor(Gtk.ListBoxRow), page.list.rows()[124])
+        self.assertAlmostEqual(adj.get_value(), before, delta=60)
+
+
 class PlaylistsTest(PageCase):
     def test_grid_sections_and_navigation(self):
         page = self.show(PlaylistsPage(self.ctx))
@@ -375,10 +468,14 @@ class PlaylistsTest(PageCase):
         self.assertEqual(page.header.info_label.get_text().split(" · ")[0], "6 曲")
         self.assertEqual(page.list.rows()[0].menu_context, "local:Focus")
         page.list.emit("row-activated", page.list.rows()[3])
-        self.wait(lambda: self.requests("load_provider"))
-        request = self.requests("load_provider")[-1]
-        self.assertEqual((request["provider"], request["id"], request["index"], request["name"]),
-                         ("local", "Focus", 3, "Focus"))
+        # 見えている並びをそのまま送る (load_provider は取り直して添字で選ぶので、その間に
+        # 並びが変わると別の曲が鳴る)
+        self.wait(lambda: self.requests("replace"))
+        request = self.requests("replace")[-1]
+        self.assertEqual(request["index"], 3)
+        self.assertEqual(request["source"], {"provider": "local", "id": "Focus", "name": "Focus"})
+        self.assertEqual([t["path"] for t in request["tracks"]], [t.path for t in page.tracks])
+        self.assertEqual(self.requests("load_provider"), [])
         page.delete_playlist()
         self.wait(lambda: self.requests("playlist_delete"))
         self.assertEqual(self.requests("playlist_delete")[-1]["name"], "Focus")
@@ -415,6 +512,47 @@ class PlaylistsTest(PageCase):
         self.ctx._remove_from_playlist("ドライブ", 0)
         self.wait(lambda: len(page.list.rows()) == 6, message="曲を消しても作り直しません")
 
+    def test_detail_leaves_when_last_track_removed(self):
+        """最後の曲を外すと cliamp はプレイリストごと消す。ページを閉じ、一覧からも消す。"""
+        store = self.ctx.store
+        track = store.playlist.tracks[0]
+        done = []
+        self.ctx.catalog.playlist_add("一曲", [track], done.append)
+        self.wait(lambda: done)
+        self.ctx.refresh_local_playlists()
+        self.wait(lambda: "一曲" in self.ctx.local_playlists)
+        home = Adw.NavigationPage(title="すべてのプレイリスト", tag="playlists", child=Gtk.Label())
+        page = PlaylistDetailPage(self.ctx, provider="local", id="一曲", name="一曲")
+        self.nav.replace([home])
+        self.nav.push(page)
+        self.wait(lambda: page.get_mapped() and len(page.list.rows()) == 1)
+        _model, group = self.ctx.track_menu(page.tracks[0], index=0, context="local:一曲")
+        group.activate_action("remove-from-playlist", None)
+        self.wait(lambda: self.nav.get_visible_page() is home, message="消えたプレイリストのページが残っています")
+        self.assertNotIn("一曲", self.ctx.local_playlists)
+        self.assertNotIn("一曲", self.fake.local_playlists)
+        self.assertIn("「一曲」は空になったので削除しました", self.window_stub.toasts)
+        self.assertFalse(any("no such file" in t for t in self.window_stub.toasts))
+
+    def test_missing_local_playlist_is_explained_without_paths(self):
+        self.wait(lambda: self.ctx.local_playlists_loaded)
+        page = self.show(PlaylistDetailPage(self.ctx, provider="local", id="無いリスト", name="無いリスト"))
+        # 一覧が取れていれば、消えたプレイリストのページは閉じる (根なので「すべてのプレイリスト」へ)
+        self.wait(lambda: self.window_stub.pages and self.window_stub.pages[-1][0] == "playlists")
+        # 一覧がまだ取れていないときは、ファイルの場所ではなく分かる文を出す
+        self.ctx._local_playlists_loaded = False
+        page.load(force=True)
+        self.wait(lambda: page.state.empty.title_label.get_text() == "プレイリストが見つかりません")
+        self.assertNotIn(".toml", page.state.empty.description_label.get_text())
+
+    def test_detail_reloads_after_reconnect(self):
+        page = self.show(PlaylistDetailPage(self.ctx, provider="local", id="ドライブ", name="ドライブ"))
+        self.wait(lambda: len(page.list.rows()) == 7)
+        with self.fake.lock:
+            del self.fake.local_playlists["ドライブ"][0]
+        self.fake.restart()
+        self.wait(lambda: len(page.list.rows()) == 6, timeout=8, message="繋ぎ直しても読み直しません")
+
 
 class PlaylistsAuthTest(PageCase):
     fake_options = {"spotify_needs_auth": True}
@@ -432,6 +570,9 @@ class PlaylistsAuthTest(PageCase):
 
 
 class RadioAndRecentTest(PageCase):
+    # 利用者の radios.toml の局とお気に入りもある cliamp (l:0〜l:3、f:0)
+    fake_options = {"radios_toml": True}
+
     def test_radio_tiles(self):
         page = self.show(RadioPage(self.ctx))
         self.wait(lambda: len(page.cliamp_shelf.items()) == 5 and len(page.japan_shelf.items()) == 2)

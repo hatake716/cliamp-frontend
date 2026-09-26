@@ -36,7 +36,10 @@
             ];
             FONTCONFIG_FILE = pkgs.makeFontsConf { fontDirectories = [ pkgs.dejavu_fonts ]; };
           } ''
-          cp -r ${self}/cliamp_music ${self}/tests .
+          # パッケージと同じく掃除した源 (app.src: cliamp_music・data・tests だけ、__pycache__ なし)
+          # から写す。flake 全体 (self) を使うと path: の flake では .git や撮影の出力まで源になり、
+          # コミットや撮影のたびにこの試験が作り直しになる
+          cp -r ${app.src}/cliamp_music ${app.src}/tests .
           chmod -R u+w .
           export HOME="$TMPDIR/home" XDG_CACHE_HOME="$TMPDIR/cache" XDG_STATE_HOME="$TMPDIR/state"
           export XDG_RUNTIME_DIR="$TMPDIR/run"
@@ -44,7 +47,7 @@
           chmod 700 "$XDG_RUNTIME_DIR"
           export PYTHONDONTWRITEBYTECODE=1
           export XDG_DATA_DIRS="${pkgs.gsettings-desktop-schemas}/share/gsettings-schemas/${pkgs.gsettings-desktop-schemas.name}:${pkgs.gtk4}/share/gsettings-schemas/${pkgs.gtk4.name}:${pkgs.adwaita-icon-theme}/share:${pkgs.hicolor-icon-theme}/share"
-          export GDK_PIXBUF_MODULE_FILE="${pkgs.librsvg}/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache"
+          export GDK_PIXBUF_MODULE_FILE="${app.pixbufLoaders}" CLIAMP_MUSIC_REQUIRE_WEBP=1
           export GDK_BACKEND=x11 GSK_RENDERER=cairo GDK_DEBUG=no-portals
           export ADW_DISABLE_PORTAL=1 GTK_A11Y=none GIO_USE_VFS=local
           unset WAYLAND_DISPLAY
@@ -61,14 +64,15 @@
           cliamp-music = final.callPackage ./package.nix { };
         };
         # pkgs.cliamp に GUI 用の IPC 拡張 (patches/) を当てる。
+        # callPackage は使わない (final の cliamp を引いて自分自身を参照してしまう)。
         cliamp = _final: prev: {
-          cliamp = import ./cliamp.nix { inherit (prev) lib cliamp; };
+          cliamp = import ./cliamp.nix { inherit (prev) lib stdenv cliamp pulseaudio; };
         };
       };
 
       packages = forAllSystems (pkgs: rec {
         cliamp-music = pkgs.callPackage ./package.nix { };
-        cliamp = import ./cliamp.nix { inherit (pkgs) lib cliamp; };
+        cliamp = import ./cliamp.nix { inherit (pkgs) lib stdenv cliamp pulseaudio; };
         default = cliamp-music;
       });
 
@@ -81,7 +85,9 @@
 
       # 開発用。`nix develop path:.` で GTK/libadwaita の typelib と Python、
       # 試験用の Xvfb、cliamp を組み立てる Go の道具が揃う。
-      devShells = forAllSystems (pkgs: {
+      devShells = forAllSystems (pkgs:
+        let app = self.packages.${systemOf pkgs}.cliamp-music;
+        in {
         default = pkgs.mkShell {
           nativeBuildInputs = [
             pkgs.gobject-introspection
@@ -111,7 +117,8 @@
           ];
           shellHook = ''
             export XDG_DATA_DIRS="${pkgs.gsettings-desktop-schemas}/share/gsettings-schemas/${pkgs.gsettings-desktop-schemas.name}:${pkgs.gtk4}/share/gsettings-schemas/${pkgs.gtk4.name}:${pkgs.adwaita-icon-theme}/share:${pkgs.hicolor-icon-theme}/share''${XDG_DATA_DIRS:+:$XDG_DATA_DIRS}"
-            export GDK_PIXBUF_MODULE_FILE="${pkgs.librsvg}/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache"
+            # アプリ (package.nix) と同じ読み込み口の一覧 (svg・webp・jxl)
+            export GDK_PIXBUF_MODULE_FILE="${app.pixbufLoaders}"
           '';
         };
       });

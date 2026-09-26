@@ -41,6 +41,7 @@ __all__ = [
     "MediaCard", "TallCard", "CategoryTile", "StationTile",
     "TrackRow", "TrackList", "EmptyState", "LoadingState", "Chip",
     "format_count", "format_total_duration", "color_pair_for", "invoke",
+    "is_text_input", "inside_popover", "space_toggles", "install_space_toggle",
 ]
 
 
@@ -104,6 +105,59 @@ def invoke(callback, widget) -> None:
         callback(widget)
     else:
         callback()
+
+
+def is_text_input(widget: Gtk.Widget | None) -> bool:
+    """文字の入力欄 (か、その中) か。"""
+    while widget is not None:
+        if isinstance(widget, (Gtk.Editable, Gtk.Text, Gtk.TextView)):
+            return True
+        widget = widget.get_parent()
+    return False
+
+
+def inside_popover(widget: Gtk.Widget | None) -> bool:
+    """開いているメニュー (ポップオーバー) の中か。"""
+    while widget is not None:
+        if isinstance(widget, Gtk.Popover):
+            return True
+        widget = widget.get_parent()
+    return False
+
+
+def space_toggles(window: Gtk.Window, keyval: int, state) -> bool:
+    """Space を再生/一時停止にする (DESIGN.md §6、どの窓でも)。受け取ったら True。
+
+    文字の入力中と、開いているメニューの中では渡す (メニューの項目は Space で選ぶ)。
+    アプリのショートカットにはしない (入力欄より先に働き、検索欄の空白を奪うため)。"""
+    if keyval != Gdk.KEY_space or (state & Gtk.accelerator_get_default_mod_mask()):
+        return False
+    focus = window.get_focus()
+    if is_text_input(focus) or inside_popover(focus):
+        return False
+    ctx = getattr(window, "ctx", None)
+    store = getattr(ctx, "store", None)
+    if store is None:
+        return False
+    store.toggle()
+    return True
+
+
+def _on_space_key(controller, keyval, _keycode, state) -> bool:
+    window = controller.get_widget()
+    return isinstance(window, Gtk.Window) and space_toggles(window, keyval, state)
+
+
+def install_space_toggle(window: Gtk.Window) -> Gtk.EventControllerKey:
+    """窓に Space (再生/一時停止) を付ける (捕まえる段で。フォーカスのある部品より先)。
+
+    ミニプレーヤーとイコライザで使う (メインの窓は自分のキー処理から space_toggles を呼ぶ)。
+    窓 (self) を掴む閉包を渡さず、コントローラから窓を引く。"""
+    keys = Gtk.EventControllerKey()
+    keys.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+    keys.connect("key-pressed", _on_space_key)
+    window.add_controller(keys)
+    return keys
 
 
 def _weak(method):
@@ -1000,13 +1054,40 @@ class Shelf(Gtk.Box):
                 pager.set_margin_top(max(0, int(art / 2 - 26)))
         self._update_pagers()
 
-    def remove_all(self) -> None:
+    def remove_all(self, reset_scroll: bool = True) -> None:
+        """中身をすべて外す。reset_scroll=False なら横の送り位置を残す (データの取り直しで
+        作り直すとき。先頭へ戻すのは中身がまるごと替わったときだけ)。"""
         child = self._box.get_first_child()
         while child is not None:
             following = child.get_next_sibling()
             self._box.remove(child)
             child = following
-        self._scroller.get_hadjustment().set_value(0)
+        if reset_scroll:
+            self._scroller.get_hadjustment().set_value(0)
+        self._update_pagers()
+
+    def set_items(self, widgets) -> None:
+        """棚の中身を widgets の並びにする。今ある部品はそのまま使い回して並べ替え、
+        要らないものだけ外す (送り位置・フォーカス・読み込んだ絵を失わない)。"""
+        wanted = list(widgets)
+        keep = {id(w) for w in wanted}
+        for child in self.items():
+            if id(child) not in keep:
+                self._box.remove(child)
+        previous = None
+        for widget in wanted:
+            parent = widget.get_parent()
+            if parent is None:
+                self._box.insert_child_after(widget, previous)
+            elif parent is self._box:
+                self._box.reorder_child_after(widget, previous)
+            previous = widget
+        first = wanted[0] if wanted else None
+        art = getattr(first, "art_height", None) if first is not None else None
+        if art:
+            for pager in (self._prev, self._next):
+                pager.set_valign(Gtk.Align.START)
+                pager.set_margin_top(max(0, int(art / 2 - 26)))
         self._update_pagers()
 
     def items(self) -> list[Gtk.Widget]:

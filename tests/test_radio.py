@@ -120,6 +120,18 @@ class Browser(unittest.TestCase):
         self.assertTrue(run_loop(lambda: box))
         return box[0]
 
+    def test_cache_drops_expired_and_old_searches(self):
+        """覚えている結果は期限切れを捨て、局名の検索は新しい SEARCH_CACHE_MAX 件までにする。"""
+        for i in range(70):
+            self.browser._cache[f"https://x.example/old/{i}"] = (0.0, [])  # 期限切れ
+        with mock.patch.object(radio, "SEARCH_CACHE_MAX", 3), mock.patch.object(radio, "CACHE_SWEEP", 2):
+            for i in range(6):
+                self.call(self.browser.search, f"局 {i}")
+        self.assertFalse(any("/old/" in url for url in self.browser._cache))
+        searches = [url for url in self.browser._cache if "/stations/byname/" in url]
+        self.assertEqual(len(searches), 3)
+        self.assertTrue(any("5" in url for url in searches))  # 新しいものが残る
+
     def test_top(self):
         stations = self.call(self.browser.top)
         self.assertEqual(len(stations), 2)

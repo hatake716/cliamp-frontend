@@ -6,7 +6,6 @@ import io
 import json
 import os
 import sys
-import tempfile
 import unittest
 import urllib.error
 from pathlib import Path
@@ -16,7 +15,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 sys.path.insert(0, str(HERE))
 
-from fake_cliamp import isolate_display, run_loop  # noqa: E402
+from fake_cliamp import isolate_display, run_loop, temp_dir  # noqa: E402
 
 isolate_display()
 
@@ -156,7 +155,7 @@ class PureFunctions(unittest.TestCase):
 @unittest.skipUnless(HAVE_GTK, "GTK がありません")
 class Loader(unittest.TestCase):
     def setUp(self):
-        self.cache = tempfile.mkdtemp(prefix="cm-art-")
+        self.cache = temp_dir("cm-art-")
         self.served: dict[str, bytes] = {HQ: png(letterboxed())}
         self.fetched: list[str] = []
         self.agents: list[str] = []
@@ -268,7 +267,7 @@ class Loader(unittest.TestCase):
         self.assertEqual(self.fetched, [oembed, thumb])
 
     def test_file_url_and_folder_cover(self):
-        folder = tempfile.mkdtemp(prefix="cm-album-")
+        folder = temp_dir("cm-album-")
         Path(folder, "cover.png").write_bytes(png(solid(320, 240, BLUE)))
         track = Track(path=os.path.join(folder, "01 曲.flac"))
         texture = self.get(track, 64)
@@ -282,7 +281,7 @@ class Loader(unittest.TestCase):
             from mutagen.id3 import APIC, ID3
         except ImportError:
             self.skipTest("mutagen がありません")
-        folder = tempfile.mkdtemp(prefix="cm-tag-")
+        folder = temp_dir("cm-tag-")
         path = os.path.join(folder, "tagged.mp3")
         Path(path).write_bytes(b"")
         tags = ID3()
@@ -297,6 +296,230 @@ class Loader(unittest.TestCase):
         texture = self.get(YT, 64)
         self.assertEqual(texture.get_width(), 64)  # 代わりの絵
         self.assertEqual(self.cache_files(), [])
+
+
+# 24x16 の青い WebP (gdk-pixbuf の webp の読み込み口で作ったもの)。書き出しの口には頼らない
+WEBP_24x16 = ("UklGRkYAAABXRUJQVlA4IDoAAAAQAwCdASoYABAAPpE4l0eloyIhMAgAsBIJQBdl0AAQNgAA/u9RL/9CT/4JP/gk/"
+              "hM/oUbKJUxJmawA")
+
+
+def huge_png(width, height) -> bytes:
+    """大きな画素数を名乗る、小さな PNG (中身は 0 の行を zlib で詰めたもの)。"""
+    import struct
+    import zlib
+
+    def chunk(kind, data):
+        body = kind + data
+        return struct.pack(">I", len(data)) + body + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF)
+
+    raw = zlib.compressobj(9)
+    row = b"\x00" + b"\x00" * (width * 3)
+    parts = [raw.compress(row) for _ in range(height)]
+    parts.append(raw.flush())
+    header = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header) + chunk(b"IDAT", b"".join(parts)) + chunk(b"IEND", b"")
+
+
+@unittest.skipUnless(HAVE_GTK, "GTK がありません")
+class Decoding(unittest.TestCase):
+    """絵を読むときの大きさの上限 (巨大な favicon でメモリを食い尽くさない)。"""
+
+    def test_huge_svg_is_rendered_small(self):
+        import time
+
+        svg = (b'<svg xmlns="http://www.w3.org/2000/svg" width="20000" height="20000">'
+               b'<rect width="20000" height="20000" fill="#e02020"/></svg>')
+        if "svg" not in {f.get_name() for f in GdkPixbuf.Pixbuf.get_formats()}:
+            self.skipTest("SVG の読み込み口がありません")
+        started = time.monotonic()
+        pixbuf = artwork.decode_image(svg)
+        self.assertLessEqual(max(pixbuf.get_width(), pixbuf.get_height()), artwork.DECODE_FIT)
+        self.assertLess(time.monotonic() - started, 2.0)
+
+    def test_huge_png_is_refused_before_allocating(self):
+        import resource
+
+        data = huge_png(16000, 12000)
+        self.assertLess(len(data), 1 << 20)
+        before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        with self.assertRaises(ValueError) as caught:
+            artwork.decode_image(data)
+        self.assertIn("大きすぎ", str(caught.exception))
+        grown_mib = (resource.getrusage(resource.RUSAGE_SELF).ru_maxrss - before) / 1024
+        self.assertLess(grown_mib, 100)
+
+    def test_big_but_reasonable_images_are_scaled(self):
+        pixbuf = artwork.decode_image(png(solid(2000, 1500, BLUE)))
+        self.assertEqual((pixbuf.get_width(), pixbuf.get_height()), (1200, 900))  # 縦横比は保つ
+        small = artwork.decode_image(png(letterboxed(480, 360)))
+        self.assertEqual((small.get_width(), small.get_height()), (480, 360))
+        square = artwork.square_pixbuf(small, letterbox_candidate=True)
+        self.assertEqual(square.get_width(), 270)  # 黒帯の検出はそのまま
+
+    def test_webp_decodes(self):
+        import base64
+
+        if "webp" not in {f.get_name() for f in GdkPixbuf.Pixbuf.get_formats()}:
+            if os.environ.get("CLIAMP_MUSIC_REQUIRE_WEBP") == "1":
+                self.fail("gdk-pixbuf に WebP の読み込み口がありません (GDK_PIXBUF_MODULE_FILE)")
+            self.skipTest("WebP の読み込み口がありません")
+        pixbuf = artwork.decode_image(base64.b64decode(WEBP_24x16))
+        self.assertEqual((pixbuf.get_width(), pixbuf.get_height()), (24, 16))
+        r, g, b = pixel(artwork.texture_from_pixbuf(pixbuf), 12, 8)
+        self.assertGreater(b, 180)
+        self.assertLess(r, 90)
+
+
+@unittest.skipUnless(HAVE_GTK, "GTK がありません")
+class DiskCache(unittest.TestCase):
+    def setUp(self):
+        self.cache = temp_dir("cm-art-")
+        log = mock.patch.object(artwork, "log")
+        log.start()
+        self.addCleanup(log.stop)
+        self.loader = ArtworkLoader(self.cache)
+
+    def test_opaque_art_is_jpeg_and_transparent_art_is_png(self):
+        opaque = os.path.join(self.cache, "a.png")
+        self.loader._save(solid(300, 300, RED), opaque)
+        with open(opaque, "rb") as handle:
+            self.assertEqual(handle.read(2), b"\xff\xd8")  # JPEG
+        clear = GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB, True, 8, 64, 64)
+        clear.fill(0x2040E080)
+        alpha = os.path.join(self.cache, "b.png")
+        self.loader._save(clear, alpha)
+        with open(alpha, "rb") as handle:
+            self.assertEqual(handle.read(4), b"\x89PNG")
+        # どちらも同じ .png の名前で読み戻せる (中身で見分ける)
+        self.assertEqual(GdkPixbuf.Pixbuf.new_from_file(opaque).get_width(), 300)
+        self.assertTrue(GdkPixbuf.Pixbuf.new_from_file(alpha).get_has_alpha())
+
+    def test_prune_by_count_and_bytes(self):
+        big = b"x" * 4096
+        for i in range(40):
+            path = os.path.join(self.cache, f"{i:03d}.png")
+            Path(path).write_bytes(big)
+            os.utime(path, (1000 + i, 1000 + i))
+        with mock.patch.object(artwork, "DISK_MAX_BYTES", 100 * 1024):
+            self.loader._prune_disk()
+        left = sorted(os.listdir(self.cache))
+        self.assertLessEqual(len(left) * 4096, 75 * 1024)
+        self.assertEqual(left[-1], "039.png")  # 新しいものが残る
+        with mock.patch.object(artwork, "DISK_MAX_FILES", 8):
+            self.loader._prune_disk()
+        self.assertEqual(len(os.listdir(self.cache)), 6)
+
+    def test_prune_runs_again_after_many_saves(self):
+        queued = []
+        with mock.patch.object(artwork, "PRUNE_EVERY_SAVES", 3), \
+                mock.patch.object(self.loader._jobs, "put", queued.append):
+            for i in range(7):
+                self.loader._save(solid(8, 8, RED), os.path.join(self.cache, f"s{i}.png"))
+        self.assertEqual(queued.count(self.loader._prune_disk), 2)
+
+    def test_old_temp_files_are_removed(self):
+        stale = os.path.join(self.cache, ".art-old.png")
+        fresh = os.path.join(self.cache, ".art-new.png")
+        Path(stale).write_bytes(b"x")
+        Path(fresh).write_bytes(b"x")
+        os.utime(stale, (1000, 1000))
+        with mock.patch.object(artwork, "DISK_MAX_FILES", 0):
+            self.loader._prune_disk()
+        self.assertFalse(os.path.exists(stale))
+        self.assertTrue(os.path.exists(fresh))
+
+
+@unittest.skipUnless(HAVE_GTK, "GTK がありません")
+class Lanes(unittest.TestCase):
+    """手元の絵 (file://・ディスクのキャッシュ) は、応えないホストの取得を待たない。"""
+
+    def setUp(self):
+        import threading
+
+        self.cache = temp_dir("cm-art-")
+        self.release = threading.Event()
+        self.fetched = []
+
+        def stalled(request, timeout):
+            self.fetched.append(request.full_url)
+            self.release.wait(10)  # 応えないホスト
+            raise urllib.error.URLError("timed out")
+
+        log = mock.patch.object(artwork, "log")
+        log.start()
+        self.addCleanup(log.stop)
+        patcher = mock.patch.object(artwork, "urlopen", stalled)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(self._drain)  # 先に走る (待っている取得を終わらせてから戻す)
+        self.loader = ArtworkLoader(self.cache)
+
+    def _drain(self):
+        self.release.set()
+        run_loop(lambda: False, timeout=0.3)
+
+    def test_local_cover_and_disk_hit_do_not_wait_for_network(self):
+        import time
+
+        for i in range(6):
+            self.loader.request(f"https://dead{i}.example/favicon.png", 64, lambda t: None)
+        self.assertTrue(run_loop(lambda: len(self.fetched) >= 4, timeout=3))
+        folder = temp_dir("cm-album-")
+        Path(folder, "cover.png").write_bytes(png(solid(64, 64, BLUE)))
+        cached_url = "https://cached.example/art.jpg"
+        self.loader._save(solid(64, 64, RED), os.path.join(self.cache, artwork.cache_file_name(cached_url)))
+        got = []
+        started = time.monotonic()
+        self.loader.request(Path(folder, "cover.png").as_uri(), 32, got.append)
+        self.loader.request(cached_url, 32, got.append)
+        self.assertTrue(run_loop(lambda: len(got) == 2, timeout=2))
+        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertNotIn(cached_url, self.fetched)
+
+    def test_same_host_is_limited(self):
+        for i in range(5):
+            self.loader.request(f"https://one-host.example/{i}.png", 64, lambda t: None)
+        run_loop(lambda: False, timeout=0.5)
+        self.assertEqual(len(self.fetched), artwork.PER_HOST)
+
+
+class FetchDeadline(unittest.TestCase):
+    """全体の期限: 少しずつしか送らないサーバーでも FETCH_DEADLINE で打ち切る。"""
+
+    @unittest.skipUnless(HAVE_GTK, "GTK がありません")
+    def test_trickling_server_is_cut_off(self):
+        import socket
+        import threading
+        import time
+
+        server = socket.socket()
+        server.bind(("127.0.0.1", 0))
+        server.listen(1)
+        port = server.getsockname()[1]
+        stop = threading.Event()
+
+        def serve():
+            conn, _ = server.accept()
+            try:
+                conn.recv(4096)
+                for byte in b"HTTP/1.1 200 OK\r\n":
+                    if stop.wait(0.5):
+                        break
+                    conn.send(bytes([byte]))
+            except OSError:
+                pass
+            finally:
+                conn.close()
+
+        thread = threading.Thread(target=serve, daemon=True)
+        thread.start()
+        self.addCleanup(server.close)
+        self.addCleanup(stop.set)
+        with mock.patch.object(artwork, "FETCH_DEADLINE", 1.5), mock.patch.object(artwork, "TIMEOUT", 1.0):
+            started = time.monotonic()
+            with self.assertRaises(Exception):
+                artwork.fetch_bytes(f"http://127.0.0.1:{port}/slow.png", timeout=1.0)
+            self.assertLess(time.monotonic() - started, 4.0)
 
 
 if __name__ == "__main__":

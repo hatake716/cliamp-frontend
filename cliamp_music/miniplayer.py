@@ -10,7 +10,8 @@
 "miniplayer_mode" ("square" / "compact") に覚える。どちらの形も大きさは固定。
 
 窓は閉じても捨てずに隠し (hide-on-close)、present() で使い回す。隠れている間は
-store のシグナルを受けない。
+store のシグナルを受けない。Space はメインの窓と同じく再生/一時停止。正方形の操作の帯は
+隠れている間フォーカスも受けない (見えない「…」に Space や Tab が届かないように)。
 """
 
 from __future__ import annotations
@@ -39,7 +40,7 @@ from .fullscreen import (  # noqa: E402
     blurred_texture,
     time_texts,
 )
-from .widgets import CircleButton, GlassCapsule  # noqa: E402
+from .widgets import CircleButton, GlassCapsule, install_space_toggle  # noqa: E402
 
 __all__ = ["MiniPlayer", "MODES", "SIZES"]
 
@@ -135,11 +136,16 @@ class _MiniArt(CoverArt):
 
 
 def _show_main(ctx, panel: str | None = None) -> None:
-    """メインの窓を前に出す。panel ("lyrics" / "queue") があれば右パネルも開く。"""
+    """メインの窓を前に出す。panel ("lyrics" / "queue") があれば右パネルも開く。
+
+    パネルを開くときは、フルスクリーンプレーヤーからは出る (パネルはその下の画面にあるので、
+    出ないと何も変わらないように見える。ショートカットの app.show-lyrics と同じ)。"""
     window = ctx.window
     if window is None:
         return
     if panel:
+        if getattr(window, "fullscreen_shown", False) and hasattr(window, "show_fullscreen"):
+            window.show_fullscreen(False)
         for name in PANEL_OPENERS:
             opener = getattr(window, name, None)
             if callable(opener):
@@ -242,6 +248,7 @@ class MiniPlayer(Adw.Window):
 
         self.connect("map", self._on_map)
         self.connect("unmap", self._on_unmap)
+        install_space_toggle(self)
         self._apply_mode(self._mode)
         self._apply_reveal(0.0)
         self._sync_status()
@@ -455,9 +462,15 @@ class MiniPlayer(Adw.Window):
     def _apply_reveal(self, value: float) -> None:
         self._reveal = value
         self.square_art.set_band(value)
+        shown = value > 0.5
+        focus = self.get_focus()
         for widget in (self._square_controls, self._square_top, self._square_close):
             widget.set_opacity(value)
-            widget.set_can_target(value > 0.5)
+            widget.set_can_target(shown)
+            # 隠れている帯はフォーカスも受けない (見えない「…」に Space や Tab が届かないように)
+            widget.set_can_focus(shown)
+            if not shown and focus is not None and (focus is widget or focus.is_ancestor(widget)):
+                self.set_focus(None)
 
     def _on_enter(self, *_args) -> None:
         self._set_revealed(True)
@@ -477,6 +490,9 @@ class MiniPlayer(Adw.Window):
 
     def _on_menu_active(self, button: Gtk.MenuButton, _pspec) -> None:
         self._menus_open = max(0, self._menus_open + (1 if button.get_active() else -1))
+        if button.get_active() and self._mode == "square" and self._reveal < 0.5:
+            # メニューが見えない「…」から出ないよう、開いたら帯を出しておく
+            self._set_revealed(True, animate=False)
 
     # store から -----------------------------------------------------------------
 
@@ -547,7 +563,7 @@ class MiniPlayer(Adw.Window):
         self.square_transport.update(status)
         self.compact_transport.update(status)
         live = status.is_live
-        seekable = track is not None and not live and status.duration > 0 and store.supports("seek_to")
+        seekable = store.can_seek()
         for scrubber in (self.square_scrubber, self.compact_scrubber):
             scrubber.set_interactive(seekable)
         self.square_scrubber.set_visible(not live)

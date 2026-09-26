@@ -1,23 +1,31 @@
 """アートワークの取得・切り抜き・キャッシュ・代わりの絵。
 
 cliamp はアートワークを一切持たないので、曲の path などから GUI が自分で求める
-(art_sources)。取れた絵は正方形に切り抜き、最大 600px の PNG として
-~/.cache/cliamp-music/artwork/ に置く。取れなければ key の hash で色を決めた
-グラデーションに白い記号を描いた「代わりの絵」を返す。
+(art_sources)。取れた絵は正方形に切り抜き、最大 600px で ~/.cache/cliamp-music/artwork/
+に置く (透けない絵は JPEG、透ける絵は PNG。名前はどちらも <sha1>.png で、読むときは中身で
+見分ける)。キャッシュは件数と大きさ (DISK_MAX_BYTES) の両方で古いものから消す。
+取れなければ key の hash で色を決めたグラデーションに白い記号を描いた「代わりの絵」を返す。
 
 取得はスレッドで行い、callback は main loop で必ず 1 回呼ぶ (cancel したときを除く)。
+手元の絵 (埋め込み・file://・ディスクのキャッシュ) は手元の列、ネットワークは別の列で
+読むので、応えない favicon のホストがあっても手元の絵は待たない。ネットワークの取得は
+1 回の操作 4 秒、全体で FETCH_DEADLINE 秒で打ち切り、同じホストへは 2 本まで。
+絵を読むときは大きさを抑える (巨大な SVG や PNG の favicon でメモリを食い尽くさない)。
 切り抜きの計算と求め方は純粋な関数にして、GTK なしで試験する。
 """
 
 from __future__ import annotations
 
 import colorsys
+import functools
 import hashlib
+import http.client
 import json
 import math
 import os
 import queue
 import re
+import socket
 import sys
 import tempfile
 import threading
@@ -41,13 +49,26 @@ from . import VERSION, log  # noqa: E402
 from .protocol import Track, is_url, track_key  # noqa: E402
 
 MAX_CACHE_PX = 600
-TIMEOUT = 10.0
+TIMEOUT = 4.0  # 1 回の操作 (接続・読み取り) の待ち
+FETCH_DEADLINE = 12.0  # 1 枚の取得の全体の上限 (少しずつ送るサーバーでも)
 MAX_BYTES = 16 << 20
 MEMORY_ITEMS = 400
-WORKERS = 4
+WORKERS = 4  # ネットワークの列
+LOCAL_WORKERS = 2  # 手元の列 (埋め込み・file://・ディスクのキャッシュ)
+PER_HOST = 2  # 同じホストへ同時に取りに行く数
 FAIL_TTL = 600.0  # 絵が取れなかった曲は 10 分は取りに行かない
 MISSING_TTL = 3600.0  # 404 の URL は 1 時間は取りに行かない
 DISK_MAX_FILES = 4000
+DISK_MAX_BYTES = 256 << 20
+PRUNE_EVERY_SAVES = 200  # これだけ保存するたびにディスクのキャッシュを見直す
+PRUNE_EVERY_SECONDS = 3600.0
+JPEG_QUALITY = "88"
+# 絵を読むときの大きさの上限。これより大きい絵は読みながら縮める (SVG は描く大きさ、JPEG は
+# DCT で縮める)。縮められない形 (PNG など) は画素数が MAX_RASTER_PIXELS を超えたら読まない
+DECODE_FIT = 2 * MAX_CACHE_PX
+MAX_RASTER_PIXELS = 40_000_000
+# 覚えている失敗 (_failed / _missing) がこれを超えたら期限切れを捨てる
+FAILURE_SWEEP = 1024
 
 SPOTIFY_OEMBED = "https://open.spotify.com/oembed?url="
 FOLDER_COVERS = ("cover.jpg", "cover.png", "folder.jpg", "folder.png", "front.jpg", "Cover.jpg",
@@ -276,15 +297,127 @@ def _texture_from_pixels(pixels: tuple[int, int, int, bool, bytes]) -> Gdk.Textu
 # 取得 (スレッドで呼ぶ)
 
 
+class _Deadline:
+    """1 枚の取得の全体の期限。過ぎたら繋いだソケットを閉じる (応答の頭を 1 バイトずつ
+    送るようなサーバーで、1 回の操作の待ちだけでは終わらないため)。"""
+
+    def __init__(self, seconds: float):
+        self.expires = time.monotonic() + seconds
+        self._socks: list[socket.socket] = []
+        self._lock = threading.Lock()
+        self._fired = False
+        self._timer = threading.Timer(seconds, self._fire)
+        self._timer.daemon = True
+        self._timer.start()
+
+    @property
+    def expired(self) -> bool:
+        return self._fired or time.monotonic() > self.expires
+
+    def register(self, sock) -> None:
+        with self._lock:
+            if self._fired:
+                _close_socket(sock)
+            else:
+                self._socks.append(sock)
+
+    def _fire(self) -> None:
+        with self._lock:
+            self._fired = True
+            socks, self._socks = self._socks, []
+        for sock in socks:
+            _close_socket(sock)
+
+    def cancel(self) -> None:
+        self._timer.cancel()
+
+
+def _close_socket(sock) -> None:
+    try:
+        sock.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass
+    try:
+        sock.close()
+    except OSError:
+        pass
+
+
+class _HTTPConnection(http.client.HTTPConnection):
+    def __init__(self, *args, deadline: _Deadline, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._deadline = deadline
+
+    def connect(self) -> None:
+        super().connect()
+        self._deadline.register(self.sock)
+
+
+class _HTTPSConnection(http.client.HTTPSConnection):
+    def __init__(self, *args, deadline: _Deadline, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._deadline = deadline
+
+    def connect(self) -> None:
+        super().connect()
+        self._deadline.register(self.sock)
+
+
+class _HTTPHandler(urllib.request.HTTPHandler):
+    def __init__(self, deadline: _Deadline):
+        super().__init__()
+        self._deadline = deadline
+
+    def http_open(self, req):
+        return self.do_open(functools.partial(_HTTPConnection, deadline=self._deadline), req)
+
+
+class _HTTPSHandler(urllib.request.HTTPSHandler):
+    def __init__(self, deadline: _Deadline):
+        super().__init__()
+        self._deadline = deadline
+
+    def https_open(self, req):
+        return self.do_open(functools.partial(_HTTPSConnection, deadline=self._deadline), req,
+                            context=self._context)
+
+
 def urlopen(request, timeout):
-    """urllib.request.urlopen の薄い包み (試験で差し替える)。"""
-    return urllib.request.urlopen(request, timeout=timeout)
+    """urllib.request.urlopen の包み (試験で差し替える)。
+
+    全体の期限 (FETCH_DEADLINE) を過ぎたら接続を閉じる。応答には期限を付けて返し、
+    fetch_bytes が読み終えたら止める。"""
+    deadline = _Deadline(FETCH_DEADLINE)
+    opener = urllib.request.build_opener(_HTTPHandler(deadline), _HTTPSHandler(deadline))
+    try:
+        response = opener.open(request, timeout=timeout)
+    except BaseException:
+        deadline.cancel()
+        raise
+    response.cliamp_deadline = deadline
+    return response
 
 
 def fetch_bytes(url: str, timeout: float = TIMEOUT) -> bytes:
     request = urllib.request.Request(url, headers={"User-Agent": f"cliamp-music/{VERSION}"})
-    with urlopen(request, timeout) as response:
-        data = response.read(MAX_BYTES + 1)
+    response = urlopen(request, timeout)
+    deadline = getattr(response, "cliamp_deadline", None)
+    try:
+        with response:
+            chunks: list[bytes] = []
+            size = 0
+            while size <= MAX_BYTES:
+                if deadline is not None and deadline.expired:
+                    raise TimeoutError(f"時間内に取れませんでした: {url}")
+                chunk = response.read(min(1 << 16, MAX_BYTES + 1 - size))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                size += len(chunk)
+    finally:
+        if deadline is not None:
+            deadline.cancel()
+    data = b"".join(chunks)
     if len(data) > MAX_BYTES:
         raise ValueError(f"画像が大きすぎます: {url}")
     return data
@@ -345,8 +478,29 @@ def embedded_art(path: str) -> bytes | None:
     return candidates[0][1]
 
 
-def decode_image(data: bytes) -> GdkPixbuf.Pixbuf:
+def decode_image(data: bytes, fit: int = DECODE_FIT) -> GdkPixbuf.Pixbuf:
+    """絵を読む。大きな絵は読みながら fit 以下に縮める (縦横比は保つ)。
+
+    圧縮した大きさ (MAX_BYTES) だけでは画素数を抑えられない: 122 バイトの SVG が 20000x20000
+    を名乗れば 3 GiB を使う。SVG は描く大きさを、JPEG は DCT の縮小を size-prepared で決める。
+    縮めずに読む形 (PNG など) は、画素数が MAX_RASTER_PIXELS を超えたら読まずに誤りにする。"""
     loader = GdkPixbuf.PixbufLoader()
+    refused: list[tuple[int, int]] = []
+
+    def on_size(ldr, width: int, height: int) -> None:
+        if width <= 0 or height <= 0:
+            return
+        fmt = ldr.get_format()
+        scalable = bool(fmt is not None and fmt.is_scalable())
+        if not scalable and width * height > MAX_RASTER_PIXELS:
+            refused.append((width, height))
+            ldr.set_size(0, 0)  # 画素の場所を取る前に読み込みを失敗させる
+            return
+        if max(width, height) > fit:
+            scale = fit / max(width, height)
+            ldr.set_size(max(1, round(width * scale)), max(1, round(height * scale)))
+
+    loader.connect("size-prepared", on_size)
     try:
         loader.write(data)
         loader.close()
@@ -355,6 +509,9 @@ def decode_image(data: bytes) -> GdkPixbuf.Pixbuf:
             loader.close()
         except GLib.Error:
             pass
+        if refused:
+            width, height = refused[0]
+            raise ValueError(f"画像が大きすぎます ({width}x{height})") from None
         raise ValueError(f"画像を読めません: {exc.message}") from None
     pixbuf = loader.get_pixbuf()
     if pixbuf is None:
@@ -437,9 +594,18 @@ class ArtworkLoader:
         self._failed: dict[str, float] = {}
         self._missing: dict[str, float] = {}
         self._missing_lock = threading.Lock()
-        self._jobs: queue.LifoQueue = queue.LifoQueue()  # 最後に頼まれた (いま見えている) ものから
+        # 最後に頼まれた (いま見えている) ものから。手元の絵とネットワークは別の列
+        self._jobs: queue.LifoQueue = queue.LifoQueue()
+        self._net_jobs: queue.LifoQueue = queue.LifoQueue()
         self._threads: list[threading.Thread] = []
+        self._net_threads: list[threading.Thread] = []
+        self._hosts: dict[str, threading.Semaphore] = {}
+        self._hosts_lock = threading.Lock()
         self._pruned = False
+        self._prune_lock = threading.Lock()
+        self._save_lock = threading.Lock()
+        self._saves = 0
+        self._last_prune = time.monotonic()
 
     # --- 公開 -------------------------------------------------------------------
 
@@ -485,6 +651,7 @@ class ArtworkLoader:
         return texture
 
     def clear_memory(self) -> None:
+        """覚えている絵と失敗を捨てる (404 の URL は MISSING_TTL の間は覚えたまま)。"""
         self._memory.clear()
         self._failed.clear()
 
@@ -528,32 +695,59 @@ class ArtworkLoader:
             self._memory.popitem(last=False)
 
     def _enqueue(self, job: "_Job") -> None:
+        """手元の列に入れる。手元で取れない (キャッシュに無い URL) ものだけネットワークの列へ回す。"""
+
         def run() -> None:
             if all(handle.cancelled for handle, _ in list(job.waiters)):
                 GLib.idle_add(self._finish, job, None, True)
                 return
             pixels = None
             try:
-                pixels = self._load(job.sources, job.size)
+                pixels, network_from = self._load_local(job.sources, job.size)
             except Exception as exc:  # 1 枚の失敗で読み込み器を止めない
                 log(f"アートワークの読み込みで例外: {exc}")
+                network_from = None
+            if network_from is not None:
+                self._enqueue_network(job, network_from)
+                return
             GLib.idle_add(self._finish, job, pixels, False)
 
         self._jobs.put(run)
         if not self._pruned:
             self._pruned = True
+            self._last_prune = time.monotonic()
             self._jobs.put(self._prune_disk)
-        alive = [t for t in self._threads if t.is_alive()]
-        self._threads = alive
-        if len(alive) < WORKERS:
-            thread = threading.Thread(target=self._work, name="cliamp-artwork", daemon=True)
-            self._threads.append(thread)
-            thread.start()
+        self._threads = self._spawn(self._threads, LOCAL_WORKERS, self._jobs, "cliamp-artwork")
 
-    def _work(self) -> None:
+    def _enqueue_network(self, job: "_Job", start: int) -> None:
+        def run() -> None:
+            if all(handle.cancelled for handle, _ in list(job.waiters)):
+                GLib.idle_add(self._finish, job, None, True)
+                return
+            pixels = None
+            try:
+                pixels = self._load(job.sources[start:], job.size)
+            except Exception as exc:
+                log(f"アートワークの読み込みで例外: {exc}")
+            GLib.idle_add(self._finish, job, pixels, False)
+
+        self._net_jobs.put(run)
+        with self._hosts_lock:  # worker のスレッドからも呼ぶ
+            self._net_threads = self._spawn(self._net_threads, WORKERS, self._net_jobs, "cliamp-artwork-net")
+
+    def _spawn(self, threads: list[threading.Thread], limit: int, jobs: queue.Queue,
+               name: str) -> list[threading.Thread]:
+        alive = [t for t in threads if t.is_alive()]
+        if len(alive) < limit:
+            thread = threading.Thread(target=self._work, args=(jobs,), name=name, daemon=True)
+            alive.append(thread)
+            thread.start()
+        return alive
+
+    def _work(self, jobs: queue.Queue) -> None:
         while True:
             try:
-                run = self._jobs.get(timeout=30)
+                run = jobs.get(timeout=30)
             except queue.Empty:
                 return
             try:
@@ -573,7 +767,10 @@ class ArtworkLoader:
         if skipped:
             return GLib.SOURCE_REMOVE
         if pixels is None:
-            self._failed[job.key] = time.monotonic() + FAIL_TTL
+            now = time.monotonic()
+            self._failed[job.key] = now + FAIL_TTL
+            if len(self._failed) > FAILURE_SWEEP:
+                self._failed = {k: t for k, t in self._failed.items() if t > now}
             texture = self.placeholder(job.key, job.size, job.kind)
         else:
             texture = _texture_from_pixels(pixels)
@@ -582,15 +779,74 @@ class ArtworkLoader:
             _deliver(callback, texture)
         return GLib.SOURCE_REMOVE
 
+    @staticmethod
+    def _sized(pixbuf: GdkPixbuf.Pixbuf, size: int):
+        if pixbuf.get_width() > size:
+            pixbuf = pixbuf.scale_simple(size, size, GdkPixbuf.InterpType.HYPER)
+        return _pixels_of(pixbuf)
+
     def _load(self, sources: list[str], size: int):
         for source in sources:
             pixbuf = self._load_source(source)
             if pixbuf is None:
                 continue
-            if pixbuf.get_width() > size:
-                pixbuf = pixbuf.scale_simple(size, size, GdkPixbuf.InterpType.HYPER)
-            return _pixels_of(pixbuf)
+            return self._sized(pixbuf, size)
         return None
+
+    def _load_local(self, sources: list[str], size: int):
+        """手元だけで取れる絵を探す。(画素, None) か、ネットワークが要れば (None, その位置)。
+
+        出どころの順は守る: キャッシュに無い URL が手元の絵より前にあれば、その URL から先を
+        ネットワークの列で試す (meta の art は埋め込みの絵より優先)。"""
+        for i, source in enumerate(sources):
+            if source.startswith(("embedded:", "file://")):
+                pixbuf = self._load_source(source)
+            elif is_url(source):
+                pixbuf = self._read_cache(source)
+                if pixbuf is None:
+                    if self._is_missing(source):
+                        continue
+                    return None, i
+            else:
+                continue
+            if pixbuf is not None:
+                return self._sized(pixbuf, size), None
+        return None, None
+
+    def _read_cache(self, source: str) -> GdkPixbuf.Pixbuf | None:
+        """ディスクのキャッシュの絵 (無い・壊れていれば None)。中身で形を見分ける (PNG / JPEG)。"""
+        cache_path = os.path.join(self.cache_dir, cache_file_name(source))
+        if not os.path.exists(cache_path):
+            return None
+        try:
+            pixbuf = GdkPixbuf.Pixbuf.new_from_file(cache_path)
+        except GLib.Error:
+            try:
+                os.unlink(cache_path)
+            except OSError:
+                pass
+            return None
+        try:
+            os.utime(cache_path)  # 古いものから消すので、使ったら新しくする
+        except OSError:
+            pass
+        return pixbuf
+
+    def _host_slot(self, url: str) -> threading.Semaphore:
+        host = urlsplit(url).netloc.lower()
+        with self._hosts_lock:
+            slot = self._hosts.get(host)
+            if slot is None:
+                if len(self._hosts) > 256:
+                    self._hosts.clear()  # 古いホストは捨てる (使っている間のものは手元に残る)
+                slot = self._hosts[host] = threading.Semaphore(PER_HOST)
+            return slot
+
+    def _fetch(self, url: str) -> bytes:
+        """同じホストへは PER_HOST 本まで (favicon は同じホストに並ぶことが多い)。"""
+        slot = self._host_slot(url)
+        with slot:
+            return fetch_bytes(url)
 
     def _is_missing(self, source: str) -> bool:
         with self._missing_lock:
@@ -599,7 +855,10 @@ class ArtworkLoader:
 
     def _mark_missing(self, source: str, ttl: float) -> None:
         with self._missing_lock:
-            self._missing[source] = time.monotonic() + ttl
+            now = time.monotonic()
+            self._missing[source] = now + ttl
+            if len(self._missing) > FAILURE_SWEEP:
+                self._missing = {k: t for k, t in self._missing.items() if t > now}
 
     def _load_source(self, source: str) -> GdkPixbuf.Pixbuf | None:
         """1 つの出どころから正方形の絵 (最大 600px) を作る。取れなければ None。"""
@@ -619,31 +878,21 @@ class ArtworkLoader:
         if not is_url(source):
             return None
         cache_path = os.path.join(self.cache_dir, cache_file_name(source))
-        if os.path.exists(cache_path):
-            try:
-                pixbuf = GdkPixbuf.Pixbuf.new_from_file(cache_path)
-                try:
-                    os.utime(cache_path)  # 古いものから消すので、使ったら新しくする
-                except OSError:
-                    pass
-                return pixbuf
-            except GLib.Error:
-                try:
-                    os.unlink(cache_path)
-                except OSError:
-                    pass
+        cached = self._read_cache(source)
+        if cached is not None:
+            return cached
         if self._is_missing(source):
             return None
         try:
             if source.startswith(SPOTIFY_OEMBED):
-                info = json.loads(fetch_bytes(source).decode("utf-8"))
+                info = json.loads(self._fetch(source).decode("utf-8"))
                 thumbnail = info.get("thumbnail_url") if isinstance(info, dict) else None
                 if not isinstance(thumbnail, str) or not is_url(thumbnail):
                     self._mark_missing(source, MISSING_TTL)
                     return None
-                data = fetch_bytes(thumbnail)
+                data = self._fetch(thumbnail)
             else:
-                data = fetch_bytes(source)
+                data = self._fetch(source)
             pixbuf = square_pixbuf(decode_image(data), letterbox_candidate=is_youtube_thumb(source))
         except urllib.error.HTTPError as exc:
             self._mark_missing(source, MISSING_TTL if exc.code in (403, 404, 410) else FAIL_TTL)
@@ -656,12 +905,17 @@ class ArtworkLoader:
         return pixbuf
 
     def _save(self, pixbuf: GdkPixbuf.Pixbuf, path: str) -> None:
+        """キャッシュに置く。透けない絵は JPEG (写真の表紙は PNG の 7 分の 1 ほど)、透ける絵
+        (favicon など) は PNG。名前は同じ .png で、読むときは中身で見分ける。"""
         tmp = None
         try:
             os.makedirs(os.path.dirname(path), exist_ok=True)
             fd, tmp = tempfile.mkstemp(prefix=".art-", suffix=".png", dir=os.path.dirname(path))
             os.close(fd)
-            pixbuf.savev(tmp, "png", [], [])
+            if pixbuf.get_has_alpha():
+                pixbuf.savev(tmp, "png", [], [])
+            else:
+                pixbuf.savev(tmp, "jpeg", ["quality"], [JPEG_QUALITY])
             os.replace(tmp, path)
             tmp = None
         except (OSError, GLib.Error) as exc:
@@ -672,18 +926,57 @@ class ArtworkLoader:
                     os.unlink(tmp)
                 except OSError:
                     pass
+        with self._save_lock:
+            self._saves += 1
+            due = (self._saves % PRUNE_EVERY_SAVES == 0
+                   or time.monotonic() - self._last_prune > PRUNE_EVERY_SECONDS)
+            if due:
+                self._last_prune = time.monotonic()
+        if due:
+            self._jobs.put(self._prune_disk)  # 長く動かしているときも増え続けないよう、ときどき見直す
 
     def _prune_disk(self) -> None:
-        """ディスクのキャッシュが増えすぎたら古いものから消す。"""
+        """ディスクのキャッシュが増えすぎたら古いものから消す (件数と大きさの両方で)。"""
+        if not self._prune_lock.acquire(blocking=False):
+            return  # 別の worker が見直している
         try:
-            entries = [e for e in os.scandir(self.cache_dir) if e.name.endswith(".png") and e.is_file()]
+            self._prune_locked()
+        finally:
+            self._prune_lock.release()
+
+    def _prune_locked(self) -> None:
+        now = time.time()
+        entries: list[tuple[float, int, str]] = []
+        try:
+            scan = list(os.scandir(self.cache_dir))
         except OSError:
             return
-        if len(entries) <= DISK_MAX_FILES:
-            return
-        entries.sort(key=lambda e: e.stat().st_mtime)
-        for entry in entries[: len(entries) - DISK_MAX_FILES * 3 // 4]:
+        for entry in scan:
+            if not entry.name.endswith(".png"):
+                continue
             try:
-                os.unlink(entry.path)
+                info = entry.stat()
             except OSError:
-                pass
+                continue  # 書き終えて名前が替わった一時ファイルなど
+            if entry.name.startswith(".art-"):
+                if now - info.st_mtime > 3600:  # 書きかけのまま残った一時ファイル
+                    try:
+                        os.unlink(entry.path)
+                    except OSError:
+                        pass
+                continue
+            entries.append((info.st_mtime, info.st_size, entry.path))
+        total = sum(size for _mtime, size, _path in entries)
+        if len(entries) <= DISK_MAX_FILES and total <= DISK_MAX_BYTES:
+            return
+        entries.sort()
+        count = len(entries)
+        for _mtime, size, path in entries:
+            if count <= DISK_MAX_FILES * 3 // 4 and total <= DISK_MAX_BYTES * 3 // 4:
+                break
+            try:
+                os.unlink(path)
+            except OSError:
+                continue
+            count -= 1
+            total -= size

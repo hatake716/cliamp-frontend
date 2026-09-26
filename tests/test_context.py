@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import sys
-import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -12,7 +11,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 sys.path.insert(0, str(HERE))
 
-from fake_cliamp import FakeCliamp, isolate_display, run_loop, temp_socket_path  # noqa: E402
+from fake_cliamp import FakeCliamp, isolate_display, run_loop, temp_dir, temp_socket_path  # noqa: E402
 
 isolate_display()
 
@@ -93,7 +92,7 @@ class ContextTest(unittest.TestCase):
         self.fake = FakeCliamp(self.path, legacy=self.legacy).start()
         self.client = CliampClient(self.path)
         self.client.set_poll_interval(0.05)
-        tmp = tempfile.mkdtemp(prefix="cm-ctx-")
+        tmp = temp_dir("cm-ctx-")
         self.window = FakeWindow()
         self.ctx = AppContext(None, window=self.window, client=self.client,
                               artwork=ArtworkLoader(tmp + "/art"), radio=RadioBrowser(),
@@ -125,8 +124,8 @@ class Delegation(ContextTest):
         log.assert_called_once_with("窓なし")
 
     def test_parts_are_created(self):
-        ctx = AppContext(client=CliampClient(self.path + ".none"), state=GuiState(tempfile.mkdtemp() + "/s.json"),
-                         artwork=ArtworkLoader(tempfile.mkdtemp()))
+        ctx = AppContext(client=CliampClient(self.path + ".none"), state=GuiState(temp_dir("cm-ctx-") + "/s.json"),
+                         artwork=ArtworkLoader(temp_dir("cm-ctx-")))
         self.assertIs(ctx.store.client, ctx.client)
         self.assertIs(ctx.catalog.client, ctx.client)
         self.assertIsInstance(ctx.radio, RadioBrowser)
@@ -194,9 +193,17 @@ class Menu(ContextTest):
         self.activate(group, "copy-link")
         self.assertEqual(self.window.clipboard.text(), YT.path)
         self.assertIn("リンクをコピーしました", self.window.toasts)
+        # 「リストから削除」は見ていた曲の path も送る (違えば cliamp が断る)
         before = len(self.fake.pl)
         self.activate(group, "remove")
+        self.wait(lambda: any("削除できませんでした" in t for t in self.window.toasts))
+        self.assertEqual(len(self.fake.pl), before)
+        self.assertEqual(self.fake.requests_for("remove")[-1]["path"], YT.path)
+        shown = Track.from_wire(self.fake.pl.tracks[4])
+        _model, group = self.ctx.track_menu(shown, index=4, context="nowplaying")
+        self.activate(group, "remove")
         self.wait(lambda: len(self.fake.pl) == before - 1)
+        self.assertNotIn(shown.path, [t["path"] for t in self.fake.pl.tracks])
 
     def test_open_in_browser_uses_uri_launcher(self):
         launched = []
@@ -221,18 +228,71 @@ class Menu(ContextTest):
         self.assertNotIn("リストから削除", labels)
         self.assertFalse(group.has_action("copy-link"))
 
+    def focus_track(self, i):
+        return Track.from_wire(self.fake.local_playlists["Focus"][i])
+
     def test_local_playlist_context(self):
-        model, group = self.ctx.track_menu(LOCAL, index=0, context="local:Focus")
+        first = self.focus_track(0)
+        model, group = self.ctx.track_menu(first, index=0, context="local:Focus")
         self.assertIn("プレイリストから削除", [label for label, _, _ in menu_items(model)])
         before = len(self.fake.local_playlists["Focus"])
         self.activate(group, "remove-from-playlist")
         self.wait(lambda: len(self.fake.local_playlists["Focus"]) == before - 1)
         self.wait(lambda: "「Focus」から削除しました" in self.window.toasts)
+        self.assertNotIn(first.path, [t["path"] for t in self.fake.local_playlists["Focus"]])
+
+    def test_remove_uses_the_track_seen_not_a_stale_index(self):
+        """見た後で (TUI などで) 並びが変わっていても、見ていた曲を外す (添字の別の曲を消さない)。"""
+        second = self.focus_track(1)
+        _model, group = self.ctx.track_menu(second, index=1, context="local:Focus")
+        with self.fake.lock:
+            del self.fake.local_playlists["Focus"][0]  # TUI で先頭を消した (second は 0 番に)
+        others = [t["path"] for t in self.fake.local_playlists["Focus"][1:]]
+        self.activate(group, "remove-from-playlist")
+        self.wait(lambda: second.path not in [t["path"] for t in self.fake.local_playlists["Focus"]])
+        self.assertEqual([t["path"] for t in self.fake.local_playlists["Focus"]], others)
+        # 見ていた曲がもう無ければ消さずに知らせる
+        _model, group = self.ctx.track_menu(second, index=0, context="local:Focus")
+        before = [t["path"] for t in self.fake.local_playlists["Focus"]]
+        self.activate(group, "remove-from-playlist")
+        self.wait(lambda: any("削除しませんでした" in t for t in self.window.toasts))
+        self.assertEqual([t["path"] for t in self.fake.local_playlists["Focus"]], before)
+
+    def test_removing_last_track_forgets_the_playlist(self):
+        """cliamp は最後の曲を外したプレイリストをファイルごと消す。一覧・メニューからも消える。"""
+        self.wait(lambda: "Focus" in self.ctx.local_playlists)
+        track = YT
+        self.ctx.add_to_playlist("一曲だけ", [track])
+        self.wait(lambda: "一曲だけ" in self.ctx.local_playlists)
+        changed = []
+        self.ctx.connect("local-playlists-changed", lambda *_: changed.append(1))
+        stored = Track.from_wire(self.fake.local_playlists["一曲だけ"][0])
+        _model, group = self.ctx.track_menu(stored, index=0, context="local:一曲だけ")
+        self.activate(group, "remove-from-playlist")
+        self.wait(lambda: "一曲だけ" not in self.ctx.local_playlists)
+        self.assertNotIn("一曲だけ", self.fake.local_playlists)
+        self.assertTrue(changed)
+        self.wait(lambda: "「一曲だけ」は空になったので削除しました" in self.window.toasts)
+        model, _group = self.ctx.track_menu(YT)
+        labels = [label for label, _, _ in menu_items(model)]
+        self.assertNotIn("一曲だけ", labels)
+        self.assertIn("Focus", labels)
+
+    def test_live_station_cannot_be_added_to_a_playlist(self):
+        """ローカルのプレイリストは live と局の絵を持てないので、局は入れさせない。"""
+        station = Track(path="https://stream.example.net/jazz.mp3", title="Jazz FM", stream=True, live=True,
+                        meta={"art": "https://stream.example.net/favicon.webp"})
+        model, group = self.ctx.track_menu(station)
+        labels = [label for label, _, _ in menu_items(model)]
+        self.assertNotIn("プレイリストに追加", labels)
+        self.assertFalse(group.has_action("add-to-playlist"))
+        self.assertFalse(group.has_action("new-playlist"))
+        self.assertIn("次に再生", labels)
 
     def test_queue_context(self):
         self.ctx.store.queue_edit("add", index=6)
         self.wait(lambda: self.fake.pl.queue == [6])
-        model, group = self.ctx.track_menu(LOCAL, index=6, context="queue")
+        model, group = self.ctx.track_menu(Track.from_wire(self.fake.pl.tracks[6]), index=6, context="queue")
         self.assertIn("待ち行列から外す", [label for label, _, _ in menu_items(model)])
         self.activate(group, "dequeue")
         self.wait(lambda: self.fake.pl.queue == [])

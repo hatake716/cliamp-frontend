@@ -6,8 +6,8 @@
   それも無ければ ~/.config/cliamp/cliamp.sock)。
 - --page ID: 最初に開くページ (撮影・試験用。ページ ID は pages/__init__.py)。
 - --self-check: 窓を出さずに、全モジュールの読み込み・4 つの CSS の解析・
-  icons/ のすべての絵の読み込みを確かめ、標準エラーに "self-check: ok" か
-  "self-check: <理由>" を書く (画面が無くても動く)。
+  icons/ のすべての絵の読み込み・gdk-pixbuf の読み込み口 (png / jpeg / svg / webp) を
+  確かめ、標準エラーに "self-check: ok" か "self-check: <理由>" を書く (画面が無くても動く)。
 
 環境変数 (撮影・試験用): CLIAMP_MUSIC_APP_ID (アプリ ID を差し替える)、
 CLIAMP_MUSIC_NON_UNIQUE=1 (NON_UNIQUE にして既に動いているアプリと繋がない)、
@@ -21,8 +21,10 @@ CLIAMP_MUSIC_START_COMMAND (「cliamp を起動」で走らせるコマンド)�
   show-lyrics <Shift><Ctrl>L, fullscreen-player <Shift><Ctrl>F, miniplayer <Shift><Ctrl>M,
   equalizer <Ctrl><Alt>E, refresh <Ctrl>R, main-window <Ctrl>0, quit <Ctrl>Q,
   window.close <Ctrl>W
-Ctrl+矢印の 4 つは、文字の入力欄にフォーカスがある間は止めて入力欄に譲る
-(アプリのショートカットは入力欄より先に働くため)。
+Ctrl+矢印の 4 つと Ctrl+. (停止) は、前にある窓の文字の入力欄にフォーカスがある間は
+止めて入力欄に譲る (アプリのショートカットは入力欄より先に働くため。Ctrl+. は GtkText の
+絵文字の選択)。判断は「いま前にある (active な) 窓」のフォーカスで行う。
+Space はどの窓でも再生/一時停止 (widgets.space_toggles。入力中とメニューの中は除く)。
 """
 
 from __future__ import annotations
@@ -70,11 +72,28 @@ SHORTCUTS = (
     ("main-window", ["<Control>0"], "メインの窓"),
     ("quit", ["<Control>q"], "終了"),
 )
-# 文字の入力中は止めるもの (入力欄の Ctrl+矢印 = 単語単位の移動と重なる)
-TEXT_CONFLICTS = ("next", "previous", "seek-forward", "seek-backward")
+# 文字の入力中は止めるもの (入力欄の Ctrl+矢印 = 単語単位の移動、Ctrl+. = 絵文字の選択と重なる)
+TEXT_CONFLICTS = ("next", "previous", "seek-forward", "seek-backward", "stop")
 # cliamp に繋がっていないと意味の無いもの
 NEEDS_CONNECTION = ("play-pause", "next", "previous", "seek-forward", "seek-backward",
                     "volume-up", "volume-down", "stop")
+# 窓が隠れている (最小化・覆われている・別のワークスペース) とみなす状態。Wayland では
+# xdg-shell に最小化の状態が無く、mutter は見えない窓に SUSPENDED を送る。X11 は MINIMIZED
+HIDDEN_STATES = Gdk.ToplevelState.MINIMIZED | Gdk.ToplevelState.SUSPENDED
+
+
+def state_hidden(state: Gdk.ToplevelState) -> bool:
+    """窓の面の状態から、隠れているか。"""
+    return bool(state & HIDDEN_STATES)
+
+
+def text_input_focused(windows) -> bool:
+    """前にある (is_active な) 窓のフォーカスが文字の入力欄か。前にある窓が無ければ False
+    (アプリのショートカットは前にある窓でしか働かないので、止める理由も無い)。"""
+    from .widgets import is_text_input
+
+    active = next((w for w in windows if w.is_active()), None)
+    return active is not None and is_text_input(active.get_focus())
 
 
 # ---------------------------------------------------------------------------
@@ -179,6 +198,9 @@ class MusicApp(Adw.Application):
         window._music_watched = True
         window.connect("notify::visible", MusicApp._on_window_visibility, self)
         window.connect("realize", MusicApp._on_window_realized, self)
+        # 文字の入力中かは、前にある窓のフォーカスで決める (どの窓が前に来ても見直す)
+        window.connect("notify::is-active", MusicApp._on_window_focus_state, self)
+        window.connect("notify::focus-widget", MusicApp._on_window_focus_state, self)
         if window.get_realized():
             MusicApp._on_window_realized(window, self)
         self._update_poll_interval()
@@ -200,6 +222,10 @@ class MusicApp(Adw.Application):
         self._update_poll_interval()
 
     @staticmethod
+    def _on_window_focus_state(_window, _pspec, self: "MusicApp") -> None:
+        self.refresh_text_input()
+
+    @staticmethod
     def _on_window_visibility(_window, _pspec, self: "MusicApp") -> None:
         self._update_poll_interval()
         self._quit_if_nothing_visible()
@@ -209,7 +235,7 @@ class MusicApp(Adw.Application):
             return False
         surface = window.get_surface()
         if surface is not None and isinstance(surface, Gdk.Toplevel):
-            if surface.get_state() & Gdk.ToplevelState.MINIMIZED:
+            if state_hidden(surface.get_state()):
                 return False
         return True
 
@@ -285,11 +311,15 @@ class MusicApp(Adw.Application):
         self._update_actions()
 
     def set_text_input_active(self, active: bool) -> None:
-        """文字の入力中か (窓が知らせる)。入力中は Ctrl+矢印のアクションを止める。"""
+        """文字の入力中か。入力中は Ctrl+矢印と Ctrl+. のアクションを止める。"""
         active = bool(active)
         if active != self._text_input_active:
             self._text_input_active = active
             self._update_actions()
+
+    def refresh_text_input(self) -> None:
+        """前にある窓のフォーカスから、文字の入力中かを決め直す。"""
+        self.set_text_input_active(text_input_focused(self.get_windows()))
 
     def _update_actions(self) -> None:
         if self.ctx is None:
@@ -311,8 +341,7 @@ class MusicApp(Adw.Application):
             equalizer.set_enabled(connected and store.supports("eq"))
 
     def _seek(self, delta: float) -> None:
-        st = self.ctx.store.status
-        if st.track is None or st.is_live or st.duration <= 0:
+        if not self.ctx.store.can_seek():
             return
         self.ctx.store.seek_by(delta)
 
@@ -514,6 +543,11 @@ def self_check() -> int:
                 problems.append(f"アイコン {file} を読めません ({error})")
     if count == 0:
         problems.append(f"{icons_dir} にアイコンがありません")
+    # 4. 絵の読み込み口 (記号は SVG、Radio Browser の局の favicon には WebP のものがある)
+    formats = _pixbuf_formats()
+    for name in ("png", "jpeg", "svg", "webp"):
+        if name not in formats:
+            problems.append(f"gdk-pixbuf に {name} の読み込み口がありません (GDK_PIXBUF_MODULE_FILE を確かめる)")
     if problems:
         for problem in problems:
             print(f"self-check: {problem}", file=sys.stderr)
@@ -521,6 +555,16 @@ def self_check() -> int:
     print(f"self-check: ok ({len(names)} モジュール、CSS {len(loaded)} 個、アイコン {count} 個)",
           file=sys.stderr)
     return 0
+
+
+def _pixbuf_formats() -> set[str]:
+    try:
+        gi.require_version("GdkPixbuf", "2.0")
+        from gi.repository import GdkPixbuf
+
+        return {fmt.get_name() for fmt in GdkPixbuf.Pixbuf.get_formats()}
+    except Exception:
+        return set()
 
 
 def _load_image(path: str) -> str:

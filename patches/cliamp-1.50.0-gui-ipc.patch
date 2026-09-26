@@ -22,25 +22,62 @@ PROTOCOL.md。
 - 既存の eq で帯域を 1 つ変えたとき、TUI の EQ キーと同じくプリセットを
   Custom にする。前のプリセット名のまま保存されると、次の起動でそのプリセットが
   当て直され、手で変えた帯域が消えていた。
+- enqueue の next (「次に再生」) は待ち行列を使わず、再生順でいまの曲の
+  すぐ後ろに並べる (待ち行列とリストの順で 2 度鳴っていた)。1 曲リピート中
+  だけは従来どおり待ち行列に入れる。シャッフル中の now と止まっているときの
+  end は、足した曲をいまの曲のすぐ後ろへ置いてから鳴らす (手前に混ざった
+  まだ鳴っていない曲が飛ばされていた)。並べ方は TUI と daemon で共用する
+  (playlist/gui.go)。
+- 添字で曲を指す要求 (play_index, remove, queue_edit, playlist_remove_track) は
+  省略可の path で指す曲を確かめ、違えば "stale" で断る。path が UTF-8 で
+  ない曲は、JSON で壊れないよう元のバイト列を path_raw (base64) でも運ぶ。
+- サーバーは受け付けを始める前にカタログ・EQ プリセット・Lua を受け取り
+  (ipc.NewServerWith)、終わるときは開いている接続を閉じてから待つ。閉じないと、
+  status を送り続ける GUI がいる限り cliamp が終わらず、ソケットだけ消えて
+  次に起動した cliamp が IPC 無しで動いていた。daemon は 2 度目のシグナルで
+  そのまま終われるようにする。
+- replace, play_index, enqueue は Send を別の goroutine で呼び、答えが入った
+  時点で返す (daemon の Send は再生の準備が終わるまで戻らないため)。daemon の
+  seek_to もすぐ答え、シークは 1 本ずつ、最後のシーク先へ行う。
 
-上の eq の直し以外は、既存のコマンドと応答の形、`cliamp status` の平文の出力、CLI、TUI のキー操作は
+以下は上流にもある競合だが、GUI のクリックで日常的に起きるので直す。
+TUI のキー割り当ては変えない。
+
+- player: Play / PlayYTDL / Stop のたびに世代を進め、組み立て中に追い越された
+  古い開始は差し替えずに player.ErrSuperseded を返す。yt-dlp のシークは、
+  組み上がったときに曲が変わっていれば捨てる。読み込み中に別の曲を選ぶと、
+  遅れて準備のできた前の曲が鳴り、表示と音が食い違っていた。
+- ui/model: 再生の開始・gapless の先読み・フィードの展開の結果に出したときの
+  番号を持たせ、古いものは捨てる (ui/model/ipc_gui_stale.go)。先読みは、
+  次の曲が変わったあとに据わったものを取り直す。
+- playlist.Remove: 待ち行列の曲が鳴っている間に、その前に鳴ったリストの曲を
+  消すと、次の曲が飛ばされていた。
+- external/local: 書き込み (追加・削除・ブックマーク) を鍵で 1 本にし、追記は
+  1 回の write で、書き直しは一意な一時ファイルで行う。TUI と IPC の接続ごとの
+  goroutine が同じ Provider に書くと、曲の項目が混ざったり更新が失われたりしていた。
+- external/radio: IPC の playlists radio は TUI の局検索の状態に関わらず
+  登録局とお気に入りを返す (BrowsePlaylists)。
+
+上の直し以外は、既存のコマンドと応答の形、`cliamp status` の平文の出力、CLI、TUI のキー操作は
 変えない。Open-Voice が平文の status と tmux 越しのキー入力で cliamp を操作して
 いるため。同じ理由で、IPC の処理は TUI のオーバーレイを開かず、フォーカスも
 動かさない。
 
-変更は新しいファイル (ipc/gui.go, playlist/gui.go, ui/model/ipc_gui.go,
-catalog.go, daemon_gui.go と各試験) に寄せ、既存のファイルには型の
-フィールド、呼び出し、世代番号を増やす行など最小限だけを足している。
+変更は新しいファイル (ipc/gui.go, ipc/shutdown.go, playlist/gui.go,
+ui/model/ipc_gui.go, ui/model/ipc_gui_stale.go, player/supersede.go,
+external/local/gui.go, external/radio/gui.go, catalog.go, daemon_gui.go と
+各試験) に寄せ、既存のファイルには型のフィールド、呼び出し、世代番号を
+増やす行など最小限だけを足している。
 上流のファイルが変わって当たらなくなったらビルドが落ちる (cliamp.nix は
 版が 1.50.0 でなければ評価の時点で止める)。go.mod は変えず、新しく import
 するのは既に vendor にあるパッケージだけなので、vendorHash はそのまま使える。
 
 diff --git a/catalog.go b/catalog.go
 new file mode 100644
-index 0000000..43a5210
+index 0000000..4e34ade
 --- /dev/null
 +++ b/catalog.go
-@@ -0,0 +1,276 @@
+@@ -0,0 +1,299 @@
 +package main
 +
 +// catalog.go — GUI 向け拡張 IPC のカタログ系コマンド (ipc.Catalog) の実装。
@@ -64,6 +101,7 @@ index 0000000..43a5210
 +	"cliamp/external/local"
 +	"cliamp/history"
 +	"cliamp/ipc"
++	"cliamp/luaplugin"
 +	"cliamp/lyrics"
 +	"cliamp/playlist"
 +	"cliamp/provider"
@@ -108,12 +146,16 @@ index 0000000..43a5210
 +	}
 +}
 +
-+// installGUIIPC は IPC サーバーに GUI 拡張のカタログと EQ プリセット名を差し込む。
-+func installGUIIPC(srv *ipc.Server, catalog ipc.Catalog) {
-+	if catalog != nil {
-+		srv.SetCatalog(catalog)
++// guiIPCOptions は IPC サーバーに渡す GUI 拡張の設定 (Lua プラグイン、カタログ、
++// EQ プリセット名) を作る。受け付けを始める前に渡すため、ipc.NewServerWith で使う。
++// luaMgr が nil のときに型付きの nil を入れないよう、ここで振り分ける
++// (入れると plugins != nil になり、plugin.call が nil を呼んで落ちる)。
++func guiIPCOptions(luaMgr *luaplugin.Manager, catalog ipc.Catalog) ipc.Options {
++	opts := ipc.Options{Catalog: catalog, EQPresets: model.EQPresetNames()}
++	if luaMgr != nil {
++		opts.Plugins = luaMgr
 +	}
-+	srv.SetEQPresets(model.EQPresetNames())
++	return opts
 +}
 +
 +func (c *guiCatalog) find(key string) (playlist.Provider, bool) {
@@ -166,6 +208,13 @@ index 0000000..43a5210
 +	return out
 +}
 +
++// browseLister は TUI の画面の状態 (radio の局検索など) に左右されない一覧を
++// 返せるプロバイダー。IPC は TUI と同じインスタンスを使うので、Playlists が
++// TUI の検索結果に絞られていると GUI の一覧まで消える。
++type browseLister interface {
++	BrowsePlaylists() ([]playlist.PlaylistInfo, error)
++}
++
 +func (c *guiCatalog) Playlists(key string) ([]playlist.PlaylistInfo, error) {
 +	prov, ok := c.find(key)
 +	if !ok {
@@ -173,6 +222,9 @@ index 0000000..43a5210
 +			return nil, fmt.Errorf("provider %s has no playlists", key)
 +		}
 +		return nil, fmt.Errorf("unknown provider: %s", key)
++	}
++	if b, ok := prov.(browseLister); ok {
++		return b.BrowsePlaylists()
 +	}
 +	return prov.Playlists()
 +}
@@ -310,19 +362,212 @@ index 0000000..43a5210
 +	return lp.DeletePlaylist(name)
 +}
 +
-+func (c *guiCatalog) PlaylistRemoveTrack(name string, index int) error {
++// PlaylistRemoveTrack は index の曲を消す。path が空でなければ、ファイルを読んで
++// 確かめてから消すまでをプロバイダーの鍵の中で行い、違えば ipc.ErrStale を返す。
++func (c *guiCatalog) PlaylistRemoveTrack(name string, index int, path string) error {
 +	lp, err := c.localProvider()
 +	if err != nil {
 +		return err
 +	}
-+	return lp.RemoveTrack(name, index)
++	err = lp.RemoveTrackIf(name, index, func(t playlist.Track) bool {
++		return !ipc.PathMismatch(t.Path, path)
++	})
++	if errors.Is(err, local.ErrTrackMismatch) {
++		return ipc.ErrStale
++	}
++	return err
++}
+diff --git a/catalog_race_test.go b/catalog_race_test.go
+new file mode 100644
+index 0000000..253262f
+--- /dev/null
++++ b/catalog_race_test.go
+@@ -0,0 +1,179 @@
++package main
++
++// GUI 拡張 IPC のカタログ系が TUI と同じプロバイダーを共有することで起きる
++// 問題の試験 (radio の局検索、ローカルのプレイリストへの並行した書き込み)。
++
++import (
++	"fmt"
++	"os"
++	"path/filepath"
++	"strings"
++	"sync"
++	"testing"
++
++	"cliamp/external/local"
++	"cliamp/external/radio"
++	"cliamp/ipc"
++	"cliamp/playlist"
++	"cliamp/ui/model"
++)
++
++// TUI で局を検索している間 (検索を閉じ忘れても) も、IPC の playlists radio は
++// 登録局とお気に入りを返す (TUI と同じインスタンスなので、Playlists は検索結果に
++// 絞られている)。
++func TestCatalogRadioPlaylistsIgnoreTUISearch(t *testing.T) {
++	t.Setenv("HOME", t.TempDir())
++	rp := radio.New()
++	c, _ := newTestCatalog(model.ProviderEntry{Key: "radio", Name: "Radio", Provider: rp})
++
++	rp.SetSearchResults([]radio.CatalogStation{{Name: "Jazz FM", URL: "https://jazz.example"}})
++	lists, err := c.Playlists("radio")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(lists) == 0 || lists[0].ID != "l:0" {
++		t.Fatalf("playlists radio during a TUI search = %+v, want l:0 first", lists)
++	}
++	for _, l := range lists {
++		if strings.HasPrefix(l.ID, "s:") {
++			t.Fatalf("playlists radio returned the TUI's search result %+v", l)
++		}
++	}
++	if tracks, err := c.Tracks("radio", "l:0"); err != nil || len(tracks) != 1 {
++		t.Fatalf("tracks radio l:0 = %v, %v", tracks, err)
++	}
++}
++
++// ipcHome は短い一時 HOME (ソケットのパスは 108 バイトまで) にローカルの
++// プレイリストを置き、本物の IPC サーバーを立てる。
++func ipcHome(t *testing.T) (string, *guiCatalog) {
++	t.Helper()
++	home, err := os.MkdirTemp("", "cl")
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { os.RemoveAll(home) })
++	t.Setenv("HOME", home)
++	c, _ := newTestCatalog()
++	c.local = local.New()
++	sock := filepath.Join(home, "c.sock")
++	srv, err := ipc.NewServerWith(sock, ipc.DispatcherFunc(func(any) {}), guiIPCOptions(nil, c))
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { srv.Close() })
++	return sock, c
++}
++
++// GUI は要求ごとに別の接続 (最大 4 本) を使うので、playlist_add は並行して
++// 届きうる。曲の項目が混ざったり、曲が消えたりしない。
++func TestConcurrentPlaylistAddKeepsTracksIntact(t *testing.T) {
++	sock, c := ipcHome(t)
++	const writers, perWriter = 4, 40
++	var wg sync.WaitGroup
++	for w := range writers {
++		wg.Add(1)
++		go func() {
++			defer wg.Done()
++			for i := range perWriter {
++				id := fmt.Sprintf("w%d-%02d", w, i)
++				resp, err := ipc.Send(sock, ipc.Request{Cmd: "playlist_add", Name: "mix",
++					Tracks: []ipc.TrackInfo{{Path: "/music/" + id + ".flac", Title: id, Artist: "artist-" + id}}})
++				if err != nil || !resp.OK {
++					t.Errorf("playlist_add %s: %v %+v", id, err, resp)
++				}
++			}
++		}()
++	}
++	wg.Wait()
++	got, err := c.local.Tracks("mix")
++	if err != nil {
++		t.Fatal(err)
++	}
++	bad := 0
++	for _, tr := range got {
++		if tr.Path != "/music/"+tr.Title+".flac" || tr.Artist != "artist-"+tr.Title {
++			bad++
++		}
++	}
++	if len(got) != writers*perWriter || bad > 0 {
++		t.Fatalf("%d tracks on disk (want %d), %d with mixed-up fields", len(got), writers*perWriter, bad)
++	}
++}
++
++// 並行した playlist_remove_track は互いの書き込みを失わない。
++func TestConcurrentPlaylistRemoveKeepsEveryRemoval(t *testing.T) {
++	sock, c := ipcHome(t)
++	var tracks []playlist.Track
++	for i := range 40 {
++		tracks = append(tracks, playlist.Track{Path: fmt.Sprintf("/m/%02d.flac", i), Title: fmt.Sprint(i)})
++	}
++	if err := c.local.AddTracks("del", tracks); err != nil {
++		t.Fatal(err)
++	}
++	const removals = 20
++	var wg sync.WaitGroup
++	errs := make(chan string, removals)
++	for range removals {
++		wg.Add(1)
++		go func() {
++			defer wg.Done()
++			resp, err := ipc.Send(sock, ipc.Request{Cmd: "playlist_remove_track", Name: "del", Index: new(int)})
++			if err != nil || !resp.OK {
++				errs <- fmt.Sprint(err, resp.Error)
++			}
++		}()
++	}
++	wg.Wait()
++	close(errs)
++	var msgs []string
++	for e := range errs {
++		msgs = append(msgs, e)
++	}
++	got, _ := c.local.Tracks("del")
++	if len(got) != 40-removals || len(msgs) > 0 {
++		t.Fatalf("%d tracks left (want %d); errors: %s", len(got), 40-removals, strings.Join(msgs, "; "))
++	}
++	if got[0].Title != fmt.Sprint(removals) {
++		t.Fatalf("first remaining track = %q, want %d", got[0].Title, removals)
++	}
++	// 一時ファイルは残らない。
++	entries, _ := os.ReadDir(filepath.Join(os.Getenv("HOME"), ".config", "cliamp", "playlists"))
++	for _, e := range entries {
++		if strings.HasSuffix(e.Name(), ".tmp") {
++			t.Fatalf("temp file left behind: %s", e.Name())
++		}
++	}
++}
++
++// GUI の playlist_add と TUI のブックマーク (同じ local.Provider への
++// 読んで書き戻す処理) が重なっても、追加が消えない。
++func TestPlaylistAddRacingTUIBookmark(t *testing.T) {
++	sock, c := ipcHome(t)
++	for trial := range 30 {
++		name := fmt.Sprintf("b%d", trial)
++		if err := c.local.AddTracks(name, []playlist.Track{{Path: "/m/a.flac", Title: "a"}}); err != nil {
++			t.Fatal(err)
++		}
++		var wg sync.WaitGroup
++		wg.Add(2)
++		go func() {
++			defer wg.Done()
++			if resp, err := ipc.Send(sock, ipc.Request{Cmd: "playlist_add", Name: name,
++				Tracks: []ipc.TrackInfo{{Path: "/m/x.flac", Title: "x"}}}); err != nil || !resp.OK {
++				t.Errorf("playlist_add: %v %+v", err, resp)
++			}
++		}()
++		go func() {
++			defer wg.Done()
++			if err := c.local.SetBookmark(name, 0); err != nil {
++				t.Errorf("SetBookmark: %v", err)
++			}
++		}()
++		wg.Wait()
++		got, _ := c.local.Tracks(name)
++		if len(got) != 2 || !got[0].Bookmark || got[1].Title != "x" {
++			t.Fatalf("trial %d: %+v", trial, got)
++		}
++	}
 +}
 diff --git a/catalog_test.go b/catalog_test.go
 new file mode 100644
-index 0000000..3f68913
+index 0000000..027990d
 --- /dev/null
 +++ b/catalog_test.go
-@@ -0,0 +1,303 @@
+@@ -0,0 +1,314 @@
 +package main
 +
 +import (
@@ -578,13 +823,20 @@ index 0000000..3f68913
 +	if err != nil || len(got) != 3 || got[0].Title != "One" || got[0].DurationSecs != 61 {
 +		t.Fatalf("saved tracks = %+v, %v", got, err)
 +	}
-+	if err := c.PlaylistRemoveTrack("朝の曲", 1); err != nil {
++	// path を付けたときは、その曲でなければ何もせずに stale を返す。
++	if err := c.PlaylistRemoveTrack("朝の曲", 1, "https://www.youtube.com/watch?v=1"); !errors.Is(err, ipc.ErrStale) {
++		t.Fatalf("remove with a mismatching path = %v, want ipc.ErrStale", err)
++	}
++	if got, _ := c.local.Tracks("朝の曲"); len(got) != 3 {
++		t.Fatalf("stale remove changed the playlist: %+v", got)
++	}
++	if err := c.PlaylistRemoveTrack("朝の曲", 1, "/music/two.flac"); err != nil {
 +		t.Fatal(err)
 +	}
 +	if got, _ := c.local.Tracks("朝の曲"); len(got) != 2 || got[1].Title != "One" {
 +		t.Fatalf("after remove = %+v", got)
 +	}
-+	if err := c.PlaylistRemoveTrack("朝の曲", 5); err == nil {
++	if err := c.PlaylistRemoveTrack("朝の曲", 5, ""); err == nil {
 +		t.Fatal("out of range remove succeeded")
 +	}
 +	if err := c.PlaylistAdd("../escape", tracks); err == nil {
@@ -604,15 +856,19 @@ index 0000000..3f68913
 +	}
 +}
 +
-+func TestInstallGUIIPC(t *testing.T) {
++func TestGUIIPCOptions(t *testing.T) {
 +	sock := filepath.Join(t.TempDir(), "cliamp.sock")
-+	srv, err := ipc.NewServer(sock, ipc.DispatcherFunc(func(any) {}))
++	c, _ := newTestCatalog()
++	srv, err := ipc.NewServerWith(sock, ipc.DispatcherFunc(func(any) {}), guiIPCOptions(nil, c))
 +	if err != nil {
 +		t.Fatal(err)
 +	}
 +	defer srv.Close()
-+	c, _ := newTestCatalog()
-+	installGUIIPC(srv, c)
++	// Lua が無いとき (nil の *luaplugin.Manager) にプラグインのコマンドを載せない
++	// (型付きの nil を入れると plugin.call が nil を呼んで落ちる)。
++	if opts := guiIPCOptions(nil, c); opts.Plugins != nil {
++		t.Fatalf("Plugins = %#v, want a nil interface", opts.Plugins)
++	}
 +
 +	resp, err := ipc.Send(sock, ipc.Request{Cmd: "capabilities"})
 +	if err != nil {
@@ -627,7 +883,7 @@ index 0000000..3f68913
 +	}
 +}
 diff --git a/daemon.go b/daemon.go
-index 88e4221..5badd96 100644
+index 88e4221..de39c45 100644
 --- a/daemon.go
 +++ b/daemon.go
 @@ -21,7 +21,7 @@ import (
@@ -639,16 +895,30 @@ index 88e4221..5badd96 100644
  	fmt.Fprintf(os.Stderr, "cliamp: running headless (socket: %s)\n", ipc.DefaultSocketPath())
  	applog.Info("daemon: starting headless mode")
  
-@@ -42,6 +42,7 @@ func runDaemon(p *player.Player, pl *playlist.Playlist, localProv *local.Provide
+@@ -37,7 +37,7 @@ func runDaemon(p *player.Player, pl *playlist.Playlist, localProv *local.Provide
+ 		d.mu.Unlock()
+ 	}
+ 
+-	srv, err := ipc.NewServer(ipc.DefaultSocketPath(), d)
++	srv, err := ipc.NewServerWith(ipc.DefaultSocketPath(), d, guiIPCOptions(nil, catalog))
+ 	if err != nil {
  		return fmt.Errorf("ipc: %w", err)
  	}
- 	defer srv.Close()
-+	installGUIIPC(srv, catalog)
+@@ -45,6 +45,8 @@ func runDaemon(p *player.Player, pl *playlist.Playlist, localProv *local.Provide
  
  	sigCh := make(chan os.Signal, 1)
  	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-@@ -69,6 +70,11 @@ type daemon struct {
- 	player    *player.Player
++	// 終わりの処理で止まっても、2 度目のシグナルで既定どおり終われるように。
++	defer signal.Stop(sigCh)
+ 
+ 	ticker := time.NewTicker(250 * time.Millisecond)
+ 	defer ticker.Stop()
+@@ -66,9 +68,16 @@ func runDaemon(p *player.Player, pl *playlist.Playlist, localProv *local.Provide
+ // internally thread-safe so blocking I/O (Play, PlayYTDL) runs without it.
+ type daemon struct {
+ 	mu        sync.Mutex
+-	player    *player.Player
++	player    player.Engine
  	playlist  *playlist.Playlist
  	localProv *local.Provider
 +
@@ -656,10 +926,20 @@ index 88e4221..5badd96 100644
 +	source      ipc.SourceInfo // いまのリストの出どころ
 +	sourceEpoch uint64         // source を覚えたときの playlist の Epoch
 +	buffering   bool           // playTrack が再生の準備を待っている間
++	playSeq     uint64         // playTrack のたびに増える。最新の開始だけが buffering を下ろす
++	seekState                  // seek_to の進行 (daemon_gui.go)
  }
  
  func (d *daemon) Send(msg any) {
-@@ -139,6 +145,15 @@ func (d *daemon) Send(msg any) {
+@@ -93,6 +102,7 @@ func (d *daemon) Send(msg any) {
+ 
+ 	case playback.StopMsg:
+ 		d.player.Stop()
++		d.cancelStart()
+ 
+ 	case playback.NextMsg:
+ 		d.nextTrack()
+@@ -139,6 +149,15 @@ func (d *daemon) Send(msg any) {
  
  	case ipc.StatusRequestMsg:
  		reply(m.Reply, d.statusResponse())
@@ -675,23 +955,37 @@ index 88e4221..5badd96 100644
  	}
  }
  
-@@ -168,6 +183,7 @@ func (d *daemon) playCurrent() {
+@@ -168,16 +187,19 @@ func (d *daemon) playCurrent() {
  // Caller must hold d.mu; the lock is held again on return.
  func (d *daemon) playTrack(track playlist.Track) {
  	dur := time.Duration(track.DurationSecs) * time.Second
-+	d.buffering = true
- 	d.mu.Unlock()
- 	var err error
- 	if playlist.IsYTDL(track.Path) {
-@@ -176,6 +192,7 @@ func (d *daemon) playTrack(track playlist.Track) {
- 		err = d.player.Play(track.Path, dur)
+-	d.mu.Unlock()
+-	var err error
+-	if playlist.IsYTDL(track.Path) {
+-		err = d.player.PlayYTDL(track.Path, dur)
+-	} else {
+-		err = d.player.Play(track.Path, dur)
+-	}
+-	d.mu.Lock()
+-	if err != nil {
+-		applog.Warn("daemon: play %q: %v", track.Path, err)
++	for retry := 0; ; retry++ {
++		seq := d.beginPlay()
++		d.mu.Unlock()
++		var err error
++		if playlist.IsYTDL(track.Path) {
++			err = d.player.PlayYTDL(track.Path, dur)
++		} else {
++			err = d.player.Play(track.Path, dur)
++		}
++		d.mu.Lock()
++		if !d.finishPlay(seq, track, err, retry) {
++			return
++		}
  	}
- 	d.mu.Lock()
-+	d.buffering = false
- 	if err != nil {
- 		applog.Warn("daemon: play %q: %v", track.Path, err)
- 	}
-@@ -231,6 +248,7 @@ func (d *daemon) handleLoad(m ipc.LoadMsg) {
+ }
+ 
+@@ -231,6 +253,7 @@ func (d *daemon) handleLoad(m ipc.LoadMsg) {
  		return
  	}
  	d.playlist.Replace(tracks)
@@ -699,7 +993,7 @@ index 88e4221..5badd96 100644
  	d.playCurrent()
  	reply(m.Reply, ipc.Response{OK: true, Playlist: m.Playlist, Total: len(tracks)})
  }
-@@ -358,6 +376,7 @@ func (d *daemon) statusResponse() ipc.Response {
+@@ -358,6 +381,7 @@ func (d *daemon) statusResponse() ipc.Response {
  	mono := d.player.Mono()
  	resp.Mono = &mono
  	resp.Speed = d.player.Speed()
@@ -709,25 +1003,31 @@ index 88e4221..5badd96 100644
  
 diff --git a/daemon_gui.go b/daemon_gui.go
 new file mode 100644
-index 0000000..9180032
+index 0000000..e368df6
 --- /dev/null
 +++ b/daemon_gui.go
-@@ -0,0 +1,205 @@
+@@ -0,0 +1,300 @@
 +package main
 +
 +// daemon_gui.go — GUI 向け拡張 IPC (ipc/gui.go) の状態系コマンドを daemon
 +// (--daemon) で処理する。TUI 側 (ui/model/ipc_gui.go) と同じ意味にしてある。
 +//
 +// どれも daemon.Send から d.mu を持った状態で呼ばれる。playTrack は再生の
-+// 準備の間だけ d.mu を手放すので、答えは再生を始める前に返す。daemon には
-+// gapless の先読みが無いので、先読みのやり直しは要らない。
++// 準備の間だけ d.mu を手放すので、答えは再生を始める前に返す (IPC 側は
++// Send を別の goroutine で呼び、答えが入った時点で返す。ipc/gui.go の
++// sendAndWait)。daemon には gapless の先読みが無いので、先読みのやり直しは
++// 要らない。
 +
 +import (
++	"errors"
 +	"fmt"
++	"sync"
 +	"time"
 +
 +	"cliamp/applog"
 +	"cliamp/ipc"
++	"cliamp/player"
++	"cliamp/playlist"
 +)
 +
 +// handleGUI は拡張 IPC のメッセージを処理する。知らないメッセージは捨てる
@@ -765,6 +1065,10 @@ index 0000000..9180032
 +	resp.StreamTitle = d.player.StreamTitle()
 +	buffering := d.buffering
 +	resp.Buffering = &buffering
++	// シークの間は、TUI と同じくシーク先を返す (生の位置は古い値のまま)。
++	if d.seeking && d.player.IsPlaying() {
++		resp.Position = d.seekTarget.Seconds()
++	}
 +}
 +
 +func (d *daemon) setListSource(src ipc.SourceInfo) {
@@ -780,16 +1084,91 @@ index 0000000..9180032
 +	return &src
 +}
 +
-+// seekTo は絶対位置へシークする (seek_to)。yt-dlp の曲は数秒かかるので、
-+// その間 d.mu を手放す (status を止めないため)。
++// beginPlay は playTrack の開始ごとに呼ぶ (d.mu を持った状態で)。
++// 読み込み待ちを立て、前の曲のシークを取り消し、この開始の番号を返す。
++func (d *daemon) beginPlay() uint64 {
++	d.playSeq++
++	d.buffering = true
++	d.seeking = false
++	d.seekSeq++ // 待っている seek_to は前の曲のもの
++	return d.playSeq
++}
++
++// cancelStart は止めたとき (stop) に呼ぶ。準備中の開始を古いものにし
++// (終わっても buffering に触らない)、読み込み待ちと待っているシークを下ろす。
++func (d *daemon) cancelStart() {
++	d.playSeq++
++	d.buffering = false
++	d.seeking = false
++	d.seekSeq++
++}
++
++// finishPlay は playTrack の開始が終わったときに呼ぶ (d.mu を持った状態で)。
++// 後から別の開始があればそちらに任せる (読み込み待ちもそちらが下ろす)。
++// 開始の途中で Stop されたとき (player.ErrSuperseded) は失敗として記録しない。
++// ただしそのとき鳴っているなら、後から始まった古い開始が勝っているので、
++// もう一度始める (true を返す)。
++func (d *daemon) finishPlay(seq uint64, track playlist.Track, err error, retry int) bool {
++	if seq != d.playSeq {
++		return false
++	}
++	if errors.Is(err, player.ErrSuperseded) {
++		if d.player.IsPlaying() && retry < 2 {
++			return true
++		}
++		err = nil
++	}
++	d.buffering = false
++	if err != nil {
++		applog.Warn("daemon: play %q: %v", track.Path, err)
++	}
++	return false
++}
++
++// seekState は daemon の seek_to の進行。
++type seekState struct {
++	seekMu     sync.Mutex    // シークを 1 本ずつにする (d.mu とは別。d.mu より先に取る)
++	seeking    bool          // シークを待っている間 (status はシーク先を返す)
++	seekTarget time.Duration // 最後に頼まれたシーク先
++	seekSeq    uint64        // seek_to と playTrack のたびに増える
++}
++
++// seekTo は絶対位置へシークする (seek_to)。yt-dlp の曲は組み直しに数秒
++// かかるので、別の goroutine で行い、すぐ戻る (IPC の答えと status を
++// 待たせない)。シークは 1 本ずつ行い、待っている間に新しい seek_to が
++// 来たら古いものは行わない (HTTP の流れでは先に終わった方が勝つため、
++// 並べて走らせると古いシーク先に戻りうる)。yt-dlp の組み立て中のシークは
++// CancelSeekYTDL で捨てる。
 +func (d *daemon) seekTo(target time.Duration) {
 +	if !d.player.IsPlaying() {
 +		return
 +	}
-+	delta := target - d.player.Position()
-+	d.mu.Unlock()
-+	err := d.player.Seek(delta)
++	target = max(target, 0)
++	if dur := d.player.Duration(); dur > 0 && target >= dur {
++		target = max(dur-time.Second, 0)
++	}
++	d.seekSeq++
++	d.seeking = true
++	d.seekTarget = target
++	d.player.CancelSeekYTDL()
++	go d.runSeek(d.seekSeq, target)
++}
++
++func (d *daemon) runSeek(seq uint64, target time.Duration) {
++	d.seekMu.Lock()
++	defer d.seekMu.Unlock()
 +	d.mu.Lock()
++	current := seq == d.seekSeq
++	d.mu.Unlock()
++	if !current {
++		return // 新しい seek_to か別の曲の開始があった
++	}
++	err := d.player.Seek(target - d.player.Position())
++	d.mu.Lock()
++	if seq == d.seekSeq {
++		d.seeking = false
++	}
++	d.mu.Unlock()
 +	if err != nil {
 +		applog.Warn("daemon: seek to %s: %v", target, err)
 +	}
@@ -810,9 +1189,18 @@ index 0000000..9180032
 +	return !d.player.IsPlaying() && !d.buffering
 +}
 +
++// staleIndex は ui/model/ipc_gui.go の同名の関数と同じ。
++func (d *daemon) staleIndex(index int, path string) bool {
++	return ipc.PathMismatch(d.playlist.Tracks()[index].Path, path)
++}
++
 +func (d *daemon) guiPlayIndex(m ipc.PlayIndexMsg) {
 +	if m.Index < 0 || m.Index >= d.playlist.Len() {
 +		ipc.SendReply(m.Reply, ipc.Response{OK: false, Error: "index out of range"})
++		return
++	}
++	if d.staleIndex(m.Index, m.Path) {
++		ipc.SendReply(m.Reply, ipc.Response{OK: false, Error: ipc.ErrStale.Error()})
 +		return
 +	}
 +	d.playlist.SetIndex(m.Index)
@@ -840,32 +1228,25 @@ index 0000000..9180032
 +		return
 +	}
 +	idle := d.idle()
-+	start := d.playlist.Len()
-+	d.playlist.Add(m.Tracks...)
 +	mode := m.Mode
-+	if mode == "next" && start == 0 {
++	if mode == "next" && d.playlist.Len() == 0 {
 +		mode = "end" // 理由は ui/model/ipc_gui.go の guiEnqueue
 +	}
 +	play := false
 +	switch mode {
 +	case "now":
 +		d.player.Stop()
-+		if d.playlist.Shuffled() {
-+			for i := 1; i < len(m.Tracks); i++ {
-+				d.playlist.Queue(start + i)
-+			}
-+		}
-+		d.playlist.SetIndex(start)
++		d.playlist.AddNow(m.Tracks...)
 +		play = true
 +	case "end":
 +		if idle {
-+			d.playlist.SetIndex(start)
++			d.playlist.AddAndSelect(m.Tracks...)
 +			play = true
++		} else {
++			d.playlist.Add(m.Tracks...)
 +		}
 +	default: // "next"
-+		for i := range m.Tracks {
-+			d.playlist.Queue(start + i)
-+		}
++		d.playlist.PlayNext(m.Tracks...)
 +	}
 +	ipc.SendReply(m.Reply, ipc.Response{OK: true, Total: d.playlist.Len(), Gen: d.playlist.Gen()})
 +	switch {
@@ -878,21 +1259,25 @@ index 0000000..9180032
 +
 +func (d *daemon) guiQueueEdit(m ipc.QueueEditMsg) {
 +	switch m.Mode {
-+	case "add":
++	case "add", "remove":
 +		if m.Index < 0 || m.Index >= d.playlist.Len() {
 +			ipc.SendReply(m.Reply, ipc.Response{OK: false, Error: "index out of range"})
 +			return
 +		}
-+		if d.playlist.QueuePosition(m.Index) == 0 {
++		if d.staleIndex(m.Index, m.Path) {
++			ipc.SendReply(m.Reply, ipc.Response{OK: false, Error: ipc.ErrStale.Error()})
++			return
++		}
++		if m.Mode == "remove" {
++			d.playlist.Dequeue(m.Index)
++		} else if d.playlist.QueuePosition(m.Index) == 0 {
 +			d.playlist.Queue(m.Index)
 +		}
-+	case "remove":
-+		if m.Index < 0 || m.Index >= d.playlist.Len() {
-+			ipc.SendReply(m.Reply, ipc.Response{OK: false, Error: "index out of range"})
++	case "move":
++		if q := d.playlist.QueueIndices(); m.Index >= 0 && m.Index < len(q) && d.staleIndex(q[m.Index], m.Path) {
++			ipc.SendReply(m.Reply, ipc.Response{OK: false, Error: ipc.ErrStale.Error()})
 +			return
 +		}
-+		d.playlist.Dequeue(m.Index)
-+	case "move":
 +		if !d.playlist.MoveQueueTo(m.Index, m.To) {
 +			ipc.SendReply(m.Reply, ipc.Response{OK: false, Error: "queue position out of range"})
 +			return
@@ -911,6 +1296,10 @@ index 0000000..9180032
 +		ipc.SendReply(m.Reply, ipc.Response{OK: false, Error: "index out of range"})
 +		return
 +	}
++	if d.staleIndex(m.Index, m.Path) {
++		ipc.SendReply(m.Reply, ipc.Response{OK: false, Error: ipc.ErrStale.Error()})
++		return
++	}
 +	if m.Index == d.playlist.Index() && !d.idle() {
 +		ipc.SendReply(m.Reply, ipc.Response{OK: false, Error: "cannot remove the current track"})
 +		return
@@ -918,6 +1307,863 @@ index 0000000..9180032
 +	d.playlist.Remove(m.Index)
 +	ipc.SendReply(m.Reply, ipc.Response{OK: true, Total: d.playlist.Len(), Gen: d.playlist.Gen()})
 +}
+diff --git a/daemon_gui_test.go b/daemon_gui_test.go
+new file mode 100644
+index 0000000..261812a
+--- /dev/null
++++ b/daemon_gui_test.go
+@@ -0,0 +1,381 @@
++package main
++
++// daemon (--daemon) の GUI 拡張 IPC の試験。プレイヤーは偽物 (音は出さない)。
++
++import (
++	"os"
++	"path/filepath"
++	"slices"
++	"sync"
++	"testing"
++	"time"
++
++	"cliamp/internal/playback"
++	"cliamp/ipc"
++	"cliamp/player"
++	"cliamp/playlist"
++)
++
++// daemonFakeEngine は player.Engine の偽物。IPC の goroutine とシークの
++// goroutine から呼ばれるので鍵で守る。block が nil でなければ、Play と
++// PlayYTDL はそれが閉じられるまで戻らない (yt-dlp の組み立てにあたる)。
++type daemonFakeEngine struct {
++	mu        sync.Mutex
++	playing   bool
++	plays     []string
++	playErrs  []error // Play/PlayYTDL が順に返す値 (尽きたら nil)
++	block     chan struct{}
++	stops     int
++	position  time.Duration
++	duration  time.Duration
++	seekDelay time.Duration
++	seeks     int
++	cancels   int
++}
++
++func (f *daemonFakeEngine) start(path string) error {
++	f.mu.Lock()
++	block := f.block
++	f.plays = append(f.plays, path)
++	f.mu.Unlock()
++	if block != nil {
++		<-block
++	}
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	var err error
++	if len(f.playErrs) > 0 {
++		err, f.playErrs = f.playErrs[0], f.playErrs[1:]
++	}
++	if err == nil {
++		f.playing = true
++		f.position = 0
++	}
++	return err
++}
++
++func (f *daemonFakeEngine) Play(path string, _ time.Duration) error     { return f.start(path) }
++func (f *daemonFakeEngine) PlayYTDL(path string, _ time.Duration) error { return f.start(path) }
++func (f *daemonFakeEngine) Preload(string, time.Duration) error         { return nil }
++func (f *daemonFakeEngine) PreloadYTDL(string, time.Duration) error     { return nil }
++func (f *daemonFakeEngine) ClearPreload()                               {}
++func (f *daemonFakeEngine) Stop() {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	f.stops++
++	f.playing = false
++}
++func (f *daemonFakeEngine) Close()       {}
++func (f *daemonFakeEngine) TogglePause() {}
++func (f *daemonFakeEngine) Seek(d time.Duration) error {
++	f.mu.Lock()
++	delay := f.seekDelay
++	f.seeks++
++	f.mu.Unlock()
++	time.Sleep(delay)
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	f.position += d
++	return nil
++}
++func (f *daemonFakeEngine) SeekYTDL(d time.Duration) error { return f.Seek(d) }
++func (f *daemonFakeEngine) CancelSeekYTDL() {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	f.cancels++
++}
++func (f *daemonFakeEngine) IsPlaying() bool {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	return f.playing
++}
++func (f *daemonFakeEngine) IsPaused() bool        { return false }
++func (f *daemonFakeEngine) Drained() bool         { return false }
++func (f *daemonFakeEngine) HasPreload() bool      { return false }
++func (f *daemonFakeEngine) Seekable() bool        { return true }
++func (f *daemonFakeEngine) IsStreamSeek() bool    { return false }
++func (f *daemonFakeEngine) IsYTDLSeek() bool      { return true }
++func (f *daemonFakeEngine) GaplessAdvanced() bool { return false }
++func (f *daemonFakeEngine) Position() time.Duration {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	return f.position
++}
++func (f *daemonFakeEngine) Duration() time.Duration {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	return f.duration
++}
++func (f *daemonFakeEngine) PositionAndDuration() (time.Duration, time.Duration) {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	return f.position, f.duration
++}
++func (f *daemonFakeEngine) SetVolume(float64)                      {}
++func (f *daemonFakeEngine) Volume() float64                        { return 0 }
++func (f *daemonFakeEngine) SetSpeed(float64)                       {}
++func (f *daemonFakeEngine) Speed() float64                         { return 1 }
++func (f *daemonFakeEngine) ToggleMono()                            {}
++func (f *daemonFakeEngine) Mono() bool                             { return false }
++func (f *daemonFakeEngine) SetEQBand(int, float64)                 {}
++func (f *daemonFakeEngine) EQBands() [10]float64                   { return [10]float64{} }
++func (f *daemonFakeEngine) StreamErr() error                       { return nil }
++func (f *daemonFakeEngine) StreamTitle() string                    { return "" }
++func (f *daemonFakeEngine) StreamBytes() (downloaded, total int64) { return 0, 0 }
++func (f *daemonFakeEngine) SamplesInto([]float64) int              { return 0 }
++func (f *daemonFakeEngine) SampleRate() int                        { return 44100 }
++
++var _ player.Engine = (*daemonFakeEngine)(nil)
++
++func daemonTracks(names ...string) []playlist.Track {
++	out := make([]playlist.Track, len(names))
++	for i, n := range names {
++		out[i] = playlist.Track{Path: n + ".flac", Title: n}
++	}
++	return out
++}
++
++// newTestDaemon は names のリストで current の曲を鳴らしている daemon を作る
++// (current < 0 なら止まったまま)。
++func newTestDaemon(t *testing.T, current int, names ...string) (*daemon, *daemonFakeEngine) {
++	t.Helper()
++	eng := &daemonFakeEngine{duration: 10 * time.Minute}
++	d := &daemon{player: eng, playlist: playlist.New()}
++	d.playlist.Replace(daemonTracks(names...))
++	if current >= 0 {
++		d.playlist.SetIndex(current)
++		d.mu.Lock()
++		d.playCurrent()
++		d.mu.Unlock()
++	}
++	return d, eng
++}
++
++func daemonSend(d *daemon, build func(chan ipc.Response) any) ipc.Response {
++	reply := make(chan ipc.Response, 1)
++	d.Send(build(reply))
++	select {
++	case r := <-reply:
++		return r
++	default:
++		return ipc.Response{Error: "no reply"}
++	}
++}
++
++func daemonPlayed(pl *playlist.Playlist) []string {
++	var out []string
++	for range 100 {
++		t, ok := pl.Next()
++		if !ok {
++			break
++		}
++		out = append(out, t.Title)
++	}
++	return out
++}
++
++// daemon の「次に再生」も 1 度だけ鳴り、シャッフル中の now / 止まっているときの
++// end は、これから鳴る曲を飛ばさない (TUI と同じ playlist の関数を使う)。
++func TestDaemonEnqueueOrder(t *testing.T) {
++	d, _ := newTestDaemon(t, 0, "a", "b", "c")
++	resp := daemonSend(d, func(r chan ipc.Response) any {
++		return ipc.EnqueueMsg{Tracks: daemonTracks("X"), Mode: "next", Reply: r}
++	})
++	if !resp.OK || d.playlist.QueueLen() != 0 {
++		t.Fatalf("next = %+v queue=%v", resp, d.playlist.QueueIndices())
++	}
++	if got := daemonPlayed(d.playlist); !slices.Equal(got, []string{"X", "b", "c"}) {
++		t.Fatalf("played %v, want [X b c]", got)
++	}
++
++	names := []string{"t0", "t1", "t2", "t3", "t4", "t5", "t6", "t7"}
++	for range 50 {
++		d, eng := newTestDaemon(t, -1, names...)
++		d.playlist.ToggleShuffle()
++		d.mu.Lock()
++		d.playCurrent()
++		d.mu.Unlock()
++		cur, _ := d.playlist.Current()
++		daemonSend(d, func(r chan ipc.Response) any {
++			return ipc.EnqueueMsg{Tracks: daemonTracks("X"), Mode: "now", Reply: r}
++		})
++		if last := eng.plays[len(eng.plays)-1]; last != "X.flac" {
++			t.Fatalf("now played %q", last)
++		}
++		got := daemonPlayed(d.playlist)
++		for _, n := range names {
++			if n != cur.Title && !slices.Contains(got, n) {
++				t.Fatalf("now skipped %s: %v", n, got)
++			}
++		}
++	}
++
++	for range 50 {
++		d, eng := newTestDaemon(t, 0, "a", "b", "c")
++		d.playlist.ToggleShuffle()
++		daemonPlayed(d.playlist)
++		eng.Stop()
++		added := []string{"x0", "x1", "x2", "x3", "x4"}
++		daemonSend(d, func(r chan ipc.Response) any {
++			return ipc.EnqueueMsg{Tracks: daemonTracks(added...), Mode: "end", Reply: r}
++		})
++		if last := eng.plays[len(eng.plays)-1]; last != "x0.flac" {
++			t.Fatalf("end when idle played %q", last)
++		}
++		got := daemonPlayed(d.playlist)
++		for _, n := range added[1:] {
++			if !slices.Contains(got, n) {
++				t.Fatalf("end when idle skipped %s: %v", n, got)
++			}
++		}
++	}
++}
++
++func TestDaemonIndexCommandsRejectStalePath(t *testing.T) {
++	d, eng := newTestDaemon(t, 0, "a", "b", "c")
++	daemonSend(d, func(r chan ipc.Response) any { return ipc.QueueEditMsg{Mode: "add", Index: 2, Reply: r} })
++	gen, plays := d.playlist.Gen(), len(eng.plays)
++	for _, build := range []func(chan ipc.Response) any{
++		func(r chan ipc.Response) any { return ipc.PlayIndexMsg{Index: 1, Path: "c.flac", Reply: r} },
++		func(r chan ipc.Response) any { return ipc.RemoveMsg{Index: 1, Path: "c.flac", Reply: r} },
++		func(r chan ipc.Response) any {
++			return ipc.QueueEditMsg{Mode: "remove", Index: 2, Path: "b.flac", Reply: r}
++		},
++		func(r chan ipc.Response) any {
++			return ipc.QueueEditMsg{Mode: "move", Index: 0, To: 0, Path: "b.flac", Reply: r}
++		},
++	} {
++		if resp := daemonSend(d, build); resp.OK || resp.Error != "stale" {
++			t.Fatalf("%T = %+v, want stale", build(nil), resp)
++		}
++	}
++	if d.playlist.Gen() != gen || len(eng.plays) != plays {
++		t.Fatal("a stale request changed the list")
++	}
++	if resp := daemonSend(d, func(r chan ipc.Response) any { return ipc.RemoveMsg{Index: 1, Path: "b.flac", Reply: r} }); !resp.OK {
++		t.Fatalf("remove with the right path = %+v", resp)
++	}
++}
++
++// seek_to はすぐ答え (yt-dlp の組み直しを待たない)、その間の status は
++// シーク先を返す。続けて来た seek_to は最後のシーク先に落ち着く。
++func TestDaemonSeekTo(t *testing.T) {
++	d, eng := newTestDaemon(t, 0, "a")
++	eng.mu.Lock()
++	eng.seekDelay = 300 * time.Millisecond
++	eng.mu.Unlock()
++
++	start := time.Now()
++	d.Send(playback.SetPositionMsg{Position: 100 * time.Second})
++	d.Send(playback.SetPositionMsg{Position: 200 * time.Second})
++	d.Send(playback.SetPositionMsg{Position: 300 * time.Second})
++	if took := time.Since(start); took > 250*time.Millisecond {
++		t.Fatalf("seek_to blocked Send for %v", took)
++	}
++	status := daemonSend(d, func(r chan ipc.Response) any { return ipc.StatusRequestMsg{Reply: r} })
++	if status.Position != 300 {
++		t.Fatalf("status position during the seek = %v, want 300", status.Position)
++	}
++	if eng.cancels < 3 {
++		t.Fatalf("CancelSeekYTDL called %d times, want once per seek_to", eng.cancels)
++	}
++	deadline := time.Now().Add(3 * time.Second)
++	for {
++		d.mu.Lock()
++		seeking := d.seeking
++		d.mu.Unlock()
++		if !seeking {
++			break
++		}
++		if time.Now().After(deadline) {
++			t.Fatal("seek never finished")
++		}
++		time.Sleep(10 * time.Millisecond)
++	}
++	d.seekMu.Lock() // 走っているシークが終わるまで待つ
++	d.seekMu.Unlock()
++	if got := eng.Position(); got != 300*time.Second {
++		t.Fatalf("final position = %v, want 300s (the last seek_to)", got)
++	}
++	eng.mu.Lock()
++	seeks := eng.seeks
++	eng.mu.Unlock()
++	if seeks > 2 {
++		t.Fatalf("%d seeks ran; queued seek_to requests should collapse into the latest", seeks)
++	}
++}
++
++// 読み込み中に止めたら (IPC の stop)、プレイヤーが返す ErrSuperseded で
++// 読み込み待ちを下ろす。鳴っていれば (後から始まった古い開始が勝った)
++// もう一度始める。
++func TestDaemonSupersededStart(t *testing.T) {
++	d, eng := newTestDaemon(t, -1, "a", "b")
++	eng.block = make(chan struct{})
++	eng.playErrs = []error{player.ErrSuperseded}
++	done := make(chan struct{})
++	go func() {
++		daemonSend(d, func(r chan ipc.Response) any { return ipc.PlayIndexMsg{Index: 0, Reply: r} })
++		close(done)
++	}()
++	waitFor(t, func() bool { d.mu.Lock(); defer d.mu.Unlock(); return d.buffering })
++	d.Send(playback.StopMsg{})
++	if status := daemonSend(d, func(r chan ipc.Response) any { return ipc.StatusRequestMsg{Reply: r} }); *status.Buffering {
++		t.Fatal("status still reports buffering right after stop")
++	}
++	close(eng.block)
++	<-done
++	d.mu.Lock()
++	buffering := d.buffering
++	d.mu.Unlock()
++	if buffering || len(eng.plays) != 1 {
++		t.Fatalf("after stop: buffering=%v plays=%v", buffering, eng.plays)
++	}
++
++	// 鳴っているのに最新の開始が ErrSuperseded: もう一度始める。
++	d, eng = newTestDaemon(t, 0, "a", "b")
++	eng.playErrs = []error{player.ErrSuperseded}
++	daemonSend(d, func(r chan ipc.Response) any { return ipc.PlayIndexMsg{Index: 1, Reply: r} })
++	if !slices.Equal(eng.plays, []string{"a.flac", "b.flac", "b.flac"}) || d.buffering {
++		t.Fatalf("plays = %v buffering=%v, want b restarted", eng.plays, d.buffering)
++	}
++}
++
++func waitFor(t *testing.T, cond func() bool) {
++	t.Helper()
++	deadline := time.Now().Add(3 * time.Second)
++	for !cond() {
++		if time.Now().After(deadline) {
++			t.Fatal("condition not met")
++		}
++		time.Sleep(5 * time.Millisecond)
++	}
++}
++
++// 本物の IPC サーバーを通した replace は、daemon が yt-dlp の準備をしている
++// 間も 3 秒以内に答え、その間の status は読み込み中を返す。
++func TestDaemonReplaceAnswersBeforePlaybackStarts(t *testing.T) {
++	home, err := os.MkdirTemp("", "dm")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer os.RemoveAll(home)
++	d, eng := newTestDaemon(t, -1, "a")
++	eng.block = make(chan struct{})
++	defer close(eng.block)
++	sock := filepath.Join(home, "c.sock")
++	srv, err := ipc.NewServerWith(sock, d, ipc.Options{})
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer srv.Close()
++
++	start := time.Now()
++	resp, err := ipc.Send(sock, ipc.Request{Cmd: "replace", Tracks: []ipc.TrackInfo{{Path: "https://www.youtube.com/watch?v=x"}}})
++	if err != nil || !resp.OK || time.Since(start) > time.Second {
++		t.Fatalf("replace = %+v, %v after %v", resp, err, time.Since(start))
++	}
++	status, err := ipc.Send(sock, ipc.Request{Cmd: "status"})
++	if err != nil || status.Buffering == nil || !*status.Buffering {
++		t.Fatalf("status while starting = %+v, %v", status, err)
++	}
++}
+diff --git a/external/local/gui.go b/external/local/gui.go
+new file mode 100644
+index 0000000..8047b96
+--- /dev/null
++++ b/external/local/gui.go
+@@ -0,0 +1,41 @@
++package local
++
++// gui.go — GUI 向け拡張 IPC (cliamp の catalog.go) が使う書き込み。
++
++import (
++	"errors"
++	"fmt"
++	"slices"
++
++	"cliamp/playlist"
++)
++
++// ErrTrackMismatch is returned by RemoveTrackIf when the track at the index
++// does not satisfy the caller's check (the caller's view is out of date).
++var ErrTrackMismatch = errors.New("track at index does not match")
++
++// RemoveTrackIf is RemoveTrack, but when match is non-nil the track at index
++// must satisfy it, checked under the same lock as the rewrite; otherwise
++// nothing changes and ErrTrackMismatch is returned.
++func (p *Provider) RemoveTrackIf(name string, index int, match func(playlist.Track) bool) error {
++	if isHistoryName(name) {
++		return errReservedHistoryName
++	}
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	tracks, err := p.loadTOMLByName(name)
++	if err != nil {
++		return err
++	}
++	if index < 0 || index >= len(tracks) {
++		return fmt.Errorf("track index %d out of range", index)
++	}
++	if match != nil && !match(tracks[index]) {
++		return ErrTrackMismatch
++	}
++	tracks = slices.Delete(tracks, index, index+1)
++	if len(tracks) == 0 {
++		return p.deletePlaylistLocked(name)
++	}
++	return p.savePlaylist(name, tracks)
++}
+diff --git a/external/local/gui_test.go b/external/local/gui_test.go
+new file mode 100644
+index 0000000..865ac80
+--- /dev/null
++++ b/external/local/gui_test.go
+@@ -0,0 +1,108 @@
++package local
++
++import (
++	"errors"
++	"fmt"
++	"os"
++	"strings"
++	"sync"
++	"testing"
++
++	"cliamp/playlist"
++)
++
++// TUI と IPC のカタログ (接続ごとの goroutine) が同じ Provider に並行して
++// 書いても、曲の項目が混ざらず、書き込みが失われない。
++func TestConcurrentWritesKeepPlaylistIntact(t *testing.T) {
++	p := newTestProvider(t)
++	var base []playlist.Track
++	for i := range 20 {
++		base = append(base, playlist.Track{Path: fmt.Sprintf("/m/base%02d.flac", i), Title: fmt.Sprintf("base%02d", i)})
++	}
++	if err := p.AddTracks("mix", base); err != nil {
++		t.Fatal(err)
++	}
++	var wg sync.WaitGroup
++	for w := range 4 {
++		wg.Add(1)
++		go func() {
++			defer wg.Done()
++			for i := range 25 {
++				id := fmt.Sprintf("w%d-%02d", w, i)
++				if err := p.AddTrack("mix", playlist.Track{Path: "/m/" + id + ".flac", Title: id, Artist: "artist-" + id}); err != nil {
++					t.Errorf("AddTrack: %v", err)
++				}
++			}
++		}()
++	}
++	for range 10 {
++		wg.Add(1)
++		go func() {
++			defer wg.Done()
++			if err := p.RemoveTrack("mix", 0); err != nil {
++				t.Errorf("RemoveTrack: %v", err)
++			}
++		}()
++	}
++	wg.Add(1)
++	go func() {
++		defer wg.Done()
++		for range 10 {
++			if err := p.SetBookmark("mix", 5); err != nil { // 長さは 10 より短くならない
++				t.Errorf("SetBookmark: %v", err)
++			}
++		}
++	}()
++	wg.Wait()
++
++	got, err := p.Tracks("mix")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(got) != 20-10+4*25 {
++		t.Fatalf("%d tracks, want %d", len(got), 20-10+4*25)
++	}
++	for _, tr := range got {
++		if tr.Path != "/m/"+tr.Title+".flac" || (strings.HasPrefix(tr.Title, "w") && tr.Artist != "artist-"+tr.Title) {
++			t.Fatalf("mixed-up track %+v", tr)
++		}
++	}
++	entries, _ := os.ReadDir(p.dir)
++	for _, e := range entries {
++		if e.Name() != "mix.toml" {
++			t.Fatalf("unexpected file left in the playlist dir: %s", e.Name())
++		}
++	}
++}
++
++// 書き直したプレイリストは、以前と同じく 0644 で残る (一時ファイルは 0600 で作られる)。
++func TestSavePlaylistKeepsMode(t *testing.T) {
++	p := newTestProvider(t)
++	if err := p.SavePlaylist("x", []playlist.Track{{Path: "/a", Title: "a"}}); err != nil {
++		t.Fatal(err)
++	}
++	info, err := os.Stat(p.dir + "/x.toml")
++	if err != nil || info.Mode().Perm() != 0o644 {
++		t.Fatalf("mode = %v, %v; want 0644", info.Mode(), err)
++	}
++}
++
++func TestRemoveTrackIf(t *testing.T) {
++	p := newTestProvider(t)
++	if err := p.AddTracks("x", []playlist.Track{{Path: "/a", Title: "a"}, {Path: "/b", Title: "b"}}); err != nil {
++		t.Fatal(err)
++	}
++	isB := func(tr playlist.Track) bool { return tr.Path == "/b" }
++	if err := p.RemoveTrackIf("x", 0, isB); !errors.Is(err, ErrTrackMismatch) {
++		t.Fatalf("mismatch err = %v", err)
++	}
++	if got, _ := p.Tracks("x"); len(got) != 2 {
++		t.Fatalf("mismatch changed the playlist: %+v", got)
++	}
++	if err := p.RemoveTrackIf("x", 1, isB); err != nil {
++		t.Fatal(err)
++	}
++	if got, _ := p.Tracks("x"); len(got) != 1 || got[0].Path != "/a" {
++		t.Fatalf("after remove = %+v", got)
++	}
++}
+diff --git a/external/local/provider.go b/external/local/provider.go
+index c314914..934a37f 100644
+--- a/external/local/provider.go
++++ b/external/local/provider.go
+@@ -3,6 +3,7 @@
+ package local
+ 
+ import (
++	"bytes"
+ 	"context"
+ 	"errors"
+ 	"fmt"
+@@ -10,9 +11,9 @@ import (
+ 	"io/fs"
+ 	"os"
+ 	"path/filepath"
+-	"slices"
+ 	"strconv"
+ 	"strings"
++	"sync"
+ 
+ 	"cliamp/history"
+ 	"cliamp/internal/appdir"
+@@ -32,6 +33,11 @@ var (
+ type Provider struct {
+ 	dir     string // e.g. ~/.config/cliamp/playlists/
+ 	history *history.Store
++
++	// mu serializes writes. The TUI and the IPC catalog (one goroutine per
++	// connection) share one Provider, and every write is a read-modify-write
++	// of the whole file or an append.
++	mu sync.Mutex
+ }
+ 
+ // New creates a Provider using ~/.config/cliamp/playlists/ as the base directory.
+@@ -139,37 +145,18 @@ func (p *Provider) Tracks(playlistID string) ([]playlist.Track, error) {
+ // AddTrack appends a track to the named playlist, creating the directory and
+ // file if needed.
+ func (p *Provider) AddTrack(playlistName string, track playlist.Track) error {
+-	if isHistoryName(playlistName) {
+-		return errReservedHistoryName
+-	}
+-	if err := os.MkdirAll(p.dir, 0o755); err != nil {
+-		return err
+-	}
+-
+-	path, err := p.safePath(playlistName)
+-	if err != nil {
+-		return err
+-	}
+-	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+-	if err != nil {
+-		return err
+-	}
+-	defer f.Close()
+-
+-	// Add a blank line before the section if file is non-empty.
+-	if info, err := f.Stat(); err == nil && info.Size() > 0 {
+-		fmt.Fprintln(f)
+-	}
+-
+-	writeTrack(f, track)
+-	return nil
++	return p.AddTracks(playlistName, []playlist.Track{track})
+ }
+ 
+ // AddTracks appends multiple tracks in a single file open/close cycle.
++// The sections are rendered first and written with one Write, so a concurrent
++// append (another IPC connection, or the TUI) cannot interleave field lines.
+ func (p *Provider) AddTracks(playlistName string, tracks []playlist.Track) error {
+ 	if isHistoryName(playlistName) {
+ 		return errReservedHistoryName
+ 	}
++	p.mu.Lock()
++	defer p.mu.Unlock()
+ 	if err := os.MkdirAll(p.dir, 0o755); err != nil {
+ 		return err
+ 	}
+@@ -187,15 +174,18 @@ func (p *Provider) AddTracks(playlistName string, tracks []playlist.Track) error
+ 	if err != nil {
+ 		return err
+ 	}
++	var buf bytes.Buffer
+ 	nonEmpty := info.Size() > 0
+ 	for _, t := range tracks {
++		// Add a blank line before the section if file is non-empty.
+ 		if nonEmpty {
+-			fmt.Fprintln(f)
++			fmt.Fprintln(&buf)
+ 		}
+-		writeTrack(f, t)
++		writeTrack(&buf, t)
+ 		nonEmpty = true
+ 	}
+-	return nil
++	_, err = f.Write(buf.Bytes())
++	return err
+ }
+ 
+ // Exists reports whether a playlist with the given name exists on disk, or
+@@ -215,6 +205,7 @@ func (p *Provider) Exists(name string) bool {
+ }
+ 
+ // savePlaylist overwrites the named playlist with the given tracks.
++// Caller must hold p.mu.
+ func (p *Provider) savePlaylist(name string, tracks []playlist.Track) error {
+ 	if err := os.MkdirAll(p.dir, 0o755); err != nil {
+ 		return err
+@@ -225,24 +216,37 @@ func (p *Provider) savePlaylist(name string, tracks []playlist.Track) error {
+ 		return err
+ 	}
+ 
+-	// Atomic write: write to temp file, then rename.
+-	tmp := path + ".tmp"
+-	f, err := os.Create(tmp)
++	// Atomic write: write to a uniquely named temp file, then rename. A fixed
++	// name would let two writers (or the `cliamp playlist` CLI in another
++	// process) truncate each other's file. The name must not end in ".toml",
++	// or Playlists and SearchTracks would pick it up.
++	f, err := os.CreateTemp(p.dir, "."+name+".*.tmp")
+ 	if err != nil {
+ 		return err
+ 	}
++	tmp := f.Name()
+ 
++	var buf bytes.Buffer
+ 	for i, t := range tracks {
+ 		if i > 0 {
+-			fmt.Fprintln(f)
++			fmt.Fprintln(&buf)
+ 		}
+-		writeTrack(f, t)
++		writeTrack(&buf, t)
++	}
++	_, err = f.Write(buf.Bytes())
++	if err == nil {
++		err = f.Chmod(0o644) // CreateTemp makes 0600; keep the old mode
++	}
++	if cerr := f.Close(); err == nil {
++		err = cerr
++	}
++	if err == nil {
++		err = os.Rename(tmp, path)
+ 	}
+-	if err := f.Close(); err != nil {
++	if err != nil {
+ 		os.Remove(tmp)
+-		return err
+ 	}
+-	return os.Rename(tmp, path)
++	return err
+ }
+ 
+ // errReservedHistoryName is returned when a caller tries to write to or
+@@ -254,6 +258,8 @@ func (p *Provider) SetBookmark(playlistName string, idx int) error {
+ 	if isHistoryName(playlistName) {
+ 		return errReservedHistoryName
+ 	}
++	p.mu.Lock()
++	defer p.mu.Unlock()
+ 	tracks, err := p.loadTOMLByName(playlistName)
+ 	if err != nil {
+ 		return err
+@@ -279,6 +285,8 @@ func (p *Provider) SavePlaylist(name string, tracks []playlist.Track) error {
+ 	if isHistoryName(name) {
+ 		return errReservedHistoryName
+ 	}
++	p.mu.Lock()
++	defer p.mu.Unlock()
+ 	return p.savePlaylist(name, tracks)
+ }
+ 
+@@ -351,6 +359,13 @@ func (p *Provider) DeletePlaylist(name string) error {
+ 	if isHistoryName(name) {
+ 		return errReservedHistoryName
+ 	}
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	return p.deletePlaylistLocked(name)
++}
++
++// deletePlaylistLocked removes the TOML file. Caller must hold p.mu.
++func (p *Provider) deletePlaylistLocked(name string) error {
+ 	path, err := p.safePath(name)
+ 	if err != nil {
+ 		return err
+@@ -370,21 +385,7 @@ func (p *Provider) ClearHistory() error {
+ // RemoveTrack removes a track by index from the named playlist.
+ // If the playlist becomes empty after removal, the file is deleted.
+ func (p *Provider) RemoveTrack(name string, index int) error {
+-	if isHistoryName(name) {
+-		return errReservedHistoryName
+-	}
+-	tracks, err := p.Tracks(name)
+-	if err != nil {
+-		return err
+-	}
+-	if index < 0 || index >= len(tracks) {
+-		return fmt.Errorf("track index %d out of range", index)
+-	}
+-	tracks = slices.Delete(tracks, index, index+1)
+-	if len(tracks) == 0 {
+-		return p.DeletePlaylist(name)
+-	}
+-	return p.savePlaylist(name, tracks)
++	return p.RemoveTrackIf(name, index, nil)
+ }
+ 
+ // writeTrack writes a single [[track]] TOML section to w.
+diff --git a/external/radio/gui.go b/external/radio/gui.go
+new file mode 100644
+index 0000000..811da24
+--- /dev/null
++++ b/external/radio/gui.go
+@@ -0,0 +1,15 @@
++package radio
++
++import "cliamp/playlist"
++
++// gui.go — GUI 向け拡張 IPC (cliamp の catalog.go) が使う一覧。
++
++// BrowsePlaylists は Playlists と同じ一覧 (l: 登録局、f: お気に入り、c: 読み込んだ
++// Radio Browser の局) を、TUI の局検索の状態に関わらず返す。Playlists は検索中に
++// 検索結果 (s:) だけを返すので、TUI と同じインスタンスを使う IPC から呼ぶと、
++// TUI で一度検索しただけで GUI から登録局とお気に入りが消える。
++func (p *Provider) BrowsePlaylists() ([]playlist.PlaylistInfo, error) {
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	return p.basePlaylistsLocked(), nil
++}
+diff --git a/external/radio/gui_test.go b/external/radio/gui_test.go
+new file mode 100644
+index 0000000..e0827c2
+--- /dev/null
++++ b/external/radio/gui_test.go
+@@ -0,0 +1,36 @@
++package radio
++
++import (
++	"strings"
++	"testing"
++)
++
++// TUI で局を検索している間も、BrowsePlaylists は検索前と同じ一覧を返す。
++func TestBrowsePlaylistsIgnoresSearch(t *testing.T) {
++	p := newTestProvider(t)
++	if err := p.favorites.Add(CatalogStation{Name: "Fav FM", URL: "https://fav.example/stream"}); err != nil {
++		t.Fatal(err)
++	}
++	before, err := p.BrowsePlaylists()
++	if err != nil || len(before) != 2 || before[0].ID != "l:0" || before[1].ID != "f:0" {
++		t.Fatalf("BrowsePlaylists before search = %+v, %v", before, err)
++	}
++
++	p.SetSearchResults([]CatalogStation{{Name: "Jazz FM", URL: "https://jazz.example"}, {Name: "Smooth", URL: "https://smooth.example"}})
++	if got, _ := p.Playlists(); len(got) != 2 || !strings.HasPrefix(got[0].ID, "s:") {
++		t.Fatalf("Playlists during search = %+v, want only s: entries", got)
++	}
++	during, _ := p.BrowsePlaylists()
++	if len(during) != len(before) {
++		t.Fatalf("BrowsePlaylists during search = %+v, want %+v", during, before)
++	}
++	for i := range during {
++		if during[i] != before[i] {
++			t.Fatalf("BrowsePlaylists during search = %+v, want %+v", during, before)
++		}
++	}
++	// 検索中に一覧から得た l: の曲も引ける。
++	if tracks, err := p.Tracks(during[0].ID); err != nil || len(tracks) != 1 {
++		t.Fatalf("Tracks(%s) during search = %v, %v", during[0].ID, tracks, err)
++	}
++}
+diff --git a/external/radio/provider.go b/external/radio/provider.go
+index 6ceca72..408550f 100644
+--- a/external/radio/provider.go
++++ b/external/radio/provider.go
+@@ -76,15 +76,21 @@ func (p *Provider) Playlists() ([]playlist.PlaylistInfo, error) {
+ 	p.mu.Lock()
+ 	defer p.mu.Unlock()
+ 
+-	var out []playlist.PlaylistInfo
+-
+ 	// When search is active, show only search results.
+ 	if p.searchResults != nil {
++		var out []playlist.PlaylistInfo
+ 		for i, s := range p.searchResults {
+ 			out = append(out, p.catalogEntry("s", i, s))
+ 		}
+ 		return out, nil
+ 	}
++	return p.basePlaylistsLocked(), nil
++}
++
++// basePlaylistsLocked returns the unfiltered list (local stations, favorites,
++// catalog) regardless of search state. Caller must hold p.mu.
++func (p *Provider) basePlaylistsLocked() []playlist.PlaylistInfo {
++	var out []playlist.PlaylistInfo
+ 
+ 	// Local stations.
+ 	for i, s := range p.stations {
+@@ -107,7 +113,7 @@ func (p *Provider) Playlists() ([]playlist.PlaylistInfo, error) {
+ 		out = append(out, p.catalogEntry("c", i, s))
+ 	}
+ 
+-	return out, nil
++	return out
+ }
+ 
+ // catalogEntry builds a PlaylistInfo for a CatalogStation, marking favorites with ★.
 diff --git a/ipc/client.go b/ipc/client.go
 index f41c118..a8dec80 100644
 --- a/ipc/client.go
@@ -969,10 +2215,10 @@ index 3fb4bb4..fdaefc7 100644
  		t.Run(r.Cmd, func(t *testing.T) {
 diff --git a/ipc/gui.go b/ipc/gui.go
 new file mode 100644
-index 0000000..416328e
+index 0000000..6f5c15f
 --- /dev/null
 +++ b/ipc/gui.go
-@@ -0,0 +1,612 @@
+@@ -0,0 +1,680 @@
 +package ipc
 +
 +// gui.go — GUI フロントエンド向けの拡張コマンド (api 1)。
@@ -989,11 +2235,14 @@ index 0000000..416328e
 +// capabilities はサーバーだけで答える。
 +
 +import (
++	"encoding/base64"
 +	"errors"
 +	"fmt"
 +	"maps"
++	"slices"
 +	"strings"
 +	"time"
++	"unicode/utf8"
 +
 +	"cliamp/internal/playback"
 +	"cliamp/playlist"
@@ -1017,6 +2266,18 @@ index 0000000..416328e
 +// ErrNotFound は Catalog.Lyrics が歌詞を見つけられなかったときに返す。
 +// 応答の error は "not found" になる。
 +var ErrNotFound = errors.New("not found")
++
++// ErrStale は、添字で指した曲が要求の path と違う (GUI の写しが古い) ときに
++// 返す。応答の error は "stale" になる。何も変えずに断るので、GUI はリストを
++// 取り直してから選び直す。
++var ErrStale = errors.New("stale")
++
++// PathMismatch は、要求の path (want) が空でなく、添字の曲の path と違うかを
++// 返す。JSON は UTF-8 でないバイトを U+FFFD に置き換えて運ぶので、同じ置き換えを
++// してから比べる。
++func PathMismatch(trackPath, want string) bool {
++	return want != "" && strings.ToValidUTF8(trackPath, "\uFFFD") != want
++}
 +
 +// SourceInfo はいま読み込まれているリストの出どころ。
 +type SourceInfo struct {
@@ -1062,19 +2323,30 @@ index 0000000..416328e
 +	History(limit int) ([]TrackInfo, error)
 +	PlaylistAdd(name string, tracks []playlist.Track) error
 +	PlaylistDelete(name string) error
-+	PlaylistRemoveTrack(name string, index int) error
++	// PlaylistRemoveTrack は index の曲を消す。path が空でなく、その曲の path と
++	// 違えば何もせずに ErrStale を返す。
++	PlaylistRemoveTrack(name string, index int, path string) error
 +}
 +
-+// SetCatalog はカタログ系コマンドの実装を差し込む。無ければ
-+// カタログ系は "catalog not enabled" を返す。
-+func (s *Server) SetCatalog(c Catalog) {
-+	s.catalog = c
++// Options は NewServerWith に渡す、受け付けを始める前に決めておく設定。
++// 受け付けを始めてから差し込むと、その間に繋いだ接続が差し込む前の値を
++// 読む (capabilities にカタログ系が載らず、GUI は繋ぎ直すまで出さない)。
++type Options struct {
++	// Plugins は Lua プラグインのコマンド (無ければ nil。型付きの nil を
++	// 入れないこと)。
++	Plugins PluginDispatcher
++	// Catalog はカタログ系コマンドの実装。無ければカタログ系は
++	// "catalog not enabled" を返す。
++	Catalog Catalog
++	// EQPresets は capabilities で返す組み込み EQ プリセットの名前 (表示順)。
++	// ui/model を import すると循環するため、外から渡す。
++	EQPresets []string
 +}
 +
-+// SetEQPresets は capabilities で返す組み込み EQ プリセットの名前 (表示順)。
-+// ui/model を import すると循環するため、外から渡す。
-+func (s *Server) SetEQPresets(names []string) {
-+	s.eqPresets = append([]string(nil), names...)
++func (s *Server) applyOptions(o Options) {
++	s.plugins = o.Plugins
++	s.catalog = o.Catalog
++	s.eqPresets = slices.Clone(o.EQPresets)
 +}
 +
 +// 状態系の要求。どれも Reply は容量 1 で、処理側は必ず 1 回だけ答える
@@ -1087,8 +2359,10 @@ index 0000000..416328e
 +}
 +
 +// PlayIndexMsg はリスト上の添字 Index の曲を再生する (TUI の行で Enter)。
++// Path が空でなければ、Index の曲がその path でないとき ErrStale で断る。
 +type PlayIndexMsg struct {
 +	Index int
++	Path  string
 +	Reply chan Response
 +}
 +
@@ -1109,17 +2383,20 @@ index 0000000..416328e
 +
 +// QueueEditMsg は「次に再生」の待ち行列を編集する。Mode は
 +// "add" / "remove" (Index はリスト上の添字)、"move" (Index と To は
-+// 待ち行列の位置)、"clear"。
++// 待ち行列の位置)、"clear"。Path が空でなければ、add/remove では Index の曲、
++// move では待ち行列の位置 Index の曲がその path でないとき ErrStale で断る。
 +type QueueEditMsg struct {
 +	Mode  string
 +	Index int
 +	To    int
++	Path  string
 +	Reply chan Response
 +}
 +
-+// RemoveMsg はリストから添字 Index の曲を消す。
++// RemoveMsg はリストから添字 Index の曲を消す。Path は PlayIndexMsg と同じ。
 +type RemoveMsg struct {
 +	Index int
++	Path  string
 +	Reply chan Response
 +}
 +
@@ -1135,7 +2412,9 @@ index 0000000..416328e
 +	}
 +}
 +
-+// NewTrackInfo は playlist.Track を IPC の形にする。
++// NewTrackInfo は playlist.Track を IPC の形にする。path が UTF-8 でなければ
++// (Windows の zip から出した Shift_JIS の名前など)、JSON で壊れないよう元の
++// バイト列を path_raw に base64 で入れ、path は表示用に置き換えた文字列にする。
 +func NewTrackInfo(t playlist.Track) TrackInfo {
 +	ti := TrackInfo{
 +		Title:       t.Title,
@@ -1155,13 +2434,35 @@ index 0000000..416328e
 +	if len(t.ProviderMeta) > 0 {
 +		ti.Meta = maps.Clone(t.ProviderMeta)
 +	}
++	if !utf8.ValidString(t.Path) {
++		ti.PathRaw = base64.StdEncoding.EncodeToString([]byte(t.Path))
++		ti.Path = strings.ToValidUTF8(t.Path, "\uFFFD")
++	}
 +	return ti
 +}
 +
-+// ToTrack は NewTrackInfo の逆。Queued と PlayedAt は捨てる。
++// trackPath は path_raw があればそれを戻したもの、無ければ path を返す。
++func (ti TrackInfo) trackPath() (string, error) {
++	if ti.PathRaw == "" {
++		return ti.Path, nil
++	}
++	raw, err := base64.StdEncoding.DecodeString(ti.PathRaw)
++	if err != nil {
++		return "", err
++	}
++	return string(raw), nil
++}
++
++// ToTrack は NewTrackInfo の逆。Queued と PlayedAt は捨てる。path_raw が
++// 壊れていれば path をそのまま使う (受け付けるかどうかは tracksFromRequest が
++// 先に見る)。
 +func (ti TrackInfo) ToTrack() playlist.Track {
++	path, err := ti.trackPath()
++	if err != nil {
++		path = ti.Path
++	}
 +	t := playlist.Track{
-+		Path:         ti.Path,
++		Path:         path,
 +		Title:        ti.Title,
 +		Artist:       ti.Artist,
 +		Album:        ti.Album,
@@ -1211,13 +2512,18 @@ index 0000000..416328e
 +	return out
 +}
 +
-+// tracksFromRequest は GUI から来た曲を playlist.Track にする。path の無い曲は
-+// 受け付けない。http(s) の URL で yt-dlp で再生しないものは stream を立てる
-+// (立っていないと TUI が Update の中で同期的に HTTP を開き、固まるため)。
++// tracksFromRequest は GUI から来た曲を playlist.Track にする。path の無い曲と
++// path_raw の壊れた曲は受け付けない。http(s) の URL で yt-dlp で再生しないものは
++// stream を立てる (立っていないと TUI が Update の中で同期的に HTTP を開き、
++// 固まるため)。
 +func tracksFromRequest(in []TrackInfo) ([]playlist.Track, error) {
 +	out := make([]playlist.Track, 0, len(in))
 +	for i, ti := range in {
-+		if strings.TrimSpace(ti.Path) == "" {
++		path, err := ti.trackPath()
++		if err != nil {
++			return nil, fmt.Errorf("track %d has a bad path_raw", i)
++		}
++		if strings.TrimSpace(path) == "" {
 +			return nil, fmt.Errorf("track %d has no path", i)
 +		}
 +		t := ti.ToTrack()
@@ -1318,8 +2624,7 @@ index 0000000..416328e
 +			return Response{OK: false, Error: "play_index requires an index"}, true
 +		}
 +		reply := make(chan Response, 1)
-+		s.disp.Send(PlayIndexMsg{Index: *req.Index, Reply: reply})
-+		return waitReply(reply, s.done), true
++		return s.sendAndWait(PlayIndexMsg{Index: *req.Index, Path: req.Path, Reply: reply}, reply), true
 +
 +	case "replace":
 +		tracks, err := tracksFromRequest(req.Tracks)
@@ -1359,11 +2664,10 @@ index 0000000..416328e
 +			return Response{OK: false, Error: fmt.Sprintf("enqueue: unknown mode %q", req.Mode)}, true
 +		}
 +		reply := make(chan Response, 1)
-+		s.disp.Send(EnqueueMsg{Tracks: tracks, Mode: mode, Reply: reply})
-+		return waitReply(reply, s.done), true
++		return s.sendAndWait(EnqueueMsg{Tracks: tracks, Mode: mode, Reply: reply}, reply), true
 +
 +	case "queue_edit":
-+		msg := QueueEditMsg{Mode: strings.ToLower(req.Mode), Index: -1, To: -1}
++		msg := QueueEditMsg{Mode: strings.ToLower(req.Mode), Index: -1, To: -1, Path: req.Path}
 +		switch msg.Mode {
 +		case "add", "remove":
 +			if req.Index == nil {
@@ -1388,7 +2692,7 @@ index 0000000..416328e
 +			return Response{OK: false, Error: "remove requires an index"}, true
 +		}
 +		reply := make(chan Response, 1)
-+		s.disp.Send(RemoveMsg{Index: *req.Index, Reply: reply})
++		s.disp.Send(RemoveMsg{Index: *req.Index, Path: req.Path, Reply: reply})
 +		return waitReply(reply, s.done), true
 +
 +	case "providers":
@@ -1534,7 +2838,7 @@ index 0000000..416328e
 +		}
 +		index := *req.Index
 +		return s.runCatalog(func(c Catalog) Response {
-+			if err := c.PlaylistRemoveTrack(req.Name, index); err != nil {
++			if err := c.PlaylistRemoveTrack(req.Name, index, req.Path); err != nil {
 +				return catalogError(err)
 +			}
 +			return Response{OK: true}
@@ -1546,7 +2850,17 @@ index 0000000..416328e
 +// replace は ReplaceMsg を送り、答えを待つ (replace と load_provider で共用)。
 +func (s *Server) replace(tracks []playlist.Track, start int, src SourceInfo) Response {
 +	reply := make(chan Response, 1)
-+	s.disp.Send(ReplaceMsg{Tracks: tracks, Index: start, Source: src, Reply: reply})
++	return s.sendAndWait(ReplaceMsg{Tracks: tracks, Index: start, Source: src, Reply: reply}, reply)
++}
++
++// sendAndWait は再生を始めうる要求 (play_index, replace, enqueue) を送り、
++// 答えを待つ。daemon の Send は答えを入れたあとも再生の準備 (yt-dlp なら
++// 数秒) が終わるまで戻らないので、Send を別の goroutine で呼び、答えが
++// 入った時点で返す (Send が戻るのを待つと 3 秒の上限が効かず、GUI は
++// 成功した操作を失敗と表示する)。答えは状態を変えたあとに入るので、同じ
++// 接続の次の要求はその変更を見る。
++func (s *Server) sendAndWait(msg any, reply chan Response) Response {
++	go s.disp.Send(msg)
 +	return waitReply(reply, s.done)
 +}
 +
@@ -1587,10 +2901,10 @@ index 0000000..416328e
 +}
 diff --git a/ipc/gui_client_test.go b/ipc/gui_client_test.go
 new file mode 100644
-index 0000000..886c3e0
+index 0000000..49de082
 --- /dev/null
 +++ b/ipc/gui_client_test.go
-@@ -0,0 +1,128 @@
+@@ -0,0 +1,127 @@
 +package ipc
 +
 +import (
@@ -1704,12 +3018,11 @@ index 0000000..886c3e0
 +// 本物のソケットで答えることを確かめる。
 +func TestCapabilitiesOverSocket(t *testing.T) {
 +	sock := filepath.Join(t.TempDir(), "cliamp.sock")
-+	srv, err := NewServer(sock, &captureDispatcher{})
++	srv, err := NewServerWith(sock, &captureDispatcher{}, Options{EQPresets: []string{"Flat"}})
 +	if err != nil {
-+		t.Fatalf("NewServer: %v", err)
++		t.Fatalf("NewServerWith: %v", err)
 +	}
 +	t.Cleanup(func() { _ = srv.Close() })
-+	srv.SetEQPresets([]string{"Flat"})
 +
 +	resp, err := Send(sock, Request{Cmd: "capabilities"})
 +	if err != nil {
@@ -1721,10 +3034,10 @@ index 0000000..886c3e0
 +}
 diff --git a/ipc/gui_test.go b/ipc/gui_test.go
 new file mode 100644
-index 0000000..5ba0b96
+index 0000000..24007c9
 --- /dev/null
 +++ b/ipc/gui_test.go
-@@ -0,0 +1,715 @@
+@@ -0,0 +1,796 @@
 +package ipc
 +
 +import (
@@ -1755,10 +3068,10 @@ index 0000000..5ba0b96
 +	block     chan struct{} // 閉じられるまで Tracks を待たせる
 +	panicMsg  string
 +
-+	gotProvider, gotID, gotQuery, gotName string
-+	gotLimit, gotIndex                    int
-+	gotTracks                             []playlist.Track
-+	calls                                 []string
++	gotProvider, gotID, gotQuery, gotName, gotPath string
++	gotLimit, gotIndex                             int
++	gotTracks                                      []playlist.Track
++	calls                                          []string
 +}
 +
 +func (f *fakeCatalog) Providers() []ProviderInfo {
@@ -1814,23 +3127,23 @@ index 0000000..5ba0b96
 +	return f.err
 +}
 +
-+func (f *fakeCatalog) PlaylistRemoveTrack(name string, index int) error {
++func (f *fakeCatalog) PlaylistRemoveTrack(name string, index int, path string) error {
 +	f.calls = append(f.calls, "playlist_remove_track")
-+	f.gotName, f.gotIndex = name, index
++	f.gotName, f.gotIndex, f.gotPath = name, index, path
 +	return f.err
 +}
 +
 +func newGUITestServer(disp Dispatcher, cat Catalog) *Server {
 +	s := newTestServer(disp)
 +	if cat != nil {
-+		s.SetCatalog(cat)
++		s.applyOptions(Options{Catalog: cat})
 +	}
 +	return s
 +}
 +
 +func TestDispatchCapabilities(t *testing.T) {
-+	s := newGUITestServer(&captureDispatcher{}, &fakeCatalog{})
-+	s.SetEQPresets([]string{"Flat", "Rock"})
++	s := newTestServer(&captureDispatcher{})
++	s.applyOptions(Options{Catalog: &fakeCatalog{}, EQPresets: []string{"Flat", "Rock"}})
 +	resp := s.dispatch(Request{Cmd: "capabilities"})
 +	if !resp.OK || resp.API != APIVersion {
 +		t.Fatalf("capabilities = %+v, want ok api=%d", resp, APIVersion)
@@ -2272,8 +3585,12 @@ index 0000000..5ba0b96
 +	if resp := s.dispatch(Request{Cmd: "playlist_delete", Name: "old"}); !resp.OK || cat.gotName != "old" {
 +		t.Fatalf("playlist_delete = %+v", resp)
 +	}
-+	if resp := s.dispatch(Request{Cmd: "playlist_remove_track", Name: "list", Index: intPtr(0)}); !resp.OK || cat.gotName != "list" || cat.gotIndex != 0 {
++	if resp := s.dispatch(Request{Cmd: "playlist_remove_track", Name: "list", Index: intPtr(0)}); !resp.OK || cat.gotName != "list" || cat.gotIndex != 0 || cat.gotPath != "" {
 +		t.Fatalf("playlist_remove_track = %+v", resp)
++	}
++	// path を付けると、その曲か確かめてから消すよう Catalog に渡す。
++	if resp := s.dispatch(Request{Cmd: "playlist_remove_track", Name: "list", Index: intPtr(1), Path: "/b.flac"}); !resp.OK || cat.gotPath != "/b.flac" {
++		t.Fatalf("playlist_remove_track with path = %+v (path %q)", resp, cat.gotPath)
 +	}
 +	cat.err = errors.New("track index 9 out of range")
 +	if resp := s.dispatch(Request{Cmd: "playlist_remove_track", Name: "list", Index: intPtr(9)}); resp.OK || !strings.Contains(resp.Error, "out of range") {
@@ -2440,8 +3757,85 @@ index 0000000..5ba0b96
 +		t.Fatalf("plain response = %s, want {\"ok\":true}", data)
 +	}
 +}
++
++// UTF-8 でない path (Shift_JIS の名前など) は JSON で壊れるので、元のバイト列を
++// path_raw で運び、送り返されたら元に戻す。
++func TestTrackInfoNonUTF8PathRoundTrip(t *testing.T) {
++	raw := "/home/u/Music/\x8b\xc8.mp3"
++	ti := NewTrackInfo(playlist.Track{Path: raw, Title: "曲"})
++	if ti.PathRaw == "" || !utf8ValidForTest(ti.Path) {
++		t.Fatalf("TrackInfo = %+v, want path_raw and a valid UTF-8 path", ti)
++	}
++	data, err := json.Marshal(Request{Cmd: "replace", Tracks: []TrackInfo{ti}})
++	if err != nil {
++		t.Fatal(err)
++	}
++	var req Request
++	if err := json.Unmarshal(data, &req); err != nil {
++		t.Fatal(err)
++	}
++	tracks, err := tracksFromRequest(req.Tracks)
++	if err != nil || len(tracks) != 1 || tracks[0].Path != raw {
++		t.Fatalf("tracksFromRequest = %q, %v; want %q", tracks[0].Path, err, raw)
++	}
++	// load_provider はメモリ上で往復する。
++	if got := ti.ToTrack().Path; got != raw {
++		t.Fatalf("ToTrack().Path = %q, want %q", got, raw)
++	}
++	// UTF-8 の path には path_raw を付けない。
++	if ti := NewTrackInfo(playlist.Track{Path: "/m/曲.mp3"}); ti.PathRaw != "" || ti.Path != "/m/曲.mp3" {
++		t.Fatalf("valid path = %+v", ti)
++	}
++	// 壊れた path_raw は受け付けない。
++	if _, err := tracksFromRequest([]TrackInfo{{Path: "/m/x", PathRaw: "!!"}}); err == nil || !strings.Contains(err.Error(), "path_raw") {
++		t.Fatalf("bad path_raw err = %v", err)
++	}
++	// path が空でも path_raw があればよい。
++	if tracks, err := tracksFromRequest([]TrackInfo{{PathRaw: ti.PathRaw}}); err != nil || tracks[0].Path != raw {
++		t.Fatalf("path_raw only = %v, %v", tracks, err)
++	}
++}
++
++func utf8ValidForTest(s string) bool { return strings.ToValidUTF8(s, "") == s }
++
++func TestPathMismatch(t *testing.T) {
++	raw := "/m/\x8b\xc8.mp3"
++	mangled := NewTrackInfo(playlist.Track{Path: raw}).Path
++	for _, tt := range []struct {
++		track, want string
++		mismatch    bool
++	}{
++		{"/m/a.flac", "", false},
++		{"/m/a.flac", "/m/a.flac", false},
++		{"/m/a.flac", "/m/b.flac", true},
++		{raw, mangled, false}, // GUI は JSON で置き換わった path しか知らない
++		{raw, "/m/other.mp3", true},
++	} {
++		if got := PathMismatch(tt.track, tt.want); got != tt.mismatch {
++			t.Errorf("PathMismatch(%q, %q) = %v, want %v", tt.track, tt.want, got, tt.mismatch)
++		}
++	}
++}
++
++// 添字で指す要求は、GUI が見た曲の path を確かめ用にそのまま渡す。
++func TestDispatchPassesPathPrecondition(t *testing.T) {
++	disp := &captureDispatcher{autoReply: Response{OK: true}}
++	s := newGUITestServer(disp, nil)
++	s.dispatch(Request{Cmd: "play_index", Index: intPtr(1), Path: "/b.flac"})
++	if got := disp.last.(PlayIndexMsg); got.Path != "/b.flac" {
++		t.Fatalf("PlayIndexMsg = %+v", got)
++	}
++	s.dispatch(Request{Cmd: "remove", Index: intPtr(1), Path: "/b.flac"})
++	if got := disp.last.(RemoveMsg); got.Path != "/b.flac" {
++		t.Fatalf("RemoveMsg = %+v", got)
++	}
++	s.dispatch(Request{Cmd: "queue_edit", Mode: "move", Index: intPtr(0), To: intPtr(1), Path: "/c.flac"})
++	if got := disp.last.(QueueEditMsg); got.Path != "/c.flac" {
++		t.Fatalf("QueueEditMsg = %+v", got)
++	}
++}
 diff --git a/ipc/protocol.go b/ipc/protocol.go
-index aac71fc..e6ade82 100644
+index aac71fc..b4e9a66 100644
 --- a/ipc/protocol.go
 +++ b/ipc/protocol.go
 @@ -17,6 +17,19 @@ type Request struct {
@@ -2489,7 +3883,7 @@ index aac71fc..e6ade82 100644
  }
  
  // ThemeInfo carries the active theme name and its resolved hex colors.
-@@ -65,10 +96,27 @@ type PluginDispatcher interface {
+@@ -65,10 +96,30 @@ type PluginDispatcher interface {
  }
  
  // TrackInfo is the track metadata in a status response.
@@ -2514,11 +3908,14 @@ index aac71fc..e6ade82 100644
 +	Meta        map[string]string `json:"meta,omitempty"`
 +	Queued      int               `json:"queued,omitempty"`
 +	PlayedAt    string            `json:"played_at,omitempty"`
++	// PathRaw は path が UTF-8 でないときだけ、元のバイト列を base64 で持つ
++	// (path は表示用に置き換えた文字列になる)。受け手はそのまま送り返す。
++	PathRaw string `json:"path_raw,omitempty"`
  }
  
  // DispatcherFunc adapts a plain function to the Dispatcher interface.
 diff --git a/ipc/server.go b/ipc/server.go
-index e1c1f41..2387969 100644
+index e1c1f41..340e846 100644
 --- a/ipc/server.go
 +++ b/ipc/server.go
 @@ -3,6 +3,7 @@ package ipc
@@ -2529,22 +3926,87 @@ index e1c1f41..2387969 100644
  	"fmt"
  	"net"
  	"os"
-@@ -30,7 +31,12 @@ type Server struct {
+@@ -30,7 +31,19 @@ type Server struct {
  	disp     Dispatcher
  	plugins  PluginDispatcher
  	done     chan struct{}
 -	wg       sync.WaitGroup
 +
-+	// GUI 拡張 (gui.go)
++	// GUI 拡張 (gui.go)。受け付けを始める前に NewServerWith で決め、後から変えない。
 +	catalog   Catalog
 +	eqPresets []string
++
++	// 開いている接続 (shutdown.go)。Close で閉じないと、status を送り続ける
++	// GUI がいる限り wg.Wait が戻らない。
++	connMu    sync.Mutex
++	conns     map[net.Conn]struct{}
++	closed    bool
++	closeOnce sync.Once
 +
 +	wg sync.WaitGroup
  }
  
  // SetPluginDispatcher wires in the Lua plugin manager after the server starts.
-@@ -119,6 +125,8 @@ func (s *Server) handleConn(conn net.Conn) {
- 	defer conn.Close()
+@@ -42,6 +55,12 @@ func (s *Server) SetPluginDispatcher(p PluginDispatcher) {
+ // NewServer creates and starts the IPC server. It cleans up stale sockets
+ // before binding. The socket is created with 0600 permissions (owner only).
+ func NewServer(sockPath string, disp Dispatcher) (*Server, error) {
++	return NewServerWith(sockPath, disp, Options{})
++}
++
++// NewServerWith は NewServer に、受け付けを始める前に決めておく設定を足したもの
++// (gui.go の Options)。後から Set… で差し込むと、その間に繋いだ接続と競合する。
++func NewServerWith(sockPath string, disp Dispatcher, opts Options) (*Server, error) {
+ 	if err := cleanStaleSocket(sockPath); err != nil {
+ 		return nil, err
+ 	}
+@@ -77,6 +96,7 @@ func NewServer(sockPath string, disp Dispatcher) (*Server, error) {
+ 		disp:     disp,
+ 		done:     make(chan struct{}),
+ 	}
++	s.applyOptions(opts)
+ 
+ 	s.wg.Add(1)
+ 	go s.acceptLoop()
+@@ -85,11 +105,15 @@ func NewServer(sockPath string, disp Dispatcher) (*Server, error) {
+ 
+ // Close shuts down the server, removes socket and PID file.
+ func (s *Server) Close() error {
+-	close(s.done)
+-	err := s.listener.Close()
+-	s.wg.Wait()
+-	os.Remove(s.sockPath)
+-	os.Remove(s.sockPath + ".pid")
++	var err error
++	s.closeOnce.Do(func() {
++		close(s.done)
++		err = s.listener.Close()
++		s.closeConns()
++		s.wg.Wait()
++		os.Remove(s.sockPath)
++		os.Remove(s.sockPath + ".pid")
++	})
+ 	return err
+ }
+ 
+@@ -107,7 +131,10 @@ func (s *Server) acceptLoop() {
+ 				continue
+ 			}
+ 		}
+-		s.wg.Add(1)
++		if !s.trackConn(conn) {
++			conn.Close()
++			return
++		}
+ 		go s.handleConn(conn)
+ 	}
+ }
+@@ -116,9 +143,11 @@ func (s *Server) acceptLoop() {
+ // dispatches them, and writes JSON responses.
+ func (s *Server) handleConn(conn net.Conn) {
+ 	defer s.wg.Done()
+-	defer conn.Close()
++	defer s.untrackConn(conn)
  
  	scanner := bufio.NewScanner(conn)
 +	// GUI の replace は曲の一覧を 1 行で送るので、既定の 64 KiB では足りない。
@@ -2552,7 +4014,7 @@ index e1c1f41..2387969 100644
  
  	for {
  		// Per-request deadline so long-lived streaming clients (e.g. vis bands
-@@ -126,6 +134,11 @@ func (s *Server) handleConn(conn net.Conn) {
+@@ -126,6 +155,11 @@ func (s *Server) handleConn(conn net.Conn) {
  		// time out.
  		conn.SetReadDeadline(time.Now().Add(60 * time.Second))
  		if !scanner.Scan() {
@@ -2564,7 +4026,7 @@ index e1c1f41..2387969 100644
  			return
  		}
  		line := scanner.Bytes()
-@@ -303,6 +316,9 @@ func (s *Server) dispatch(req Request) Response {
+@@ -303,6 +337,9 @@ func (s *Server) dispatch(req Request) Response {
  		return Response{OK: true, Items: s.plugins.CommandList()}
  
  	default:
@@ -2574,8 +4036,256 @@ index e1c1f41..2387969 100644
  		return Response{OK: false, Error: "unknown command: " + req.Cmd}
  	}
  }
+diff --git a/ipc/shutdown.go b/ipc/shutdown.go
+new file mode 100644
+index 0000000..917d5d0
+--- /dev/null
++++ b/ipc/shutdown.go
+@@ -0,0 +1,49 @@
++package ipc
++
++// shutdown.go — Close で開いている接続を閉じるための記録。
++//
++// handleConn は EOF・読み取りの失敗・60 秒の無通信でしか戻らない。GUI は
++// status を 1 本の接続で送り続けるので、接続を閉じずに wg.Wait すると
++// Close が戻らない (TUI を終えても daemon に SIGTERM を送っても cliamp が
++// 終わらず、ソケットだけ消えて PID ファイルが残り、次に起動した cliamp が
++// IPC 無しで動く)。Close は接続を閉じてから待つ。読みかけの要求は
++// 読み取りの失敗で終わり、処理中の要求は s.done で待ちを切り上げる。
++
++import "net"
++
++// trackConn は受け付けた接続を記録し、wg に数える。Close の後なら記録せず
++// false を返す (呼ぶ側が閉じる)。判定と wg.Add を同じ鍵の中で行うので、
++// Close の直前に受け付けた接続も取りこぼさない。
++func (s *Server) trackConn(conn net.Conn) bool {
++	s.connMu.Lock()
++	defer s.connMu.Unlock()
++	if s.closed {
++		return false
++	}
++	if s.conns == nil {
++		s.conns = make(map[net.Conn]struct{})
++	}
++	s.conns[conn] = struct{}{}
++	s.wg.Add(1)
++	return true
++}
++
++// untrackConn は接続の記録を消して閉じる。
++func (s *Server) untrackConn(conn net.Conn) {
++	s.connMu.Lock()
++	delete(s.conns, conn)
++	s.connMu.Unlock()
++	conn.Close()
++}
++
++// closeConns は記録にある接続をすべて閉じ、以後の接続を受け付けない。
++// 読み取りの期限を今にするだけでは足りない (handleConn は要求のたびに
++// 期限を 60 秒先へ延ばすので、上書きされうる)。
++func (s *Server) closeConns() {
++	s.connMu.Lock()
++	defer s.connMu.Unlock()
++	s.closed = true
++	for c := range s.conns {
++		c.Close()
++	}
++}
+diff --git a/ipc/shutdown_test.go b/ipc/shutdown_test.go
+new file mode 100644
+index 0000000..b20f22a
+--- /dev/null
++++ b/ipc/shutdown_test.go
+@@ -0,0 +1,187 @@
++package ipc
++
++import (
++	"bufio"
++	"encoding/json"
++	"net"
++	"os"
++	"path/filepath"
++	"slices"
++	"sync"
++	"testing"
++	"time"
++)
++
++// statusDispatcher は status にすぐ答える (daemon の Send は runDaemon が
++// 戻ったあとも答え続ける。TUI も Update が生きている間は同じ)。
++type statusDispatcher struct{}
++
++func (statusDispatcher) Send(msg any) {
++	if m, ok := msg.(StatusRequestMsg); ok {
++		m.Reply <- Response{OK: true, State: "playing"}
++	}
++}
++
++// exitedDispatcher は Bubbletea のプログラムが終わったあとの TUI: prog.Send は
++// すぐ戻り、誰も答えない。
++type exitedDispatcher struct{}
++
++func (exitedDispatcher) Send(any) {}
++
++// pollStatus は GUI (cliamp_music/client.py の _poll_loop) と同じく、1 本の
++// 接続で status を送り続ける。ok:false ("server shutting down") が返っても
++// 接続を保つ。接続が切られたら戻る。
++func pollStatus(sock string, interval time.Duration, first chan<- struct{}, done chan<- struct{}) {
++	defer close(done)
++	var once sync.Once
++	signal := func() { once.Do(func() { close(first) }) }
++	defer signal()
++	conn, err := net.Dial("unix", sock)
++	if err != nil {
++		return
++	}
++	defer conn.Close()
++	r := bufio.NewReader(conn)
++	for {
++		if _, err := conn.Write([]byte(`{"cmd":"status"}` + "\n")); err != nil {
++			return
++		}
++		if _, err := r.ReadString('\n'); err != nil {
++			return
++		}
++		signal()
++		time.Sleep(interval)
++	}
++}
++
++// GUI が status を送り続けていても Close はすぐ戻り (TUI を q で終えたとき、
++// daemon に SIGTERM を送ったとき)、ソケットと PID ファイルを消し、GUI の
++// 接続は切れる。戻らないと cliamp が終わらず、次に起動した cliamp が
++// 「already running」で IPC 無しになる。
++func TestCloseWhileGUIPollsStatus(t *testing.T) {
++	for _, tt := range []struct {
++		name string
++		disp Dispatcher
++	}{
++		{"daemon", statusDispatcher{}},
++		{"tui exited", exitedDispatcher{}},
++	} {
++		t.Run(tt.name, func(t *testing.T) {
++			sock := filepath.Join(t.TempDir(), "c.sock")
++			srv, err := NewServer(sock, tt.disp)
++			if err != nil {
++				t.Fatalf("NewServer: %v", err)
++			}
++			first, pollerDone := make(chan struct{}), make(chan struct{})
++			go pollStatus(sock, 20*time.Millisecond, first, pollerDone)
++			<-first
++
++			closed := make(chan struct{})
++			go func() { _ = srv.Close(); close(closed) }()
++			select {
++			case <-closed:
++			case <-time.After(time.Second):
++				t.Fatal("Server.Close() did not return within 1s while a client kept polling status")
++			}
++			select {
++			case <-pollerDone:
++			case <-time.After(time.Second):
++				t.Fatal("the polling client's connection was not closed")
++			}
++			for _, p := range []string{sock, sock + ".pid"} {
++				if _, err := os.Stat(p); !os.IsNotExist(err) {
++					t.Errorf("%s still exists after Close (err=%v)", p, err)
++				}
++			}
++			// 次の cliamp はそのまま起動できる。
++			srv2, err := NewServer(sock, tt.disp)
++			if err != nil {
++				t.Fatalf("restart: %v", err)
++			}
++			_ = srv2.Close()
++		})
++	}
++}
++
++func TestCloseTwice(t *testing.T) {
++	srv, err := NewServer(filepath.Join(t.TempDir(), "c.sock"), statusDispatcher{})
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := srv.Close(); err != nil {
++		t.Fatalf("first Close: %v", err)
++	}
++	_ = srv.Close() // 2 度目も止まらず、panic しない
++}
++
++// NewServerWith で渡した設定は、受け付けを始めた直後に繋いだ接続にも
++// 見える (後から差し込むと、その間の接続は capabilities にカタログ系が
++// 載らず、GUI は繋ぎ直すまで出さない。-race でも競合しない)。
++func TestNewServerWithOptionsVisibleToFirstClient(t *testing.T) {
++	for i := range 20 {
++		sock := filepath.Join(t.TempDir(), "c.sock")
++		srv, err := NewServerWith(sock, statusDispatcher{}, Options{
++			Catalog:   &fakeCatalog{},
++			Plugins:   fakePlugins{},
++			EQPresets: []string{"Flat"},
++		})
++		if err != nil {
++			t.Fatal(err)
++		}
++		conn, err := net.Dial("unix", sock)
++		if err != nil {
++			t.Fatal(err)
++		}
++		conn.Write([]byte(`{"cmd":"capabilities"}` + "\n"))
++		line, err := bufio.NewReader(conn).ReadBytes('\n')
++		conn.Close()
++		srv.Close()
++		if err != nil {
++			t.Fatal(err)
++		}
++		var resp Response
++		if err := json.Unmarshal(line, &resp); err != nil {
++			t.Fatal(err)
++		}
++		if !slices.Contains(resp.Commands, "providers") || !slices.Contains(resp.Commands, "plugin.call") || !slices.Equal(resp.EQPresets, []string{"Flat"}) {
++			t.Fatalf("run %d: capabilities = %+v", i, resp)
++		}
++	}
++}
++
++// blockingAfterReplyDispatcher は daemon.Send の replace / play_index / enqueue:
++// 答えを入れてから、再生の準備 (yt-dlp なら数秒) が終わるまで Send から戻らない。
++type blockingAfterReplyDispatcher struct{ hold time.Duration }
++
++func (d blockingAfterReplyDispatcher) Send(msg any) {
++	var reply chan Response
++	switch m := msg.(type) {
++	case ReplaceMsg:
++		reply = m.Reply
++	case PlayIndexMsg:
++		reply = m.Reply
++	case EnqueueMsg:
++		reply = m.Reply
++	default:
++		return
++	}
++	SendReply(reply, Response{OK: true})
++	time.Sleep(d.hold)
++}
++
++// 答えが入った時点で返す (Send が戻るのを待たない)。待つと daemon では
++// 再生の準備の間ずっと答えが返らず、GUI は成功した操作を失敗と表示する。
++func TestPlaybackCommandsAnswerBeforeSendReturns(t *testing.T) {
++	srv := newTestServer(blockingAfterReplyDispatcher{hold: 3 * time.Second})
++	for _, req := range []Request{
++		{Cmd: "replace", Tracks: []TrackInfo{{Path: "https://www.youtube.com/watch?v=x"}}},
++		{Cmd: "play_index", Index: intPtr(0)},
++		{Cmd: "enqueue", Mode: "now", Tracks: []TrackInfo{{Path: "/a.flac"}}},
++	} {
++		start := time.Now()
++		resp := srv.dispatch(req)
++		if took := time.Since(start); !resp.OK || took > time.Second {
++			t.Fatalf("%s answered %+v after %v although the dispatcher replied at once", req.Cmd, resp, took)
++		}
++	}
++}
 diff --git a/main.go b/main.go
-index daeb523..f97f6fe 100644
+index daeb523..db0ccea 100644
 --- a/main.go
 +++ b/main.go
 @@ -246,7 +246,7 @@ func run(overrides config.Overrides, positional []string, daemon bool) error {
@@ -2587,20 +4297,419 @@ index daeb523..f97f6fe 100644
  	}
  
  	themes := theme.LoadAll()
-@@ -375,6 +375,7 @@ func run(overrides config.Overrides, positional []string, daemon bool) error {
- 		if luaMgr != nil {
- 			ipcSrv.SetPluginDispatcher(luaMgr)
- 		}
-+		installGUIIPC(ipcSrv, newGUICatalog(providers, localProv))
+@@ -367,14 +367,12 @@ func run(overrides config.Overrides, positional []string, daemon bool) error {
+ 		})
+ 	}
+ 
+-	ipcSrv, ipcErr := ipc.NewServer(ipc.DefaultSocketPath(), ipc.DispatcherFunc(func(msg any) { prog.Send(msg) }))
++	ipcSrv, ipcErr := ipc.NewServerWith(ipc.DefaultSocketPath(), ipc.DispatcherFunc(func(msg any) { prog.Send(msg) }),
++		guiIPCOptions(luaMgr, newGUICatalog(providers, localProv)))
+ 	if ipcErr != nil {
+ 		fmt.Fprintf(os.Stderr, "ipc: %v\n", ipcErr)
+ 	} else {
+ 		defer ipcSrv.Close()
+-		if luaMgr != nil {
+-			ipcSrv.SetPluginDispatcher(luaMgr)
+-		}
  	}
  
  	finalModel, err := mediactl.Run(prog, svc)
+diff --git a/player/player.go b/player/player.go
+index 3065946..77b3281 100644
+--- a/player/player.go
++++ b/player/player.go
+@@ -48,8 +48,9 @@ type Player struct {
+ 	resampleQuality int
+ 	bitDepth        int // 16 or 32
+ 
+-	gaplessAdvance atomic.Bool  // set when gapless transition fires
+-	seekGen        atomic.Int64 // generation counter for yt-dlp seeks; incremented to cancel stale seeks
++	gaplessAdvance atomic.Bool   // set when gapless transition fires
++	seekGen        atomic.Int64  // generation counter for yt-dlp seeks; incremented to cancel stale seeks
++	playGen        atomic.Uint64 // bumped by every Play/PlayYTDL/Stop; a start that finishes after a newer one is discarded (supersede.go)
+ 
+ 	streamTitle      atomic.Value               // stores string, set by ICY reader callback
+ 	customFactories  map[string]StreamerFactory // URI scheme prefix -> factory (e.g. "spotify:" -> fn)
+@@ -95,17 +96,19 @@ func New(q Quality) (*Player, error) {
+ // knownDuration is the metadata duration (use 0 if unknown); it is used as a
+ // fallback when the decoder cannot determine the length (e.g. HTTP streams).
+ func (p *Player) Play(path string, knownDuration time.Duration) error {
++	gen := p.beginStart()
+ 	tp, err := p.buildPipeline(path)
+ 	if err != nil {
+ 		return err
+ 	}
+ 	tp.setKnownDuration(knownDuration)
+-	return p.playPipeline(tp)
++	return p.playPipeline(tp, gen)
+ }
+ 
+ // PlayYTDL starts playing a yt-dlp page URL via a piped yt-dlp | ffmpeg chain.
+ // Playback starts as soon as the first PCM samples arrive (~1-3s). Not seekable.
+ func (p *Player) PlayYTDL(pageURL string, knownDuration time.Duration) error {
++	gen := p.beginStart()
+ 	// Probe duration concurrently with pipeline setup so it doesn't delay playback.
+ 	probeCh := make(chan time.Duration, 1)
+ 	if knownDuration == 0 {
+@@ -132,25 +135,32 @@ func (p *Player) PlayYTDL(pageURL string, knownDuration time.Duration) error {
+ 		}
+ 	}
+ 	tp.knownDuration = knownDuration
+-	return p.playPipeline(tp)
++	return p.playPipeline(tp, gen)
+ }
+ 
+ // playPipeline wires a ready-to-play trackPipeline into the speaker chain.
+ // On the first call it builds the long-lived EQ → volume → tap → ctrl chain.
+ // Subsequent calls swap only the track source via the gapless streamer.
+-func (p *Player) playPipeline(tp *trackPipeline) error {
++// gen is the value beginStart returned; if a newer start or a Stop happened
++// while tp was being built, tp is discarded and ErrSuperseded is returned.
++func (p *Player) playPipeline(tp *trackPipeline, gen uint64) error {
+ 	// Collect old pipelines to close after releasing locks.
+ 	var oldCurrent, oldNext *trackPipeline
+ 
++	// Lock the speaker so the goroutine finishes any in-progress Stream()
++	// call before we swap the source and unpause. The ctrl.Paused write
++	// must happen under the speaker lock because the audio thread reads it
++	// on every Stream() call. The generation check is made under the same
++	// lock so a Stop or a newer start cannot slip in between check and swap.
++	speaker.Lock()
++	if p.playGen.Load() != gen {
++		speaker.Unlock()
++		go closePipelines(tp)
++		return ErrSuperseded
++	}
+ 	if p.started {
+-		// Lock the speaker so the goroutine finishes any in-progress Stream()
+-		// call before we swap the source and unpause. The ctrl.Paused write
+-		// must happen under the speaker lock because the audio thread reads it
+-		// on every Stream() call.
+-		speaker.Lock()
+ 		p.gapless.Replace(tp.stream)
+ 		p.ctrl.Paused = false
+-		speaker.Unlock()
+ 	}
+ 
+ 	p.mu.Lock()
+@@ -178,6 +188,7 @@ func (p *Player) playPipeline(tp *trackPipeline) error {
+ 		p.playing.Store(true)
+ 		p.paused.Store(false)
+ 		p.mu.Unlock()
++		speaker.Unlock() // speaker.Play takes the same lock
+ 
+ 		speaker.Play(p.ctrl)
+ 		go closePipelines(oldCurrent, oldNext)
+@@ -187,6 +198,7 @@ func (p *Player) playPipeline(tp *trackPipeline) error {
+ 	p.playing.Store(true)
+ 	p.paused.Store(false)
+ 	p.mu.Unlock()
++	speaker.Unlock()
+ 
+ 	// Close old resources asynchronously to avoid blocking the caller
+ 	// (UI thread) on slow Close() operations (ffmpeg wait, HTTP teardown).
+@@ -274,6 +286,8 @@ func (p *Player) TogglePause() {
+ // (outputting silence via the gapless streamer) so it can be restarted without
+ // rebuilding the pipeline.
+ func (p *Player) Stop() {
++	// Starts still being built must not swap themselves in after the stop.
++	p.invalidateStarts()
+ 	// Lock speaker to ensure the goroutine finishes any in-progress Stream()
+ 	// call, then clear the source and pause. After unlock, the speaker will
+ 	// only see silence from the gapless streamer (paused ctrl).
+@@ -465,25 +479,26 @@ func (p *Player) SeekYTDL(d time.Duration) error {
+ 	tp.knownDuration = cur.knownDuration
+ 	tp.ytdlSeek = true
+ 
+-	// Check if this seek was cancelled while we were building.
+-	if p.seekGen.Load() != gen {
+-		// A newer seek was requested — discard this result.
++	// Now acquire speaker lock to swap streams. Check under the same locks
++	// whether this seek was cancelled while we were building (a newer seek)
++	// or the track changed (Stop, or a new Play/PlayYTDL); if so, discard
++	// the result instead of swapping the old track back in.
++	speaker.Lock()
++	p.mu.Lock()
++	if p.seekGen.Load() != gen || p.current != cur {
++		p.mu.Unlock()
++		speaker.Unlock()
+ 		go closePipelines(tp)
+ 		return nil
+ 	}
+-
+-	// Now acquire speaker lock to swap streams.
+-	speaker.Lock()
+ 	p.gapless.Replace(tp.stream)
+ 	p.gapless.SetNext(nil)
+-	speaker.Unlock()
+-
+-	p.mu.Lock()
+ 	old := p.current
+ 	oldNext := p.nextPipeline
+ 	p.current = tp
+ 	p.nextPipeline = nil
+ 	p.mu.Unlock()
++	speaker.Unlock()
+ 	// Clean up old pipelines async to avoid blocking on process wait.
+ 	go closePipelines(old, oldNext)
+ 	return nil
+diff --git a/player/supersede.go b/player/supersede.go
+new file mode 100644
+index 0000000..ee2e4d9
+--- /dev/null
++++ b/player/supersede.go
+@@ -0,0 +1,25 @@
++package player
++
++// supersede.go — 古くなった再生の開始の結果を捨てる。
++//
++// Play / PlayYTDL はパイプラインを組んでから (yt-dlp なら数秒) 差し替える。
++// その間に Stop や別の曲の開始があると、遅れて終わった古い開始が新しい曲を
++// 上書きし、表示と違う曲が鳴っていた。開始と Stop のたびに playGen を進め、
++// 差し替える時点で自分の世代が最新でなければ捨てる。yt-dlp のシーク
++// (SeekYTDL) は、差し替える時点で曲が変わっていれば捨てる (player.go)。
++
++import "errors"
++
++// ErrSuperseded は、組み立て中に Stop や新しい開始があったため、その開始を
++// 捨てたことを示す。呼ぶ側にとっては失敗ではない (表示すべきエラーではない)。
++var ErrSuperseded = errors.New("player: start superseded")
++
++// beginStart は再生の開始の世代を進めて返す。
++func (p *Player) beginStart() uint64 {
++	return p.playGen.Add(1)
++}
++
++// invalidateStarts は組み立て中の開始をすべて無効にする (Stop)。
++func (p *Player) invalidateStarts() {
++	p.playGen.Add(1)
++}
+diff --git a/player/supersede_test.go b/player/supersede_test.go
+new file mode 100644
+index 0000000..bd44672
+--- /dev/null
++++ b/player/supersede_test.go
+@@ -0,0 +1,214 @@
++package player
++
++import (
++	"encoding/binary"
++	"errors"
++	"math"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/gopxl/beep/v2"
++)
++
++// newSilentPlayer は New と同じ Player を speaker.Init なしで作る
++// (音の出る機器を開かない)。
++func newSilentPlayer() *Player {
++	p := &Player{sr: beep.SampleRate(44100), resampleQuality: 1, bitDepth: 16}
++	p.speed.Store(math.Float64bits(1.0))
++	p.gapless = &gaplessStreamer{}
++	p.gapless.onSwap = func() {
++		p.mu.Lock()
++		old := p.current
++		p.current = p.nextPipeline
++		p.nextPipeline = nil
++		p.mu.Unlock()
++		if old != nil {
++			old.close()
++		}
++		p.gaplessAdvance.Store(true)
++	}
++	return p
++}
++
++func (p *Player) currentPath() string {
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	if p.current == nil {
++		return ""
++	}
++	return p.current.path
++}
++
++// writeSilentWAV は 1 秒の無音の WAV を書く。
++func writeSilentWAV(t *testing.T, name string) string {
++	t.Helper()
++	path := filepath.Join(t.TempDir(), name)
++	const sr, ch, bits = 44100, 2, 16
++	data := make([]byte, sr*ch*bits/8)
++	hdr := make([]byte, 44)
++	copy(hdr[0:], "RIFF")
++	binary.LittleEndian.PutUint32(hdr[4:], uint32(36+len(data)))
++	copy(hdr[8:], "WAVEfmt ")
++	binary.LittleEndian.PutUint32(hdr[16:], 16)
++	binary.LittleEndian.PutUint16(hdr[20:], 1)
++	binary.LittleEndian.PutUint16(hdr[22:], ch)
++	binary.LittleEndian.PutUint32(hdr[24:], sr)
++	binary.LittleEndian.PutUint32(hdr[28:], sr*ch*bits/8)
++	binary.LittleEndian.PutUint16(hdr[32:], ch*bits/8)
++	binary.LittleEndian.PutUint16(hdr[34:], bits)
++	copy(hdr[36:], "data")
++	binary.LittleEndian.PutUint32(hdr[40:], uint32(len(data)))
++	if err := os.WriteFile(path, append(hdr, data...), 0o644); err != nil {
++		t.Fatal(err)
++	}
++	return path
++}
++
++// 組み立て中の開始 (yt-dlp なら数秒) のあとに Stop と別の曲の Play が
++// あったら、遅れて組み上がった古い開始は差し替えずに ErrSuperseded を返す。
++func TestStaleStartIsSuperseded(t *testing.T) {
++	oldPath := writeSilentWAV(t, "old.wav")
++	newPath := writeSilentWAV(t, "new.wav")
++
++	for _, tt := range []struct {
++		name  string
++		after func(p *Player)
++		want  string
++	}{
++		// GUI の replace と同じ: Stop・ClearPreload のあと手元の曲を同期で鳴らす。
++		{"stop then play", func(p *Player) {
++			p.Stop()
++			p.ClearPreload()
++			if err := p.Play(newPath, 0); err != nil {
++				t.Fatalf("Play: %v", err)
++			}
++		}, newPath},
++		// 読み込み中の曲を止めただけでも、後から鳴り出さない。
++		{"stop only", func(p *Player) { p.Stop() }, ""},
++		// 止めずに別の曲を始めた (play_index) ときも新しい方が勝つ。
++		{"play only", func(p *Player) {
++			if err := p.Play(newPath, 0); err != nil {
++				t.Fatalf("Play: %v", err)
++			}
++		}, newPath},
++	} {
++		t.Run(tt.name, func(t *testing.T) {
++			p := newSilentPlayer()
++			gen := p.beginStart() // PlayYTDL(old) の始まり
++			tp, err := p.buildPipeline(oldPath)
++			if err != nil {
++				t.Fatal(err)
++			}
++			tt.after(p)
++			if err := p.playPipeline(tp, gen); !errors.Is(err, ErrSuperseded) {
++				t.Fatalf("stale start returned %v, want ErrSuperseded", err)
++			}
++			if got := p.currentPath(); got != tt.want {
++				t.Fatalf("current = %q, want %q", got, tt.want)
++			}
++			if tt.want == "" && p.IsPlaying() {
++				t.Fatal("the stale start made the player play after Stop")
++			}
++			p.Stop()
++		})
++	}
++}
++
++// 最新の開始は ErrSuperseded にならない。
++func TestLatestStartPlays(t *testing.T) {
++	p := newSilentPlayer()
++	path := writeSilentWAV(t, "a.wav")
++	if err := p.Play(path, 0); err != nil {
++		t.Fatal(err)
++	}
++	if got := p.currentPath(); got != path || !p.IsPlaying() {
++		t.Fatalf("current = %q playing=%v", got, p.IsPlaying())
++	}
++	p.Stop()
++}
++
++// fakeYTDL は、呼ばれると FAKE_YTDLP_DELAY 秒待ってから無音 (0 のバイト列) を
++// 出す yt-dlp と、そのまま通す ffmpeg を PATH の先頭に置く。sh などが
++// 見つからなければ飛ばす。
++func fakeYTDL(t *testing.T) {
++	t.Helper()
++	tools := map[string]string{}
++	for _, name := range []string{"sh", "sleep", "head", "cat"} {
++		p, err := exec.LookPath(name)
++		if err != nil {
++			t.Skipf("%s not found: %v", name, err)
++		}
++		tools[name] = p
++	}
++	dir := t.TempDir()
++	write := func(name, body string) {
++		script := "#!" + tools["sh"] + "\n" + body + "\n"
++		if err := os.WriteFile(filepath.Join(dir, name), []byte(script), 0o755); err != nil {
++			t.Fatal(err)
++		}
++	}
++	write("yt-dlp", tools["sleep"]+` "${FAKE_YTDLP_DELAY:-0}"`+"\nexec "+tools["head"]+" -c 4000000 /dev/zero")
++	write("ffmpeg", "exec "+tools["cat"])
++	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
++}
++
++// yt-dlp の曲のシーク (組み直しに数秒) の間に別の曲へ移ったら、遅れて
++// 組み上がったシークは古い曲を差し戻さない (GUI の seek_to のあと replace)。
++func TestStaleSeekYTDLDoesNotReplaceNewTrack(t *testing.T) {
++	fakeYTDL(t)
++	const yt = "https://www.youtube.com/watch?v=AAAAAAAAAAA"
++	local := writeSilentWAV(t, "local.wav")
++	p := newSilentPlayer()
++	t.Setenv("FAKE_YTDLP_DELAY", "0")
++	if err := p.PlayYTDL(yt, time.Minute); err != nil {
++		t.Fatalf("PlayYTDL: %v", err)
++	}
++	if got := p.currentPath(); got != yt {
++		t.Fatalf("current = %q", got)
++	}
++
++	t.Setenv("FAKE_YTDLP_DELAY", "1")
++	errCh := make(chan error, 1)
++	go func() { errCh <- p.SeekYTDL(30 * time.Second) }()
++	time.Sleep(300 * time.Millisecond)
++	// CancelSeekYTDL を呼ばない (upstream の TUI の next や daemon と同じ)。
++	p.Stop()
++	if err := p.Play(local, 0); err != nil {
++		t.Fatal(err)
++	}
++	if err := <-errCh; err != nil {
++		t.Fatalf("SeekYTDL: %v", err)
++	}
++	if got := p.currentPath(); got != local {
++		t.Fatalf("after the stale seek finished, current = %q, want %q", got, local)
++	}
++	p.Stop()
++}
++
++// 組み立て中の PlayYTDL のあとに手元の曲を鳴らしたら、PlayYTDL は
++// ErrSuperseded を返して手元の曲が残る (本物の yt-dlp の経路)。
++func TestStalePlayYTDLIsSuperseded(t *testing.T) {
++	fakeYTDL(t)
++	const yt = "https://www.youtube.com/watch?v=BBBBBBBBBBB"
++	local := writeSilentWAV(t, "local.wav")
++	p := newSilentPlayer()
++	t.Setenv("FAKE_YTDLP_DELAY", "1")
++	errCh := make(chan error, 1)
++	go func() { errCh <- p.PlayYTDL(yt, time.Minute) }()
++	time.Sleep(300 * time.Millisecond)
++	p.Stop()
++	if err := p.Play(local, 0); err != nil {
++		t.Fatal(err)
++	}
++	if err := <-errCh; !errors.Is(err, ErrSuperseded) {
++		t.Fatalf("stale PlayYTDL returned %v, want ErrSuperseded", err)
++	}
++	if got := p.currentPath(); got != local || strings.Contains(got, "youtube") {
++		t.Fatalf("current = %q, want %q", got, local)
++	}
++	p.Stop()
++}
 diff --git a/playlist/gui.go b/playlist/gui.go
 new file mode 100644
-index 0000000..3de0b2b
+index 0000000..0238d18
 --- /dev/null
 +++ b/playlist/gui.go
-@@ -0,0 +1,86 @@
+@@ -0,0 +1,203 @@
 +package playlist
 +
 +import "slices"
@@ -2645,7 +4754,7 @@ index 0000000..3de0b2b
 +		out = append(out, idx)
 +		return len(out) < n
 +	}
-+	for slot := p.pos + 1; slot < len(p.order); slot++ {
++	for slot := p.orderResumeSlot(); slot < len(p.order); slot++ {
 +		if !add(slot) {
 +			return out
 +		}
@@ -2686,6 +4795,428 @@ index 0000000..3de0b2b
 +	p.queue = slices.Insert(p.queue, to, idx)
 +	p.gen++
 +	return true
++}
++
++// orderResumeSlot は、次に順送りで鳴らす order の位置の候補の先頭を返す。
++// ふつうは pos の次。待ち行列の曲が鳴っている間に order[pos] が消されて
++// 後ろの曲が詰まってきたときは、その曲はまだ鳴っていないので pos から。
++func (p *Playlist) orderResumeSlot() int {
++	if p.resumeAtPos && p.queuedIdx >= 0 {
++		return p.pos
++	}
++	return p.pos + 1
++}
++
++// AddNext は曲を末尾に足し (添字は Add と同じく len から続く)、再生順では
++// いまの曲のすぐ後ろに並べる (GUI の「次に再生」)。待ち行列は使わない。
++// 待ち行列に入れると待ち行列で 1 度、リストの順でもう 1 度鳴るため。
++// 待ち行列に入っている曲はこれより先に鳴る。足した最初の曲の添字を返す。
++// シャッフルでなくても順は添字どおりでなくなるが、Move やシャッフルを
++// 切ったときは従来どおり添字の順に戻る (足した曲は末尾へ回る)。
++func (p *Playlist) AddNext(tracks ...Track) int {
++	start := len(p.tracks)
++	if len(tracks) == 0 {
++		return start
++	}
++	p.tracks = append(p.tracks, tracks...)
++	ins := make([]int, len(tracks))
++	for i := range ins {
++		ins[i] = start + i
++	}
++	at := 0
++	if len(p.order) > 0 {
++		at = p.orderResumeSlot()
++	}
++	p.order = slices.Insert(p.order, at, ins...)
++	p.gen++
++	return start
++}
++
++// PlaceNext はシャッフル中に、添字 idxs の曲を再生順でいまの曲のすぐ後ろへ
++// (与えた順に) 動かす。Add はシャッフル中に足した曲をこれからの順に混ぜるので、
++// そのあと SetIndex で足した曲へ飛ぶと、手前に混ざったまだ鳴っていない曲が
++// 鳴ったことになり飛ばされる。先にこれで並べておけば飛ばない。
++// シャッフルでなければ何もしない (添字の順が再生順のまま)。すでに鳴った
++// 位置 (pos 以前) にある曲は動かさない。
++func (p *Playlist) PlaceNext(idxs ...int) {
++	if !p.shuffle || len(p.order) == 0 || len(idxs) == 0 {
++		return
++	}
++	from := p.orderResumeSlot()
++	slotOf := make(map[int]int, len(p.order))
++	for slot, idx := range p.order {
++		slotOf[idx] = slot
++	}
++	var move []int
++	moving := make(map[int]bool, len(idxs))
++	for _, idx := range idxs {
++		if slot, ok := slotOf[idx]; ok && slot >= from && !moving[idx] {
++			move = append(move, idx)
++			moving[idx] = true
++		}
++	}
++	if len(move) == 0 {
++		return
++	}
++	order := slices.Clone(p.order[:from])
++	order = append(order, move...)
++	for _, idx := range p.order[from:] {
++		if !moving[idx] {
++			order = append(order, idx)
++		}
++	}
++	p.order = order
++	p.gen++
++}
++
++// GUI の enqueue の並べ方 (TUI の ui/model/ipc_gui.go と daemon_gui.go で共用)。
++// どれも足した最初の曲の添字を返す。
++
++// PlayNext は「次に再生」: AddNext と同じく、いまの曲のすぐ後ろに並べる。
++// 1 曲リピートでは順送りで進まない (Next がいまの曲を返し続ける) ので、
++// 従来どおり末尾に足して待ち行列に入れる (待ち行列は 1 曲リピートより先に鳴る)。
++func (p *Playlist) PlayNext(tracks ...Track) int {
++	if p.repeat != RepeatOne {
++		return p.AddNext(tracks...)
++	}
++	start := len(p.tracks)
++	p.Add(tracks...)
++	for i := range tracks {
++		p.Queue(start + i)
++	}
++	return start
++}
++
++// AddNow は enqueue now: 末尾に足して先頭の曲を選ぶ (TUI の Enter と同じ
++// playTrackImmediate の並べ方)。シャッフル中は足した曲をまとめていまの曲の
++// すぐ後ろへ並べてから選ぶので、これから鳴るはずだった曲は飛ばされず、
++// 2 曲目以降も足した順に続く。
++func (p *Playlist) AddNow(tracks ...Track) int {
++	start := len(p.tracks)
++	p.Add(tracks...)
++	idxs := make([]int, len(tracks))
++	for i := range idxs {
++		idxs[i] = start + i
++	}
++	p.PlaceNext(idxs...)
++	p.SetIndex(start)
++	return start
++}
++
++// AddAndSelect は止まっているときの enqueue end: 末尾に足して先頭の曲を選ぶ
++// (TUI の a と同じ)。シャッフル中は先頭の曲だけをいまの曲のすぐ後ろへ並べ、
++// 残りはこれからの順に混ぜたままにする。
++func (p *Playlist) AddAndSelect(tracks ...Track) int {
++	start := len(p.tracks)
++	p.Add(tracks...)
++	p.PlaceNext(start)
++	p.SetIndex(start)
++	return start
++}
+diff --git a/playlist/gui_order_test.go b/playlist/gui_order_test.go
+new file mode 100644
+index 0000000..a004b0d
+--- /dev/null
++++ b/playlist/gui_order_test.go
+@@ -0,0 +1,299 @@
++package playlist
++
++// GUI の enqueue の並べ方 (AddNext, PlayNext, AddNow, AddAndSelect, PlaceNext) と、
++// 待ち行列の曲が鳴っている間の Remove の試験。daemon も同じ関数を使う。
++
++import (
++	"slices"
++	"testing"
++)
++
++// guiPlayed は Next で最後まで進めたときに鳴る曲の Title を返す。
++func guiPlayed(p *Playlist) []string {
++	var out []string
++	for range 200 {
++		t, ok := p.Next()
++		if !ok {
++			break
++		}
++		out = append(out, t.Title)
++	}
++	return out
++}
++
++func guiNamed(names ...string) []Track {
++	out := make([]Track, len(names))
++	for i, n := range names {
++		out[i] = Track{Path: n + ".mp3", Title: n}
++	}
++	return out
++}
++
++func guiTitlesOf(p *Playlist, idxs []int) []string {
++	out := make([]string, len(idxs))
++	for i, idx := range idxs {
++		out[i] = p.Tracks()[idx].Title
++	}
++	return out
++}
++
++// 「次に再生」はいまの曲のすぐ後ろに 1 度だけ鳴り、Upcoming もそのとおり。
++// 添字は末尾に続く (既存の曲の添字は動かない)。
++func TestPlayNextPlaysOnceRightAfterCurrent(t *testing.T) {
++	for _, tt := range []struct {
++		name    string
++		current int
++		want    []string
++	}{
++		{"first", 0, []string{"X", "Y", "B", "C"}},
++		{"last", 2, []string{"X", "Y"}},
++	} {
++		t.Run(tt.name, func(t *testing.T) {
++			p := New()
++			p.Replace(guiNamed("A", "B", "C"))
++			p.SetIndex(tt.current)
++			gen := p.Gen()
++			if start := p.PlayNext(guiNamed("X", "Y")...); start != 3 {
++				t.Fatalf("start = %d, want 3", start)
++			}
++			if p.Gen() == gen || p.QueueLen() != 0 {
++				t.Fatalf("gen unchanged or queue used: queue=%v", p.QueueIndices())
++			}
++			if up := guiTitlesOf(p, p.Upcoming(10)); !slices.Equal(up, tt.want) {
++				t.Fatalf("Upcoming = %v, want %v", up, tt.want)
++			}
++			if got := guiPlayed(p); !slices.Equal(got, tt.want) {
++				t.Fatalf("played %v, want %v", got, tt.want)
++			}
++		})
++	}
++}
++
++// シャッフル中も、足した曲は順に、いまの曲のすぐ後ろで鳴り、他の曲は飛ばない。
++func TestPlayNextWithShuffle(t *testing.T) {
++	for range 50 {
++		p := New()
++		p.Replace(guiNamed("A", "B", "C", "D", "E"))
++		p.ToggleShuffle()
++		cur, _ := p.Current()
++		p.PlayNext(guiNamed("X", "Y")...)
++		got := guiPlayed(p)
++		if len(got) != 6 || got[0] != "X" || got[1] != "Y" {
++			t.Fatalf("played %v, want X Y then the 4 others", got)
++		}
++		for _, n := range []string{"A", "B", "C", "D", "E"} {
++			if n != cur.Title && !slices.Contains(got, n) {
++				t.Fatalf("%s skipped: %v", n, got)
++			}
++		}
++	}
++}
++
++// 待ち行列に入っている曲は「次に再生」より先に鳴る (従来の待ち行列の末尾に
++// 足したのと同じ順)。
++func TestPlayNextAfterExistingQueue(t *testing.T) {
++	p := New()
++	p.Replace(guiNamed("A", "B", "C"))
++	p.Queue(2)
++	p.PlayNext(guiNamed("X")...)
++	if got := guiPlayed(p); !slices.Equal(got, []string{"C", "X", "B", "C"}) {
++		t.Fatalf("played %v, want [C X B C]", got)
++	}
++}
++
++// 1 曲リピートでは順送りで進まないので、待ち行列に入れる。
++func TestPlayNextWithRepeatOneQueues(t *testing.T) {
++	p := New()
++	p.Replace(guiNamed("A", "B"))
++	p.SetRepeat(RepeatOne)
++	start := p.PlayNext(guiNamed("X")...)
++	if !slices.Equal(p.QueueIndices(), []int{start}) {
++		t.Fatalf("queue = %v, want [%d]", p.QueueIndices(), start)
++	}
++	if next, _ := p.Next(); next.Title != "X" {
++		t.Fatalf("next = %q, want X", next.Title)
++	}
++}
++
++// シャッフル中の enqueue now は、足した曲をまとめていまの曲のすぐ後ろに置き、
++// これから鳴るはずだった曲を飛ばさない。シャッフルでなければ TUI の Enter と
++// 同じく足した行へ飛ぶ。
++func TestAddNow(t *testing.T) {
++	for range 100 {
++		p := New()
++		p.Replace(guiNamed("A", "B", "C", "D", "E", "F", "G", "H"))
++		p.ToggleShuffle()
++		cur, _ := p.Current()
++		before := len(p.Upcoming(100))
++		start := p.AddNow(guiNamed("X", "Y")...)
++		if now, idx := p.Current(); now.Title != "X" || idx != start {
++			t.Fatalf("current = %q, want X", now.Title)
++		}
++		if got := len(p.Upcoming(100)); got != before+1 {
++			t.Fatalf("Upcoming has %d entries, want %d (Y + the others)", got, before+1)
++		}
++		got := guiPlayed(p)
++		if len(got) == 0 || got[0] != "Y" {
++			t.Fatalf("after X: %v, want Y first", got)
++		}
++		for _, n := range []string{"A", "B", "C", "D", "E", "F", "G", "H"} {
++			if n != cur.Title && !slices.Contains(got, n) {
++				t.Fatalf("%s skipped: %v", n, got)
++			}
++		}
++	}
++
++	p := New()
++	p.Replace(guiNamed("A", "B", "C"))
++	p.AddNow(guiNamed("X", "Y")...)
++	if cur, _ := p.Current(); cur.Title != "X" || !slices.Equal(guiPlayed(p), []string{"Y"}) {
++		t.Fatalf("linear: current %q, rest %v", cur.Title, guiPlayed(p))
++	}
++}
++
++// 止まっているときの enqueue end: 先頭の曲を選び、シャッフル中でも足した
++// 残りの曲とまだ鳴っていない曲を飛ばさない。
++func TestAddAndSelect(t *testing.T) {
++	for range 100 {
++		p := New()
++		p.Replace(guiNamed("A", "B", "C", "D"))
++		p.ToggleShuffle()
++		guiPlayed(p) // 最後まで鳴らし終えた
++		added := []string{"X0", "X1", "X2", "X3", "X4", "X5"}
++		p.AddAndSelect(guiNamed(added...)...)
++		if cur, _ := p.Current(); cur.Title != "X0" {
++			t.Fatalf("current = %q, want X0", cur.Title)
++		}
++		got := guiPlayed(p)
++		for _, n := range added[1:] {
++			if !slices.Contains(got, n) {
++				t.Fatalf("%s skipped: %v", n, got)
++			}
++		}
++	}
++	// 途中で止めたときも、まだ鳴っていない曲は残る。
++	for range 100 {
++		p := New()
++		p.Replace(guiNamed("A", "B", "C", "D", "E", "F"))
++		p.ToggleShuffle()
++		cur, _ := p.Current()
++		p.AddAndSelect(guiNamed("X")...)
++		got := guiPlayed(p)
++		for _, n := range []string{"A", "B", "C", "D", "E", "F"} {
++			if n != cur.Title && !slices.Contains(got, n) {
++				t.Fatalf("%s skipped: %v", n, got)
++			}
++		}
++	}
++}
++
++func TestPlaceNextIgnoresLinearAndPlayedSlots(t *testing.T) {
++	p := New()
++	p.Replace(guiNamed("A", "B", "C"))
++	p.SetIndex(1)
++	gen := p.Gen()
++	p.PlaceNext(2, 0)
++	if p.Gen() != gen || !slices.Equal(p.Upcoming(10), []int{2}) {
++		t.Fatal("PlaceNext changed a linear playlist")
++	}
++	p.ToggleShuffle() // B が先頭
++	p.PlaceNext(1)    // いまの曲は動かさない
++	if cur, _ := p.Current(); cur.Title != "B" {
++		t.Fatalf("current = %q", cur.Title)
++	}
++}
++
++// 待ち行列の曲が鳴っている間に、その前に鳴ったリストの曲 (order[pos]) を
++// 消しても、次に鳴るはずの曲は飛ばされない。
++func TestRemoveInterruptedTrackWhileQueuedKeepsSuccessor(t *testing.T) {
++	for _, tt := range []struct {
++		name           string
++		repeat         RepeatMode
++		current, queue int
++		remove         string
++		queued         string
++		want           []string
++	}{
++		{"first, repeat off", RepeatOff, 0, 4, "A", "E", []string{"B", "C", "D", "E"}},
++		{"middle, repeat off", RepeatOff, 1, 4, "B", "E", []string{"C", "D", "E"}},
++		{"first, repeat all", RepeatAll, 0, 4, "A", "E", []string{"B", "C", "D", "E"}},
++		// 最後の位置の曲を消したら、その後ろは無いのでふつうに終わる。
++		{"last slot", RepeatOff, 4, 0, "E", "A", nil},
++	} {
++		t.Run(tt.name, func(t *testing.T) {
++			p := New()
++			p.Replace(guiNamed("A", "B", "C", "D", "E"))
++			p.SetRepeat(tt.repeat)
++			p.SetIndex(tt.current)
++			p.Queue(tt.queue)
++			if next, _ := p.Next(); next.Title != tt.queued || !p.CurrentIsQueued() {
++				t.Fatalf("queued %s not playing", tt.queued)
++			}
++			idx := slices.IndexFunc(p.Tracks(), func(tr Track) bool { return tr.Title == tt.remove })
++			p.Remove(idx)
++			if cur, _ := p.Current(); cur.Title != tt.queued {
++				t.Fatalf("current after removal = %q, want %s", cur.Title, tt.queued)
++			}
++			cut := func(s []string) []string {
++				if tt.repeat == RepeatAll {
++					return s[:min(len(s), len(tt.want))]
++				}
++				return s
++			}
++			if up := cut(guiTitlesOf(p, p.Upcoming(10))); !slices.Equal(up, tt.want) {
++				t.Fatalf("Upcoming = %v, want %v", up, tt.want)
++			}
++			if peek, ok := p.PeekNext(); ok != (tt.want != nil) || (ok && peek.Title != tt.want[0]) {
++				t.Fatalf("PeekNext = %q, %v; want %v", peek.Title, ok, tt.want)
++			}
++			if got := cut(guiPlayed(p)); !slices.Equal(got, tt.want) {
++				t.Fatalf("played %v, want %v", got, tt.want)
++			}
++		})
++	}
++}
++
++func TestRemoveInterruptedTrackWhileQueuedWithShuffle(t *testing.T) {
++	for range 50 {
++		p := New()
++		p.Replace(guiNamed("A", "B", "C", "D", "E", "F"))
++		p.ToggleShuffle()
++		p.Queue(p.Upcoming(10)[len(p.Upcoming(10))-1])
++		anchor, _ := p.Current()
++		p.Next() // 待ち行列の曲
++		want := guiTitlesOf(p, p.Upcoming(10))
++		idx := slices.IndexFunc(p.Tracks(), func(tr Track) bool { return tr.Title == anchor.Title })
++		p.Remove(idx)
++		if got := guiTitlesOf(p, p.Upcoming(10)); !slices.Equal(got, want) {
++			t.Fatalf("Upcoming after removing the played %s = %v, want %v", anchor.Title, got, want)
++		}
++		if got := guiPlayed(p); !slices.Equal(got, want) {
++			t.Fatalf("played %v, want %v", got, want)
++		}
++	}
++}
++
++// 待ち行列から戻ったあとや、選び直したあとは、ふつうに pos の次から進む。
++func TestResumeAtPosIsClearedWhenPositionMoves(t *testing.T) {
++	p := New()
++	p.Replace(guiNamed("A", "B", "C", "D"))
++	p.Queue(3)
++	p.Next()      // D (待ち行列)
++	p.Remove(0)   // B C D の B は未再生
++	p.SetIndex(1) // C を選び直したら、ふつうに C の次から進む
++	if got := guiPlayed(p); !slices.Equal(got, []string{"D"}) {
++		t.Fatalf("after SetIndex(C): %v, want [D]", got)
++	}
++
++	p = New()
++	p.Replace(guiNamed("A", "B", "C", "D"))
++	p.Queue(3)
++	p.Next()    // D (待ち行列)
++	p.Remove(0) // B は未再生
++	if next, _ := p.Next(); next.Title != "B" {
++		t.Fatalf("next = %q, want B", next.Title)
++	}
++	if next, _ := p.Next(); next.Title != "C" {
++		t.Fatalf("after B = %q, want C (resume flag must not stick)", next.Title)
++	}
 +}
 diff --git a/playlist/gui_test.go b/playlist/gui_test.go
 new file mode 100644
@@ -2928,10 +5459,10 @@ index 0000000..ddec197
 +	}
 +}
 diff --git a/playlist/playlist.go b/playlist/playlist.go
-index 57357b1..99bbca7 100644
+index 57357b1..a471241 100644
 --- a/playlist/playlist.go
 +++ b/playlist/playlist.go
-@@ -304,6 +304,11 @@ type Playlist struct {
+@@ -304,6 +304,17 @@ type Playlist struct {
  	repeat    RepeatMode
  	queue     []int // track indices queued to play next
  	queuedIdx int   // track index currently playing from queue, -1 if none
@@ -2940,10 +5471,16 @@ index 57357b1..99bbca7 100644
 +	// たびに、epoch は Replace のたびに増える。外から差分の有無を安く知るため。
 +	gen   uint64
 +	epoch uint64
++
++	// resumeAtPos は、待ち行列の曲が鳴っている間に order[pos] (待ち行列の前に
++	// 鳴ったリストの曲) が消され、後ろの曲が詰まってきたことを示す。そのとき
++	// order[pos] はまだ鳴っていないので、次の順送りは pos から始める (gui.go の
++	// orderResumeSlot)。
++	resumeAtPos bool
  }
  
  // New creates an empty Playlist.
-@@ -314,6 +319,8 @@ func New() *Playlist {
+@@ -314,6 +325,8 @@ func New() *Playlist {
  // Replace clears the playlist and loads the given tracks, resetting
  // position, queue, and shuffle order.
  func (p *Playlist) Replace(tracks []Track) {
@@ -2952,7 +5489,15 @@ index 57357b1..99bbca7 100644
  	p.tracks = tracks
  	p.order = make([]int, len(tracks))
  	for i := range tracks {
-@@ -331,6 +338,9 @@ func (p *Playlist) Replace(tracks []Track) {
+@@ -322,6 +335,7 @@ func (p *Playlist) Replace(tracks []Track) {
+ 	p.pos = 0
+ 	p.queue = nil
+ 	p.queuedIdx = -1
++	p.resumeAtPos = false
+ 	if p.shuffle && len(tracks) > 0 {
+ 		p.doShuffle()
+ 	}
+@@ -331,6 +345,9 @@ func (p *Playlist) Replace(tracks []Track) {
  func (p *Playlist) Add(tracks ...Track) {
  	start := len(p.tracks)
  	p.tracks = append(p.tracks, tracks...)
@@ -2962,7 +5507,7 @@ index 57357b1..99bbca7 100644
  	for i := start; i < len(p.tracks); i++ {
  		p.order = append(p.order, i)
  	}
-@@ -423,6 +433,7 @@ func (p *Playlist) nextShuffleWrap() (orderPos int, trackIdx int, ok bool) {
+@@ -423,6 +440,7 @@ func (p *Playlist) nextShuffleWrap() (orderPos int, trackIdx int, ok bool) {
  	origOrder := slices.Clone(p.order)
  	origPos := p.pos
  	p.doShuffle()
@@ -2970,7 +5515,24 @@ index 57357b1..99bbca7 100644
  	if orderPos, trackIdx, ok = p.firstPlayableOrderSlot(1, len(p.order)); ok {
  		return orderPos, trackIdx, true
  	}
-@@ -523,10 +534,12 @@ func (p *Playlist) Next() (Track, bool) {
+@@ -435,7 +453,7 @@ func (p *Playlist) nextShuffleWrap() (orderPos int, trackIdx int, ok bool) {
+ }
+ 
+ func (p *Playlist) advanceFromOrder() (orderPos int, trackIdx int, ok bool) {
+-	if orderPos, trackIdx, ok = p.firstPlayableOrderSlot(p.pos+1, len(p.order)); ok {
++	if orderPos, trackIdx, ok = p.firstPlayableOrderSlot(p.orderResumeSlot(), len(p.order)); ok {
+ 		return orderPos, trackIdx, true
+ 	}
+ 	if p.repeat != RepeatAll {
+@@ -503,6 +521,7 @@ func (p *Playlist) ActivateSelected() (SelectionActivation, bool) {
+ 	}
+ 	p.pos = orderPos
+ 	p.queuedIdx = -1
++	p.resumeAtPos = false
+ 	return SelectionActivation{
+ 		Track:   p.tracks[idx],
+ 		Index:   idx,
+@@ -523,15 +542,18 @@ func (p *Playlist) Next() (Track, bool) {
  	if idx, remaining, ok := p.nextPlayableQueued(); ok {
  		p.queue = remaining
  		p.queuedIdx = idx
@@ -2983,7 +5545,43 @@ index 57357b1..99bbca7 100644
  	}
  	if p.repeat == RepeatOne {
  		idx := p.currentOrderTrackIndex()
-@@ -619,6 +632,7 @@ func (p *Playlist) SetIndex(i int) {
+ 		if p.isPlayable(idx) {
+ 			p.queuedIdx = -1
++			p.resumeAtPos = false
+ 			return p.tracks[idx], true
+ 		}
+ 		p.pos = origPos
+@@ -547,6 +569,7 @@ func (p *Playlist) Next() (Track, bool) {
+ 	}
+ 	p.queuedIdx = -1
+ 	p.pos = orderPos
++	p.resumeAtPos = false
+ 	return p.tracks[idx], true
+ }
+ 
+@@ -588,11 +611,13 @@ func (p *Playlist) Prev() (Track, bool) {
+ 
+ 	if orderPos, idx, ok := p.lastPlayableOrderSlot(p.pos - 1); ok {
+ 		p.pos = orderPos
++		p.resumeAtPos = false
+ 		return p.tracks[idx], true
+ 	}
+ 	if p.repeat == RepeatAll {
+ 		if orderPos, idx, ok := p.lastPlayableOrderSlot(len(p.order) - 1); ok {
+ 			p.pos = orderPos
++			p.resumeAtPos = false
+ 			return p.tracks[idx], true
+ 		}
+ 	}
+@@ -607,6 +632,7 @@ func (p *Playlist) Prev() (Track, bool) {
+ // SetIndex sets the current position to the given track index.
+ func (p *Playlist) SetIndex(i int) {
+ 	p.queuedIdx = -1
++	p.resumeAtPos = false
+ 	for pos, idx := range p.order {
+ 		if idx == i {
+ 			p.pos = pos
+@@ -619,6 +645,7 @@ func (p *Playlist) SetIndex(i int) {
  func (p *Playlist) Queue(trackIdx int) {
  	if trackIdx >= 0 && trackIdx < len(p.tracks) {
  		p.queue = append(p.queue, trackIdx)
@@ -2991,7 +5589,7 @@ index 57357b1..99bbca7 100644
  	}
  }
  
-@@ -627,6 +641,7 @@ func (p *Playlist) Dequeue(trackIdx int) bool {
+@@ -627,6 +654,7 @@ func (p *Playlist) Dequeue(trackIdx int) bool {
  	for i, idx := range p.queue {
  		if idx == trackIdx {
  			p.queue = slices.Delete(p.queue, i, i+1)
@@ -2999,7 +5597,7 @@ index 57357b1..99bbca7 100644
  			return true
  		}
  	}
-@@ -657,12 +672,18 @@ func (p *Playlist) QueueTracks() []Track {
+@@ -657,12 +685,18 @@ func (p *Playlist) QueueTracks() []Track {
  }
  
  // ClearQueue removes all entries from the play-next queue.
@@ -3019,7 +5617,7 @@ index 57357b1..99bbca7 100644
  	}
  }
  
-@@ -672,6 +693,7 @@ func (p *Playlist) MoveQueue(from, to int) bool {
+@@ -672,6 +706,7 @@ func (p *Playlist) MoveQueue(from, to int) bool {
  		return false
  	}
  	p.queue[from], p.queue[to] = p.queue[to], p.queue[from]
@@ -3027,7 +5625,7 @@ index 57357b1..99bbca7 100644
  	return true
  }
  
-@@ -685,6 +707,7 @@ func (p *Playlist) Move(from, to int) bool {
+@@ -685,6 +720,7 @@ func (p *Playlist) Move(from, to int) bool {
  
  	// Swap in the tracks array (visual order).
  	p.tracks[from], p.tracks[to] = p.tracks[to], p.tracks[from]
@@ -3035,7 +5633,7 @@ index 57357b1..99bbca7 100644
  
  	// Update order: swap all references so they point at the moved tracks.
  	for i, idx := range p.order {
-@@ -732,6 +755,7 @@ func (p *Playlist) Remove(idx int) bool {
+@@ -732,6 +768,7 @@ func (p *Playlist) Remove(idx int) bool {
  	}
  
  	p.tracks = slices.Delete(p.tracks, idx, idx+1)
@@ -3043,7 +5641,34 @@ index 57357b1..99bbca7 100644
  
  	removedOrderPos := -1
  	newOrder := p.order[:0]
-@@ -783,6 +807,7 @@ func (p *Playlist) Remove(idx int) bool {
+@@ -747,11 +784,17 @@ func (p *Playlist) Remove(idx int) bool {
+ 	}
+ 	p.order = newOrder
+ 
+-	if removedOrderPos >= 0 && removedOrderPos < p.pos {
++	switch {
++	case removedOrderPos >= 0 && removedOrderPos < p.pos:
+ 		p.pos--
++	case removedOrderPos == p.pos && p.queuedIdx >= 0 && p.queuedIdx != idx:
++		// A queued track is playing and the list track it interrupted was
++		// removed: the next slot slid into pos and has not played yet.
++		p.resumeAtPos = true
+ 	}
+ 	if p.pos >= len(p.order) {
+ 		p.pos = len(p.order) - 1
++		p.resumeAtPos = false
+ 	}
+ 	if p.pos < 0 {
+ 		p.pos = 0
+@@ -772,6 +815,7 @@ func (p *Playlist) Remove(idx int) bool {
+ 	switch {
+ 	case p.queuedIdx == idx:
+ 		p.queuedIdx = -1
++		p.resumeAtPos = false
+ 	case p.queuedIdx > idx:
+ 		p.queuedIdx--
+ 	}
+@@ -783,6 +827,7 @@ func (p *Playlist) Remove(idx int) bool {
  func (p *Playlist) SetTrack(i int, t Track) {
  	if i >= 0 && i < len(p.tracks) {
  		p.tracks[i] = t
@@ -3051,7 +5676,7 @@ index 57357b1..99bbca7 100644
  	}
  }
  
-@@ -793,6 +818,7 @@ func (p *Playlist) Tracks() []Track { return p.tracks }
+@@ -793,6 +838,7 @@ func (p *Playlist) Tracks() []Track { return p.tracks }
  func (p *Playlist) ToggleBookmark(idx int) {
  	if idx >= 0 && idx < len(p.tracks) {
  		p.tracks[idx].Bookmark = !p.tracks[idx].Bookmark
@@ -3059,7 +5684,7 @@ index 57357b1..99bbca7 100644
  	}
  }
  
-@@ -811,6 +837,7 @@ func (p *Playlist) BookmarkCount() int {
+@@ -811,6 +857,7 @@ func (p *Playlist) BookmarkCount() int {
  // Uses Fisher-Yates shuffle, preserving the current track at position 0.
  func (p *Playlist) ToggleShuffle() {
  	p.shuffle = !p.shuffle
@@ -3067,7 +5692,7 @@ index 57357b1..99bbca7 100644
  	if len(p.tracks) == 0 {
  		return
  	}
-@@ -847,10 +874,14 @@ func (p *Playlist) doShuffle() {
+@@ -847,10 +894,14 @@ func (p *Playlist) doShuffle() {
  // CycleRepeat cycles through Off -> All -> One.
  func (p *Playlist) CycleRepeat() {
  	p.repeat = (p.repeat + 1) % 3
@@ -3082,12 +5707,123 @@ index 57357b1..99bbca7 100644
  	p.repeat = mode
  }
  
+diff --git a/ui/model/commands.go b/ui/model/commands.go
+index 3ebd2df..e53a93f 100644
+--- a/ui/model/commands.go
++++ b/ui/model/commands.go
+@@ -54,8 +54,14 @@ type feedsLoadedMsg struct {
+ }
+ 
+ // feedTrackResolvedMsg carries episodes resolved from a feed track in the playlist.
++// seq/epoch identify the request (playSeq and playlist Epoch when it was made)
++// so a result for a superseded request is dropped; err is carried here rather
++// than returned as a bare error for the same reason.
+ type feedTrackResolvedMsg struct {
+ 	tracks []playlist.Track
++	seq    uint64
++	epoch  uint64
++	err    error
+ }
+ 
+ // lyricsLoadedMsg carries parsed LRC output.
+@@ -71,11 +77,21 @@ type netSearchResultsMsg struct {
+ 	err    error
+ }
+ 
+-// streamPlayedMsg signals that async stream Play() completed.
+-type streamPlayedMsg struct{ err error }
++// streamPlayedMsg signals that async stream Play() completed. seq is the
++// playSeq of the start, so a superseded start is ignored.
++type streamPlayedMsg struct {
++	err error
++	seq uint64
++}
+ 
+-// streamPreloadedMsg signals that async stream Preload() completed.
+-type streamPreloadedMsg struct{}
++// streamPreloadedMsg signals that async stream Preload() completed. seq is the
++// preloadSeq of the preload and path the track it preloaded, so a preload that
++// no longer matches the next track can be discarded.
++type streamPreloadedMsg struct {
++	seq  uint64
++	path string
++	err  error
++}
+ 
+ type attachNotifierMsg struct{ notifier playback.Notifier }
+ 
+@@ -168,13 +184,10 @@ func fetchYTDLBatchCmd(gen uint64, pageURL string, start, count int) tea.Cmd {
+ 	}
+ }
+ 
+-func resolveFeedTrackCmd(feedURL string) tea.Cmd {
++func resolveFeedTrackCmd(feedURL string, seq, epoch uint64) tea.Cmd {
+ 	return func() tea.Msg {
+ 		tracks, err := resolve.Remote([]string{feedURL})
+-		if err != nil {
+-			return err
+-		}
+-		return feedTrackResolvedMsg{tracks: tracks}
++		return feedTrackResolvedMsg{tracks: tracks, seq: seq, epoch: epoch, err: err}
+ 	}
+ }
+ 
+@@ -202,36 +215,36 @@ func fetchNetSearchCmd(query string) tea.Cmd {
+ 	}
+ }
+ 
+-func playStreamCmd(p player.Engine, path string, knownDuration time.Duration) tea.Cmd {
++func playStreamCmd(p player.Engine, path string, knownDuration time.Duration, seq uint64) tea.Cmd {
+ 	return func() tea.Msg {
+-		return streamPlayedMsg{err: p.Play(path, knownDuration)}
++		return streamPlayedMsg{err: p.Play(path, knownDuration), seq: seq}
+ 	}
+ }
+ 
+-func preloadStreamCmd(p player.Engine, path string, knownDuration time.Duration) tea.Cmd {
++func preloadStreamCmd(p player.Engine, path string, knownDuration time.Duration, seq uint64) tea.Cmd {
+ 	return func() tea.Msg {
+-		p.Preload(path, knownDuration) // errors silently ignored
+-		return streamPreloadedMsg{}
++		err := p.Preload(path, knownDuration) // errors otherwise ignored
++		return streamPreloadedMsg{seq: seq, path: path, err: err}
+ 	}
+ }
+ 
+-func preloadLocalCmd(p player.Engine, path string, knownDuration time.Duration) tea.Cmd {
++func preloadLocalCmd(p player.Engine, path string, knownDuration time.Duration, seq uint64) tea.Cmd {
+ 	return func() tea.Msg {
+-		p.Preload(path, knownDuration)
+-		return streamPreloadedMsg{}
++		err := p.Preload(path, knownDuration)
++		return streamPreloadedMsg{seq: seq, path: path, err: err}
+ 	}
+ }
+ 
+-func playYTDLStreamCmd(p player.Engine, pageURL string, knownDuration time.Duration) tea.Cmd {
++func playYTDLStreamCmd(p player.Engine, pageURL string, knownDuration time.Duration, seq uint64) tea.Cmd {
+ 	return func() tea.Msg {
+-		return streamPlayedMsg{err: p.PlayYTDL(pageURL, knownDuration)}
++		return streamPlayedMsg{err: p.PlayYTDL(pageURL, knownDuration), seq: seq}
+ 	}
+ }
+ 
+-func preloadYTDLStreamCmd(p player.Engine, pageURL string, knownDuration time.Duration) tea.Cmd {
++func preloadYTDLStreamCmd(p player.Engine, pageURL string, knownDuration time.Duration, seq uint64) tea.Cmd {
+ 	return func() tea.Msg {
+-		p.PreloadYTDL(pageURL, knownDuration) // errors silently ignored
+-		return streamPreloadedMsg{}
++		err := p.PreloadYTDL(pageURL, knownDuration) // errors otherwise ignored
++		return streamPreloadedMsg{seq: seq, path: pageURL, err: err}
+ 	}
+ }
+ 
 diff --git a/ui/model/ipc_gui.go b/ui/model/ipc_gui.go
 new file mode 100644
-index 0000000..4fc1cf9
+index 0000000..a0f2a4b
 --- /dev/null
 +++ b/ui/model/ipc_gui.go
-@@ -0,0 +1,355 @@
+@@ -0,0 +1,383 @@
 +package model
 +
 +// ipc_gui.go — GUI 向け拡張 IPC (ipc/gui.go) の状態系コマンドを TUI で処理する。
@@ -3163,7 +5899,7 @@ index 0000000..4fc1cf9
 +	resp.Gen = m.playlist.Gen()
 +	resp.Source = m.listSource()
 +	resp.StreamTitle = m.streamTitle
-+	buffering := m.buffering || m.feedLoading
++	buffering := m.buffering || m.feedLoading || m.feedTrackPending
 +	resp.Buffering = &buffering
 +}
 +
@@ -3255,13 +5991,32 @@ index 0000000..4fc1cf9
 +	m.adjustScroll()
 +}
 +
++// staleIndex は、GUI が添字と一緒に送った path (空なら確かめない) が
++// いまのリストのその曲と違うかを返す。違えば GUI の写しが古い
++// (TUI や別の操作でリストが動いた) ので、別の曲を操作しないよう断る。
++func (m *Model) staleIndex(index int, path string) bool {
++	return ipc.PathMismatch(m.playlist.Tracks()[index].Path, path)
++}
++
++// staleQueuePos は staleIndex の、待ち行列の位置 pos で指す版 (queue_edit move)。
++// 待ち行列の位置は、待ち行列の曲が鳴り始めるたびに 1 つずつ詰まる。範囲外は
++// false (範囲は MoveQueueTo が見る)。
++func (m *Model) staleQueuePos(pos int, path string) bool {
++	q := m.playlist.QueueIndices()
++	return pos >= 0 && pos < len(q) && m.staleIndex(q[pos], path)
++}
++
 +// guiPlayIndex は TUI の「行で Enter」と同じ (keys.go の enter)。
 +func (m *Model) guiPlayIndex(msg ipc.PlayIndexMsg) tea.Cmd {
 +	if msg.Index < 0 || msg.Index >= m.playlist.Len() {
 +		ipc.SendReply(msg.Reply, ipc.Response{OK: false, Error: "index out of range"})
 +		return nil
 +	}
-+	if m.buffering && msg.Index == m.playlist.Index() {
++	if m.staleIndex(msg.Index, msg.Path) {
++		ipc.SendReply(msg.Reply, ipc.Response{OK: false, Error: ipc.ErrStale.Error()})
++		return nil
++	}
++	if (m.buffering || m.feedTrackPending) && msg.Index == m.playlist.Index() {
 +		// その曲をいま読み込んでいる。Enter と同じく何もしない。
 +		ipc.SendReply(msg.Reply, ipc.Response{OK: true})
 +		return nil
@@ -3317,24 +6072,25 @@ index 0000000..4fc1cf9
 +	return cmd
 +}
 +
-+// guiEnqueue は曲を足す。next は TUI の検索結果での q (queueTrackNext)、end は
-+// a (appendTrack)、now は Enter (playTrackImmediate) にあたる。複数曲をまとめて
-+// 扱うため、既存の 1 曲用の関数を繰り返し呼ばずに同じ手順を書いている
-+// (繰り返すと、読み込み中に 2 曲目がまた再生を始めてしまう)。
++// guiEnqueue は曲を足す。next は「次に再生」(いまの曲のすぐ後ろ)、end は
++// TUI の a (appendTrack)、now は Enter (playTrackImmediate) にあたる。複数曲を
++// まとめて扱うため、既存の 1 曲用の関数を繰り返し呼ばずに同じ手順を書いている
++// (繰り返すと、読み込み中に 2 曲目がまた再生を始めてしまう)。並べ方は
++// daemon と共用の playlist の関数 (playlist/gui.go) で行う。
 +func (m *Model) guiEnqueue(msg ipc.EnqueueMsg) tea.Cmd {
 +	if len(msg.Tracks) == 0 {
 +		ipc.SendReply(msg.Reply, ipc.Response{OK: false, Error: "enqueue requires tracks"})
 +		return nil
 +	}
++	// フィードの展開待ちも止まっているとみなす: 足した曲を始めれば展開は
++	// 取り消される (待たせると、展開したエピソードがリストごと置き換えて
++	// 足した曲が消える)。
 +	idle := !m.player.IsPlaying() && !m.buffering
 +	beforePath, beforeOK := m.peekNextPath()
-+	start := m.playlist.Len()
-+	m.playlist.Add(msg.Tracks...)
 +	first := msg.Tracks[0]
 +	mode := msg.Mode
-+	if mode == "next" && start == 0 {
-+		// 空のリストに「次に再生」: 待ち行列に入れると、待ち行列で 1 度、
-+		// リストの順でもう 1 度鳴る。末尾に足して先頭から鳴らすのと同じにする。
++	if mode == "next" && m.playlist.Len() == 0 {
++		// 空のリストに「次に再生」は、末尾に足して先頭から鳴らすのと同じ。
 +		mode = "end"
 +	}
 +
@@ -3344,14 +6100,7 @@ index 0000000..4fc1cf9
 +		m.scrobbleCurrent()
 +		m.player.Stop()
 +		m.player.ClearPreload()
-+		// 2 曲目以降は、シャッフルでなければ再生順でそのまま 1 曲目に続く。
-+		// 待ち行列にも入れると 2 度鳴るので、混ざるシャッフルのときだけ入れる。
-+		if m.playlist.Shuffled() {
-+			for i := 1; i < len(msg.Tracks); i++ {
-+				m.playlist.Queue(start + i)
-+			}
-+		}
-+		m.playlist.SetIndex(start)
++		start := m.playlist.AddNow(msg.Tracks...)
 +		m.plCursor = start
 +		m.status.Showf(statusTTLMedium, "Playing: %s", first.DisplayName())
 +		cmd = m.playCurrentTrack()
@@ -3359,17 +6108,16 @@ index 0000000..4fc1cf9
 +	case "end":
 +		m.status.Showf(statusTTLMedium, "Added: %s", first.DisplayName())
 +		if idle {
-+			m.playlist.SetIndex(start)
++			start := m.playlist.AddAndSelect(msg.Tracks...)
 +			m.plCursor = start
 +			cmd = m.playCurrentTrack()
 +			m.notifyPlayback()
 +		} else {
++			m.playlist.Add(msg.Tracks...)
 +			cmd = m.repreloadIfNextChanged(beforePath, beforeOK)
 +		}
 +	default: // "next"
-+		for i := range msg.Tracks {
-+			m.playlist.Queue(start + i)
-+		}
++		m.playlist.PlayNext(msg.Tracks...)
 +		m.status.Showf(statusTTLMedium, "Queued: %s", first.DisplayName())
 +		if idle {
 +			cmd = m.nextTrack()
@@ -3392,6 +6140,10 @@ index 0000000..4fc1cf9
 +			ipc.SendReply(msg.Reply, ipc.Response{OK: false, Error: "index out of range"})
 +			return nil
 +		}
++		if m.staleIndex(msg.Index, msg.Path) {
++			ipc.SendReply(msg.Reply, ipc.Response{OK: false, Error: ipc.ErrStale.Error()})
++			return nil
++		}
 +		if m.playlist.QueuePosition(msg.Index) == 0 {
 +			m.playlist.Queue(msg.Index)
 +		}
@@ -3400,8 +6152,16 @@ index 0000000..4fc1cf9
 +			ipc.SendReply(msg.Reply, ipc.Response{OK: false, Error: "index out of range"})
 +			return nil
 +		}
++		if m.staleIndex(msg.Index, msg.Path) {
++			ipc.SendReply(msg.Reply, ipc.Response{OK: false, Error: ipc.ErrStale.Error()})
++			return nil
++		}
 +		m.playlist.Dequeue(msg.Index)
 +	case "move":
++		if m.staleQueuePos(msg.Index, msg.Path) {
++			ipc.SendReply(msg.Reply, ipc.Response{OK: false, Error: ipc.ErrStale.Error()})
++			return nil
++		}
 +		if !m.playlist.MoveQueueTo(msg.Index, msg.To) {
 +			ipc.SendReply(msg.Reply, ipc.Response{OK: false, Error: "queue position out of range"})
 +			return nil
@@ -3426,7 +6186,11 @@ index 0000000..4fc1cf9
 +		ipc.SendReply(msg.Reply, ipc.Response{OK: false, Error: "index out of range"})
 +		return nil
 +	}
-+	if msg.Index == m.playlist.Index() && (m.player.IsPlaying() || m.buffering) {
++	if m.staleIndex(msg.Index, msg.Path) {
++		ipc.SendReply(msg.Reply, ipc.Response{OK: false, Error: ipc.ErrStale.Error()})
++		return nil
++	}
++	if msg.Index == m.playlist.Index() && (m.player.IsPlaying() || m.buffering || m.feedTrackPending) {
 +		ipc.SendReply(msg.Reply, ipc.Response{OK: false, Error: "cannot remove the current track"})
 +		return nil
 +	}
@@ -3443,12 +6207,678 @@ index 0000000..4fc1cf9
 +	ipc.SendReply(msg.Reply, ipc.Response{OK: true, Total: m.playlist.Len(), Gen: m.playlist.Gen()})
 +	return cmd
 +}
+diff --git a/ui/model/ipc_gui_stale.go b/ui/model/ipc_gui_stale.go
+new file mode 100644
+index 0000000..92f5dee
+--- /dev/null
++++ b/ui/model/ipc_gui_stale.go
+@@ -0,0 +1,119 @@
++package model
++
++// ipc_gui_stale.go — 遅れて届いた古い非同期の結果を捨てる。
++//
++// 再生の開始 (yt-dlp・HTTP)、gapless の先読み、フィードの展開はどれも
++// tea.Cmd で走り、数秒かかる。その間に GUI (や TUI) が別の曲を選ぶと、
++// 古い結果が後から届いて新しい状態を上書きしていた (表示と違う曲が鳴る、
++// 「次に再生」した曲が飛ばされる、差し替えたリストがフィードのエピソードに
++// 戻る)。どの Cmd にも出したときの番号を持たせ、届いたときに最新でなければ
++// 捨てる。GUI の操作はクリックひとつで起きるので、TUI のキー操作よりずっと
++// 起きやすい。
++
++import (
++	"errors"
++
++	tea "charm.land/bubbletea/v2"
++
++	"cliamp/player"
++)
++
++// beginPlay は playTrack のたびに呼び、この開始の番号を返す。フィードの曲なら
++// 展開待ちの印を立て、そうでなければ前のフィードの展開待ちを取り消す
++// (新しい開始が勝つ。遅れて届く展開の結果は dropStaleFeed で捨てる)。
++func (m *Model) beginPlay(feed bool) uint64 {
++	m.playSeq++
++	switch {
++	case feed:
++		m.feedTrackPending = true
++	case m.feedTrackPending:
++		m.feedTrackPending = false
++		m.feedLoading = false
++	}
++	return m.playSeq
++}
++
++// cancelPendingStart は止めたとき (stop) に呼ぶ。読み込み中の開始や
++// フィードの展開を取り消し、遅れて届く結果を捨てさせる (止めたのに後から
++// 鳴り出したり、読み込み中のまま再生の操作を受け付けなかったりしないように)。
++func (m *Model) cancelPendingStart() {
++	m.playSeq++
++	m.buffering = false
++	if m.feedTrackPending {
++		m.feedTrackPending = false
++		m.feedLoading = false
++	}
++}
++
++// dropStalePlayed は streamPlayedMsg が古い開始のものなら捨てる (true)。
++// 新しい開始が進行中なら buffering はそちらが下ろす。プレイヤーが
++// ErrSuperseded を返した (開始の途中で Stop された) ときは読み込み待ちを
++// 下ろす。ただし鳴っているなら、後から始まった古い開始が勝っているので、
++// いまの曲をもう一度始める。
++func (m *Model) dropStalePlayed(msg streamPlayedMsg) (bool, tea.Cmd) {
++	if msg.seq != m.playSeq {
++		return true, nil
++	}
++	if !errors.Is(msg.err, player.ErrSuperseded) {
++		return false, nil
++	}
++	if m.player.IsPlaying() {
++		if track, idx := m.playlist.Current(); idx >= 0 {
++			return true, m.playTrack(track)
++		}
++	}
++	m.buffering = false
++	m.notifyAll()
++	return true, nil
++}
++
++// dropStaleFeed は feedTrackResolvedMsg が古い要求のものなら捨てる (true)。
++// 要求のあとに別の曲を始めた (playSeq が進んだ) か、リストが差し替わった
++// (Epoch が変わった) なら、展開したエピソードでリストを置き換えない。
++func (m *Model) dropStaleFeed(msg feedTrackResolvedMsg) bool {
++	if msg.seq != m.playSeq {
++		return true // 新しい開始が展開待ちの印を下ろしている
++	}
++	m.feedTrackPending = false
++	if msg.epoch != m.playlist.Epoch() {
++		m.feedLoading = false
++		return true
++	}
++	return false
++}
++
++// beginPreload は先読みを始めるたびに呼び、その番号を返す。
++func (m *Model) beginPreload() uint64 {
++	m.preloading = true
++	m.preloadSeq++
++	return m.preloadSeq
++}
++
++// preloadFinished は先読みの完了 (streamPreloadedMsg) を受ける。
++// プレイヤーは最後に終わった先読みを gapless の次に据えるので、次の曲が
++// 変わったあとに古い先読みが遅れて終わると、表示は新しい次の曲へ進むのに
++// 古い曲が鳴る。
++//   - 新しい先読みがまだ走っていれば、それが上書きするので何もしない。
++//   - 古い先読みが新しいものの後に終わった (上書きした) なら、捨てて取り直す。
++//   - 最新の先読みでも、その間に次の曲が変わっていれば (取り直しが
++//     読み込み中などで見送られたとき)、捨てて取り直す。
++func (m *Model) preloadFinished(msg streamPreloadedMsg) tea.Cmd {
++	if msg.seq != m.preloadSeq {
++		if m.preloading || msg.err != nil {
++			return nil // 新しい先読みが上書きする / 失敗して何も据えていない
++		}
++	} else {
++		m.preloading = false
++		if msg.err != nil {
++			return nil // 何も据えていない。tick が取り直す
++		}
++		if want, ok := m.playlist.PeekNext(); ok && want.Path == msg.path {
++			return nil
++		}
++	}
++	m.player.ClearPreload()
++	if m.player.IsPlaying() && !m.player.IsPaused() && !m.buffering {
++		return m.preloadNext()
++	}
++	return nil
++}
+diff --git a/ui/model/ipc_gui_stale_test.go b/ui/model/ipc_gui_stale_test.go
+new file mode 100644
+index 0000000..1826fbc
+--- /dev/null
++++ b/ui/model/ipc_gui_stale_test.go
+@@ -0,0 +1,535 @@
++package model
++
++// 遅れて届く古い非同期の結果 (ipc_gui_stale.go) と、GUI の enqueue・remove の
++// 並べ方の試験。
++
++import (
++	"errors"
++	"slices"
++	"testing"
++	"time"
++
++	tea "charm.land/bubbletea/v2"
++
++	"cliamp/internal/playback"
++	"cliamp/ipc"
++	"cliamp/player"
++	"cliamp/playlist"
++)
++
++// raceEngine は本物のプレイヤーの「最後に終わった Preload が gapless の次に
++// 据わる」を真似る。ytdlErr は PlayYTDL が返す値 (本物は、組み立て中に
++// Stop や別の開始があると ErrSuperseded を返す)。
++type raceEngine struct {
++	guiFakeEngine
++	armed   string
++	ytdlErr error
++}
++
++func (f *raceEngine) PlayYTDL(path string, _ time.Duration) error {
++	f.playCalls = append(f.playCalls, path)
++	if f.ytdlErr != nil {
++		return f.ytdlErr
++	}
++	f.playing = true
++	return nil
++}
++func (f *raceEngine) Preload(path string, _ time.Duration) error     { f.armed = path; return nil }
++func (f *raceEngine) PreloadYTDL(path string, _ time.Duration) error { f.armed = path; return nil }
++func (f *raceEngine) ClearPreload()                                  { f.clearPreloads++; f.armed = "" }
++func (f *raceEngine) HasPreload() bool                               { return f.armed != "" }
++
++func newRaceModel(tracks []playlist.Track) (Model, *raceEngine) {
++	m, _ := newGUITestModel()
++	eng := &raceEngine{}
++	m.player = eng
++	m.playlist.Replace(tracks)
++	return m, eng
++}
++
++// runCmd は cmd を走らせ (tea.Batch はほどく)、出たメッセージを返す。
++func runCmd(cmd tea.Cmd) []tea.Msg {
++	if cmd == nil {
++		return nil
++	}
++	msg := cmd()
++	if b, ok := msg.(tea.BatchMsg); ok {
++		var out []tea.Msg
++		for _, c := range b {
++			out = append(out, runCmd(c)...)
++		}
++		return out
++	}
++	if msg == nil {
++		return nil
++	}
++	return []tea.Msg{msg}
++}
++
++// settle は cmd を走らせ、出たメッセージを Update に通し、返った Cmd も
++// 尽きるまで同じく走らせる (bubbletea がするのと同じ)。
++func settle(t *testing.T, m Model, cmd tea.Cmd) Model {
++	t.Helper()
++	queue := []tea.Cmd{cmd}
++	for n := 0; len(queue) > 0; n++ {
++		if n > 50 {
++			t.Fatal("commands did not settle")
++		}
++		c := queue[0]
++		queue = queue[1:]
++		for _, msg := range runCmd(c) {
++			next, more := m.Update(msg)
++			m = next.(Model)
++			queue = append(queue, more)
++		}
++	}
++	return m
++}
++
++func update(m Model, msg tea.Msg) (Model, tea.Cmd) {
++	next, cmd := m.Update(msg)
++	return next.(Model), cmd
++}
++
++func titlesUntilEnd(pl *playlist.Playlist) []string {
++	var out []string
++	for range 100 {
++		t, ok := pl.Next()
++		if !ok {
++			break
++		}
++		out = append(out, t.Title)
++	}
++	return out
++}
++
++func assertArmedIsNext(t *testing.T, m Model, eng *raceEngine) {
++	t.Helper()
++	want, _ := m.playlist.PeekNext()
++	if eng.armed != want.Path {
++		t.Fatalf("gapless will play %q but playlist.Next() reports %q (preloading=%v)", eng.armed, want.Path, m.preloading)
++	}
++}
++
++// 次の曲の先読み (yt-dlp なら数秒) が走っている間に queue_edit で次の曲が
++// 変わっても、どちらの先読みが先に終わっても据わるのは新しい次の曲。
++func TestInFlightPreloadAfterQueueEdit(t *testing.T) {
++	for _, oldLast := range []bool{true, false} {
++		m, eng := newRaceModel(newGUITestTracks("a", "b", "c"))
++		m.playlist.SetIndex(0)
++		oldPreload := m.playCurrentTrack() // a を鳴らし、b の先読みが走る
++		if !m.preloading {
++			t.Fatal("expected a preload in flight")
++		}
++		m, newPreload := update(m, ipc.QueueEditMsg{Mode: "add", Index: 2, Reply: make(chan ipc.Response, 1)})
++		if oldLast {
++			m = settle(t, m, newPreload)
++			m = settle(t, m, oldPreload)
++		} else {
++			m = settle(t, m, oldPreload)
++			m = settle(t, m, newPreload)
++		}
++		assertArmedIsNext(t, m, eng)
++		if m.preloading {
++			t.Fatalf("oldLast=%v: preloading left set", oldLast)
++		}
++	}
++}
++
++// replace の前の先読みが replace の後に据わっても、新しいリストの次の曲に直す。
++func TestInFlightPreloadAfterReplace(t *testing.T) {
++	for _, oldLast := range []bool{true, false} {
++		m, eng := newRaceModel(newGUITestTracks("old1", "old2"))
++		m.playlist.SetIndex(0)
++		oldPreload := m.playCurrentTrack()
++		m, newCmds := update(m, ipc.ReplaceMsg{Tracks: newGUITestTracks("new1", "new2"), Index: 0, Reply: make(chan ipc.Response, 1)})
++		if oldLast {
++			m = settle(t, m, newCmds)
++			m = settle(t, m, oldPreload)
++		} else {
++			m = settle(t, m, oldPreload)
++			m = settle(t, m, newCmds)
++		}
++		if eng.armed != "new2.flac" {
++			t.Fatalf("oldLast=%v: gapless next = %q, want new2.flac", oldLast, eng.armed)
++		}
++	}
++}
++
++// 読み込みに時間のかかる曲 (yt-dlp) へ replace した直後に、前のリストの
++// 先読みが据わった: 新しい先読みは始まっていないので、番号ではなく曲で見分けて捨てる。
++func TestInFlightPreloadAfterReplaceWithBufferingTrack(t *testing.T) {
++	m, eng := newRaceModel(newGUITestTracks("old1", "old2"))
++	m.playlist.SetIndex(0)
++	oldPreload := m.playCurrentTrack()
++	yt := playlist.Track{Path: "https://www.youtube.com/watch?v=AAAAAAAAAAA", Title: "yt"}
++	m, start := update(m, ipc.ReplaceMsg{Tracks: []playlist.Track{yt, {Path: "new2.flac", Title: "new2"}}, Reply: make(chan ipc.Response, 1)})
++	if !m.buffering {
++		t.Fatal("expected buffering")
++	}
++	m = settle(t, m, oldPreload) // old2 が据わる
++	if eng.armed != "" {
++		t.Fatalf("stale preload of %q left armed while the new list plays", eng.armed)
++	}
++	m = settle(t, m, start) // yt が鳴り出し、new2 を先読みする
++	if eng.armed != "new2.flac" {
++		t.Fatalf("gapless next = %q, want new2.flac", eng.armed)
++	}
++}
++
++// yt-dlp の曲の読み込み中に手元の曲へ replace した: 手元の曲は同期で鳴るので
++// その時点で読み込み待ちは終わり、遅れて届く古い開始の知らせは何も変えない。
++func TestReplaceWhileBufferingIgnoresStaleStart(t *testing.T) {
++	yt := playlist.Track{Path: "https://www.youtube.com/watch?v=AAAAAAAAAAA", Title: "A"}
++	for _, stale := range []error{nil, player.ErrSuperseded} {
++		m, eng := newRaceModel([]playlist.Track{yt})
++		m.playlist.SetIndex(0)
++		oldStart := m.playCurrentTrack()
++		if !m.buffering {
++			t.Fatal("expected buffering")
++		}
++		m, _ = sendGUI(t, m, func(r chan ipc.Response) tea.Msg {
++			return ipc.ReplaceMsg{Tracks: newGUITestTracks("local"), Reply: r}
++		})
++		if m.buffering {
++			t.Fatal("still buffering after a synchronous local start")
++		}
++		eng.ytdlErr = stale
++		m = settle(t, m, oldStart)
++		cur, _ := m.playlist.Current()
++		if cur.Title != "local" || m.buffering || m.err != nil {
++			t.Fatalf("stale=%v: current=%q buffering=%v err=%v", stale, cur.Title, m.buffering, m.err)
++		}
++		if cmd := m.togglePlayPause(); m.buffering {
++			t.Fatalf("play/pause stuck (cmd=%v)", cmd != nil)
++		}
++	}
++}
++
++// 読み込み中に止めた (IPC の stop): プレイヤーは古い開始を捨てて
++// ErrSuperseded を返す。読み込み待ちを下ろし、エラーにはしない。
++func TestStopWhileBufferingClearsBuffering(t *testing.T) {
++	yt := playlist.Track{Path: "https://www.youtube.com/watch?v=AAAAAAAAAAA", Title: "A"}
++	m, eng := newRaceModel([]playlist.Track{yt})
++	m.playlist.SetIndex(0)
++	start := m.playCurrentTrack()
++	m, _ = update(m, playback.StopMsg{})
++	if m.buffering {
++		t.Fatal("still buffering right after stop")
++	}
++	eng.ytdlErr = player.ErrSuperseded
++	m = settle(t, m, start)
++	if m.buffering || m.err != nil {
++		t.Fatalf("after stop: buffering=%v err=%v", m.buffering, m.err)
++	}
++	var resp ipc.Response
++	m, resp = sendGUI(t, m, func(r chan ipc.Response) tea.Msg { return ipc.StatusRequestMsg{Reply: r} })
++	if resp.Buffering == nil || *resp.Buffering {
++		t.Fatalf("status buffering = %v, want false", resp.Buffering)
++	}
++}
++
++// 最新の開始が ErrSuperseded になったのに鳴っている: 後から始まった古い開始が
++// 勝っているので、いまの曲をもう一度始める。
++func TestSupersededLatestStartWhilePlayingRestarts(t *testing.T) {
++	yt := playlist.Track{Path: "https://www.youtube.com/watch?v=AAAAAAAAAAA", Title: "A"}
++	m, eng := newRaceModel([]playlist.Track{yt})
++	m.playlist.SetIndex(0)
++	start := m.playCurrentTrack()
++	eng.playing = true // 古い開始の曲が鳴っている
++	eng.ytdlErr = player.ErrSuperseded
++	msgs := runCmd(start)
++	eng.ytdlErr = nil
++	m, restart := update(m, msgs[0])
++	if restart == nil || !m.buffering {
++		t.Fatal("superseded latest start while playing was not restarted")
++	}
++	m = settle(t, m, restart)
++	if m.buffering || len(eng.playCalls) != 2 || eng.playCalls[1] != yt.Path {
++		t.Fatalf("buffering=%v plays=%v", m.buffering, eng.playCalls)
++	}
++}
++
++// フィードの曲の展開中に GUI がリストを差し替えたら、遅れて届いた展開は
++// 捨てる (差し替えたリストをエピソードで上書きしない)。
++func TestStaleFeedResolutionAfterGUIReplace(t *testing.T) {
++	feed := playlist.Track{Path: "https://example.com/podcast.rss", Title: "Pod", Feed: true, Stream: true}
++	m, eng := newRaceModel(nil)
++	// GUI が feed の行で replace し、続けてアルバムで replace する。
++	m, _ = sendGUI(t, m, func(r chan ipc.Response) tea.Msg {
++		return ipc.ReplaceMsg{Tracks: []playlist.Track{feed}, Reply: r}
++	})
++	if !m.feedLoading || !m.feedTrackPending {
++		t.Fatal("expected the feed to be loading")
++	}
++	seq, epoch := m.playSeq, m.playlist.Epoch()
++	src := ipc.SourceInfo{Provider: "local", ID: "Mine", Name: "Mine"}
++	m, _ = sendGUI(t, m, func(r chan ipc.Response) tea.Msg {
++		return ipc.ReplaceMsg{Tracks: newGUITestTracks("a", "b"), Source: src, Reply: r}
++	})
++	var status ipc.Response
++	m, status = sendGUI(t, m, func(r chan ipc.Response) tea.Msg { return ipc.StatusRequestMsg{Reply: r} })
++	if *status.Buffering {
++		t.Fatal("status still reports buffering for the abandoned feed while the album plays")
++	}
++	m, _ = update(m, feedTrackResolvedMsg{tracks: newGUITestTracks("ep1", "ep2", "ep3"), seq: seq, epoch: epoch})
++	cur, _ := m.playlist.Current()
++	if cur.Title != "a" || m.playlist.Len() != 2 || eng.playCalls[len(eng.playCalls)-1] != "a.flac" {
++		t.Fatalf("stale feed result replaced the list: len=%d current=%q plays=%v", m.playlist.Len(), cur.Title, eng.playCalls)
++	}
++	if got := m.listSource(); got == nil || *got != src {
++		t.Fatalf("source = %v, want %v", got, src)
++	}
++
++	// 遅れて届いた展開の失敗も、新しい曲の読み込み待ちやエラーに触らない。
++	yt := playlist.Track{Path: "https://www.youtube.com/watch?v=AAAAAAAAAAA", Title: "yt"}
++	m, _ = sendGUI(t, m, func(r chan ipc.Response) tea.Msg {
++		return ipc.ReplaceMsg{Tracks: []playlist.Track{feed}, Reply: r}
++	})
++	seq, epoch = m.playSeq, m.playlist.Epoch()
++	m, _ = sendGUI(t, m, func(r chan ipc.Response) tea.Msg {
++		return ipc.ReplaceMsg{Tracks: []playlist.Track{yt}, Reply: r}
++	})
++	if !m.buffering {
++		t.Fatal("expected buffering for the yt-dlp track")
++	}
++	m, _ = update(m, feedTrackResolvedMsg{seq: seq, epoch: epoch, err: errors.New("feed: 404")})
++	if !m.buffering || m.err != nil {
++		t.Fatalf("stale feed error: buffering=%v err=%v", m.buffering, m.err)
++	}
++}
++
++// 最新のフィードの展開はこれまでどおりリストを置き換え、失敗はエラーに出す。
++func TestFreshFeedResolution(t *testing.T) {
++	feed := playlist.Track{Path: "https://example.com/podcast.rss", Title: "Pod", Feed: true, Stream: true}
++	m, _ := newRaceModel([]playlist.Track{feed})
++	m.loadedPlaylist = "Mine"
++	m.playlist.SetIndex(0)
++	_ = m.playCurrentTrack()
++	m, _ = update(m, feedTrackResolvedMsg{tracks: newGUITestTracks("ep1", "ep2"), seq: m.playSeq, epoch: m.playlist.Epoch()})
++	if cur, _ := m.playlist.Current(); cur.Title != "ep1" || m.feedLoading || m.feedTrackPending || m.loadedPlaylist != "" {
++		t.Fatalf("current=%q feedLoading=%v pending=%v loadedPlaylist=%q", cur.Title, m.feedLoading, m.feedTrackPending, m.loadedPlaylist)
++	}
++
++	m, _ = newRaceModel([]playlist.Track{feed})
++	m.playlist.SetIndex(0)
++	_ = m.playCurrentTrack()
++	m, _ = update(m, feedTrackResolvedMsg{seq: m.playSeq, epoch: m.playlist.Epoch(), err: errors.New("feed: 404")})
++	if m.err == nil || m.feedLoading || m.feedTrackPending {
++		t.Fatalf("err=%v feedLoading=%v pending=%v", m.err, m.feedLoading, m.feedTrackPending)
++	}
++}
++
++// フィードの展開待ちの間の enqueue end は、止まっているときと同じく足した曲を
++// 鳴らし、展開は取り消す (展開したエピソードが足した曲ごとリストを置き換えない)。
++func TestEnqueueDuringFeedLoading(t *testing.T) {
++	feed := playlist.Track{Path: "https://example.com/podcast.rss", Title: "Pod", Feed: true, Stream: true}
++	m, eng := newRaceModel(nil)
++	m, _ = sendGUI(t, m, func(r chan ipc.Response) tea.Msg {
++		return ipc.ReplaceMsg{Tracks: []playlist.Track{feed}, Reply: r}
++	})
++	seq, epoch := m.playSeq, m.playlist.Epoch()
++	m, _ = sendGUI(t, m, func(r chan ipc.Response) tea.Msg {
++		return ipc.EnqueueMsg{Tracks: newGUITestTracks("x"), Mode: "end", Reply: r}
++	})
++	m, _ = update(m, feedTrackResolvedMsg{tracks: newGUITestTracks("ep1"), seq: seq, epoch: epoch})
++	if cur, _ := m.playlist.Current(); cur.Title != "x" || eng.playCalls[len(eng.playCalls)-1] != "x.flac" || m.playlist.Len() != 2 {
++		t.Fatalf("current=%q len=%d plays=%v", cur.Title, m.playlist.Len(), eng.playCalls)
++	}
++	// 展開待ちの行は消せない。
++	m, resp := sendGUI(t, m, func(r chan ipc.Response) tea.Msg {
++		return ipc.ReplaceMsg{Tracks: []playlist.Track{feed, {Path: "y.flac", Title: "y"}}, Reply: r}
++	})
++	if !resp.OK || !m.feedTrackPending {
++		t.Fatalf("replace = %+v pending=%v", resp, m.feedTrackPending)
++	}
++	if _, resp = sendGUI(t, m, func(r chan ipc.Response) tea.Msg { return ipc.RemoveMsg{Index: 0, Reply: r} }); resp.OK {
++		t.Fatal("removed the feed row that is being resolved")
++	}
++	// 同じ行をもう一度押しても 2 度目の展開は始めない。
++	seq = m.playSeq
++	m, _ = sendGUI(t, m, func(r chan ipc.Response) tea.Msg { return ipc.PlayIndexMsg{Index: 0, Reply: r} })
++	if m.playSeq != seq {
++		t.Fatal("play_index on the loading feed row started a second resolution")
++	}
++}
++
++// シャッフル中の enqueue now は、これから鳴るはずだった曲を飛ばさない。
++func TestEnqueueNowWithShuffleKeepsUpcoming(t *testing.T) {
++	names := []string{"t00", "t01", "t02", "t03", "t04", "t05", "t06", "t07", "t08", "t09"}
++	for range 100 {
++		m, _ := newGUITestModel(names...)
++		m.playlist.ToggleShuffle()
++		startPlaying(&m, 0)
++		cur, _ := m.playlist.Current()
++		before := len(m.playlist.Upcoming(100))
++
++		m, resp := sendGUI(t, m, func(r chan ipc.Response) tea.Msg {
++			return ipc.EnqueueMsg{Tracks: newGUITestTracks("X"), Mode: "now", Reply: r}
++		})
++		if now, _ := m.playlist.Current(); !resp.OK || now.Title != "X" {
++			t.Fatalf("resp=%+v current=%q", resp, now.Title)
++		}
++		if got := len(m.playlist.Upcoming(100)); got != before {
++			t.Fatalf("up next shrank from %d to %d", before, got)
++		}
++		played := titlesUntilEnd(m.playlist)
++		for _, n := range names {
++			if n != cur.Title && !slices.Contains(played, n) {
++				t.Fatalf("%s was skipped (played %v)", n, played)
++			}
++		}
++	}
++}
++
++// 止まっているとき (リストを最後まで鳴らし終えたあとなど) のシャッフル中の
++// enqueue end も、足した曲のうち先頭しか鳴らさずに終わることはない。
++func TestEnqueueEndWhenIdleWithShuffleKeepsAddedTracks(t *testing.T) {
++	added := []string{"x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9"}
++	for range 100 {
++		m, eng := newGUITestModel("a", "b", "c")
++		m.playlist.ToggleShuffle()
++		startPlaying(&m, 0)
++		titlesUntilEnd(m.playlist) // 最後まで鳴らした
++		eng.Stop()
++
++		m, _ = sendGUI(t, m, func(r chan ipc.Response) tea.Msg {
++			return ipc.EnqueueMsg{Tracks: newGUITestTracks(added...), Mode: "end", Reply: r}
++		})
++		if last := eng.playCalls[len(eng.playCalls)-1]; last != "x0.flac" {
++			t.Fatalf("played %q, want x0.flac", last)
++		}
++		played := titlesUntilEnd(m.playlist)
++		for _, n := range added[1:] {
++			if !slices.Contains(played, n) {
++				t.Fatalf("%s was skipped (played %v)", n, played)
++			}
++		}
++	}
++}
++
++// 「次に再生」した曲は 1 度だけ鳴り、up_next はそのとおりに示す。
++func TestEnqueueNextPlaysOnce(t *testing.T) {
++	for _, tt := range []struct {
++		name    string
++		list    []string
++		current int
++		add     []string
++		want    []string
++	}{
++		{"middle", []string{"a", "b", "c"}, 0, []string{"X"}, []string{"X", "b", "c"}},
++		{"last track", []string{"a", "b", "c"}, 2, []string{"X"}, []string{"X"}},
++		{"album", []string{"a"}, 0, []string{"X1", "X2", "X3"}, []string{"X1", "X2", "X3"}},
++	} {
++		t.Run(tt.name, func(t *testing.T) {
++			m, _ := newGUITestModel(tt.list...)
++			startPlaying(&m, tt.current)
++			m, resp := sendGUI(t, m, func(r chan ipc.Response) tea.Msg {
++				return ipc.EnqueueMsg{Tracks: newGUITestTracks(tt.add...), Mode: "next", Reply: r}
++			})
++			if !resp.OK {
++				t.Fatalf("resp = %+v", resp)
++			}
++			_, snap := sendGUI(t, m, func(r chan ipc.Response) tea.Msg { return ipc.PlaylistRequestMsg{Reply: r} })
++			var upNext []string
++			for _, i := range snap.UpNext {
++				upNext = append(upNext, snap.Tracks[i].Title)
++			}
++			played := titlesUntilEnd(m.playlist)
++			if !slices.Equal(played, tt.want) || !slices.Equal(upNext, tt.want) || len(snap.Queue) != 0 {
++				t.Fatalf("played %v, up_next %v, queue %v; want %v", played, upNext, snap.Queue, tt.want)
++			}
++		})
++	}
++}
++
++// 1 曲リピート中は順送りで進まないので、「次に再生」は従来どおり待ち行列に入る。
++func TestEnqueueNextWithRepeatOneUsesQueue(t *testing.T) {
++	m, _ := newGUITestModel("a", "b")
++	m.playlist.SetRepeat(playlist.RepeatOne)
++	startPlaying(&m, 0)
++	m, _ = sendGUI(t, m, func(r chan ipc.Response) tea.Msg {
++		return ipc.EnqueueMsg{Tracks: newGUITestTracks("X"), Mode: "next", Reply: r}
++	})
++	if next, _ := m.playlist.Next(); next.Title != "X" {
++		t.Fatalf("next = %q, want X", next.Title)
++	}
++	if next, _ := m.playlist.Next(); next.Title != "a" {
++		t.Fatalf("after X = %q, want a again (repeat one)", next.Title)
++	}
++}
++
++// 待ち行列の曲が鳴っている間に、その前に鳴ったリストの曲を消しても、
++// 次の曲は飛ばされない。
++func TestRemovePastTrackWhileQueuedKeepsNext(t *testing.T) {
++	m, eng := newGUITestModel("a", "b", "c", "d")
++	startPlaying(&m, 0) // a
++	m, resp := sendGUI(t, m, func(r chan ipc.Response) tea.Msg {
++		return ipc.QueueEditMsg{Mode: "add", Index: 3, Reply: r}
++	})
++	if !resp.OK {
++		t.Fatalf("queue add = %+v", resp)
++	}
++	m.nextTrack() // a が終わり、待ち行列の d
++	if cur, _ := m.playlist.Current(); cur.Title != "d" || !m.playlist.CurrentIsQueued() {
++		t.Fatalf("current = %q, want queued d", cur.Title)
++	}
++	m, resp = sendGUI(t, m, func(r chan ipc.Response) tea.Msg { return ipc.RemoveMsg{Index: 0, Path: "a.flac", Reply: r} })
++	if !resp.OK {
++		t.Fatalf("remove a = %+v", resp)
++	}
++	_, snap := sendGUI(t, m, func(r chan ipc.Response) tea.Msg { return ipc.PlaylistRequestMsg{Reply: r} })
++	if !slices.Equal(snap.UpNext, []int{0, 1, 2}) { // b c d
++		t.Fatalf("up_next = %v, want [0 1 2] (b c d)", snap.UpNext)
++	}
++	m.nextTrack()
++	if last := eng.playCalls[len(eng.playCalls)-1]; last != "b.flac" {
++		t.Fatalf("after the queued d, played %q, want b.flac", last)
++	}
++}
++
++// 添字と一緒に送った path がいまのリストのその曲と違えば (GUI の写しが古い)、
++// 何も変えずに stale を返す。
++func TestGUIIndexCommandsRejectStalePath(t *testing.T) {
++	m, eng := newGUITestModel("a", "b", "c", "d")
++	startPlaying(&m, 0)
++	m, _ = sendGUI(t, m, func(r chan ipc.Response) tea.Msg { return ipc.QueueEditMsg{Mode: "add", Index: 2, Reply: r} })
++	m, _ = sendGUI(t, m, func(r chan ipc.Response) tea.Msg { return ipc.QueueEditMsg{Mode: "add", Index: 3, Reply: r} })
++	gen, calls := m.playlist.Gen(), len(eng.playCalls)
++
++	for _, build := range []func(r chan ipc.Response) tea.Msg{
++		func(r chan ipc.Response) tea.Msg { return ipc.PlayIndexMsg{Index: 1, Path: "c.flac", Reply: r} },
++		func(r chan ipc.Response) tea.Msg { return ipc.RemoveMsg{Index: 1, Path: "c.flac", Reply: r} },
++		func(r chan ipc.Response) tea.Msg {
++			return ipc.QueueEditMsg{Mode: "add", Index: 1, Path: "c.flac", Reply: r}
++		},
++		func(r chan ipc.Response) tea.Msg {
++			return ipc.QueueEditMsg{Mode: "remove", Index: 2, Path: "d.flac", Reply: r}
++		},
++		// 待ち行列 [c d] の位置 0 は c。d のつもりの move は古い。
++		func(r chan ipc.Response) tea.Msg {
++			return ipc.QueueEditMsg{Mode: "move", Index: 0, To: 1, Path: "d.flac", Reply: r}
++		},
++	} {
++		var resp ipc.Response
++		m, resp = sendGUI(t, m, build)
++		if resp.OK || resp.Error != "stale" {
++			t.Fatalf("%T = %+v, want error stale", build(nil), resp)
++		}
++	}
++	if m.playlist.Gen() != gen || len(eng.playCalls) != calls || !slices.Equal(m.playlist.QueueIndices(), []int{2, 3}) {
++		t.Fatal("a stale request changed the list")
++	}
++
++	// 合っていれば (または path を送らなければ) これまでどおり。
++	m, resp := sendGUI(t, m, func(r chan ipc.Response) tea.Msg {
++		return ipc.QueueEditMsg{Mode: "move", Index: 1, To: 0, Path: "d.flac", Reply: r}
++	})
++	if !resp.OK || !slices.Equal(resp.Queue, []int{3, 2}) {
++		t.Fatalf("move with the right path = %+v", resp)
++	}
++	m, resp = sendGUI(t, m, func(r chan ipc.Response) tea.Msg { return ipc.PlayIndexMsg{Index: 1, Path: "b.flac", Reply: r} })
++	if cur, _ := m.playlist.Current(); !resp.OK || cur.Title != "b" {
++		t.Fatalf("play_index with the right path = %+v current=%q", resp, cur.Title)
++	}
++}
 diff --git a/ui/model/ipc_gui_test.go b/ui/model/ipc_gui_test.go
 new file mode 100644
-index 0000000..588b768
+index 0000000..8ff9451
 --- /dev/null
 +++ b/ui/model/ipc_gui_test.go
-@@ -0,0 +1,470 @@
+@@ -0,0 +1,477 @@
 +package model
 +
 +import (
@@ -3646,8 +7076,13 @@ index 0000000..588b768
 +	if !resp.OK || resp.Total != 4 {
 +		t.Fatalf("resp = %+v", resp)
 +	}
-+	if got := m.playlist.QueueIndices(); !slices.Equal(got, []int{2, 3}) {
-+		t.Fatalf("queue = %v, want [2 3]", got)
++	// 待ち行列ではなく、再生順でいまの曲のすぐ後ろに並ぶ (待ち行列に入れると
++	// 待ち行列とリストの順で 2 度鳴る)。up_next にもそのとおり出る。
++	if got := m.playlist.QueueIndices(); len(got) != 0 {
++		t.Fatalf("queue = %v, want empty", got)
++	}
++	if got := m.playlist.Upcoming(10); !slices.Equal(got, []int{2, 3, 1}) {
++		t.Fatalf("up next = %v, want [2 3 1]", got)
 +	}
 +	if len(eng.playCalls) != calls {
 +		t.Fatal("enqueue next restarted playback")
@@ -3661,7 +7096,7 @@ index 0000000..588b768
 +	}
 +}
 +
-+func TestGUIEnqueueNextWhenStoppedPlaysQueued(t *testing.T) {
++func TestGUIEnqueueNextWhenStoppedPlaysFirst(t *testing.T) {
 +	m, eng := newGUITestModel("a", "b")
 +	m, resp := sendGUI(t, m, func(r chan ipc.Response) tea.Msg {
 +		return ipc.EnqueueMsg{Tracks: newGUITestTracks("x", "y"), Mode: "next", Reply: r}
@@ -3669,8 +7104,8 @@ index 0000000..588b768
 +	if !resp.OK || len(eng.playCalls) != 1 || eng.playCalls[0] != "x.flac" {
 +		t.Fatalf("resp=%+v plays=%v, want x played", resp, eng.playCalls)
 +	}
-+	if got := m.playlist.QueueIndices(); !slices.Equal(got, []int{3}) {
-+		t.Fatalf("queue = %v, want [3]", got)
++	if got := titlesUntilEnd(m.playlist); !slices.Equal(got, []string{"y", "b"}) {
++		t.Fatalf("after x: %v, want [y b]", got)
 +	}
 +}
 +
@@ -3728,8 +7163,10 @@ index 0000000..588b768
 +	m, _ = sendGUI(t, m, func(r chan ipc.Response) tea.Msg {
 +		return ipc.EnqueueMsg{Tracks: newGUITestTracks("x", "y"), Mode: "now", Reply: r}
 +	})
-+	if cur, _ := m.playlist.Current(); cur.Title != "x" || !slices.Equal(m.playlist.QueueIndices(), []int{3}) {
-+		t.Fatalf("shuffle: current=%q queue=%v, want x and [3]", cur.Title, m.playlist.QueueIndices())
++	// シャッフルでも y は再生順で x のすぐ後ろ (待ち行列には入れない)。
++	next, _ := m.playlist.PeekNext()
++	if cur, _ := m.playlist.Current(); cur.Title != "x" || next.Title != "y" || m.playlist.QueueLen() != 0 {
++		t.Fatalf("shuffle: current=%q next=%q queue=%v, want x, y and empty", cur.Title, next.Title, m.playlist.QueueIndices())
 +	}
 +}
 +
@@ -3932,7 +7369,7 @@ index d41136f..97117e4 100644
  	m.loadedPlaylist = m.plManager.selPlaylist
  	if startIdx < 0 || startIdx >= m.playlist.Len() {
 diff --git a/ui/model/model.go b/ui/model/model.go
-index e9ec48c..a243bc6 100644
+index e9ec48c..313541d 100644
 --- a/ui/model/model.go
 +++ b/ui/model/model.go
 @@ -6,6 +6,7 @@ import (
@@ -3943,7 +7380,7 @@ index e9ec48c..a243bc6 100644
  	"cliamp/luaplugin"
  	"cliamp/player"
  	"cliamp/playlist"
-@@ -221,6 +222,11 @@ type Model struct {
+@@ -221,6 +222,18 @@ type Model struct {
  	// row in the provider browser. Empty when no provider playlist is active.
  	activeProviderPlaylistID string
  
@@ -3952,11 +7389,89 @@ index e9ec48c..a243bc6 100644
 +	guiSource      ipc.SourceInfo
 +	guiSourceEpoch uint64
 +
++	// 遅れて届く古い非同期の結果を見分ける番号 (ipc_gui_stale.go)。playSeq は
++	// playTrack のたび、preloadSeq は先読みを始めるたびに増える。
++	// feedTrackPending はフィードの曲を展開している間だけ立つ。
++	playSeq          uint64
++	preloadSeq       uint64
++	feedTrackPending bool
++
  	// exitResume holds the playback state captured just before player.Close()
  	// so ResumeState() can read it after the player is shut down.
  	exitResume struct {
+diff --git a/ui/model/playback.go b/ui/model/playback.go
+index ec55d60..e695611 100644
+--- a/ui/model/playback.go
++++ b/ui/model/playback.go
+@@ -170,10 +170,12 @@ func (m *Model) removeSelectedFromPlaylist() {
+ // playTrack plays a track, using async HTTP for streams and sync I/O for local files.
+ // yt-dlp URLs are streamed via a piped yt-dlp | ffmpeg chain for instant playback.
+ func (m *Model) playTrack(track playlist.Track) tea.Cmd {
+-	if track.Feed || playlist.IsFeed(track.Path) {
++	feed := track.Feed || playlist.IsFeed(track.Path)
++	seq := m.beginPlay(feed)
++	if feed {
+ 		m.feedLoading = true
+ 		m.status.Show("Loading feed...", statusTTLLong)
+-		return resolveFeedTrackCmd(track.Path)
++		return resolveFeedTrackCmd(track.Path, seq, m.playlist.Epoch())
+ 	}
+ 
+ 	m.reconnect.attempts = 0
+@@ -202,9 +204,9 @@ func (m *Model) playTrack(track playlist.Track) tea.Cmd {
+ 		m.err = nil
+ 		dur := time.Duration(track.DurationSecs) * time.Second
+ 		if fetchCmd != nil {
+-			return tea.Batch(playYTDLStreamCmd(m.player, track.Path, dur), fetchCmd)
++			return tea.Batch(playYTDLStreamCmd(m.player, track.Path, dur, seq), fetchCmd)
+ 		}
+-		return playYTDLStreamCmd(m.player, track.Path, dur)
++		return playYTDLStreamCmd(m.player, track.Path, dur, seq)
+ 	}
+ 	// Fire now-playing notification for Navidrome tracks.
+ 	m.nowPlaying(track)
+@@ -213,8 +215,11 @@ func (m *Model) playTrack(track playlist.Track) tea.Cmd {
+ 		m.buffering = true
+ 		m.bufferingAt = time.Now()
+ 		m.err = nil
+-		return tea.Batch(playStreamCmd(m.player, track.Path, dur), fetchCmd)
++		return tea.Batch(playStreamCmd(m.player, track.Path, dur, seq), fetchCmd)
+ 	}
++	// The start is synchronous, so nothing is buffering any more (an earlier
++	// async start still in flight is superseded and its message ignored).
++	m.buffering = false
+ 	if err := m.player.Play(track.Path, dur); err != nil {
+ 		// Provider session went stale (e.g. Spotify auth expired and
+ 		// silent reconnect failed). Surface the standard sign-in
+diff --git a/ui/model/preload.go b/ui/model/preload.go
+index 97a9696..584f5f9 100644
+--- a/ui/model/preload.go
++++ b/ui/model/preload.go
+@@ -48,8 +48,7 @@ func (m *Model) preloadNext() tea.Cmd {
+ 			}
+ 		}
+ 		nextDur := time.Duration(next.DurationSecs) * time.Second
+-		m.preloading = true
+-		return preloadYTDLStreamCmd(m.player, next.Path, nextDur)
++		return preloadYTDLStreamCmd(m.player, next.Path, nextDur, m.beginPreload())
+ 	}
+ 	if next.Stream {
+ 		// For streams, only arm gapless if we're within the lead-time window.
+@@ -67,10 +66,8 @@ func (m *Model) preloadNext() tea.Cmd {
+ 		nextDur := time.Duration(next.DurationSecs) * time.Second
+ 		// Mark in-flight so the tick loop doesn't dispatch a second concurrent
+ 		// preload before this goroutine has finished arming gapless.SetNext.
+-		m.preloading = true
+-		return preloadStreamCmd(m.player, next.Path, nextDur)
++		return preloadStreamCmd(m.player, next.Path, nextDur, m.beginPreload())
+ 	}
+ 	nextDur := time.Duration(next.DurationSecs) * time.Second
+-	m.preloading = true
+-	return preloadLocalCmd(m.player, next.Path, nextDur)
++	return preloadLocalCmd(m.player, next.Path, nextDur, m.beginPreload())
+ }
 diff --git a/ui/model/update.go b/ui/model/update.go
-index e676be5..ffcfe89 100644
+index e676be5..5a5da26 100644
 --- a/ui/model/update.go
 +++ b/ui/model/update.go
 @@ -309,6 +309,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -3967,7 +7482,57 @@ index e676be5..ffcfe89 100644
  		m.setInitialHeaderState(msg)
  		m.plCursor = 0
  		m.plScroll = 0
-@@ -760,6 +761,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+@@ -423,12 +424,21 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+ 		return m, fetchYTDLBatchCmd(m.ytdlBatch.gen, m.ytdlBatch.url, m.ytdlBatch.offset, ytdlBatchSize)
+ 
+ 	case feedTrackResolvedMsg:
++		if m.dropStaleFeed(msg) {
++			return m, nil
++		}
+ 		m.feedLoading = false
++		if msg.err != nil {
++			return m.Update(msg.err)
++		}
+ 		if len(msg.tracks) == 0 {
+ 			m.status.Show("No episodes found in feed.", statusTTLDefault)
+ 			return m, nil
+ 		}
+ 		m.playlist.Replace(msg.tracks)
++		// The list is no longer the playlist that held the feed row.
++		m.loadedPlaylist = ""
++		m.activeProviderPlaylistID = ""
+ 		m.setInitialHeaderState(msg.tracks)
+ 		m.plCursor = 0
+ 		m.plScroll = 0
+@@ -520,6 +530,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+ 		return m, nil
+ 
+ 	case streamPlayedMsg:
++		if stale, cmd := m.dropStalePlayed(msg); stale {
++			return m, cmd
++		}
+ 		m.buffering = false
+ 		if msg.err != nil {
+ 			m.err = msg.err
+@@ -536,8 +549,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+ 		return m, m.preloadNext()
+ 
+ 	case streamPreloadedMsg:
+-		m.preloading = false
+-		return m, nil
++		return m, m.preloadFinished(msg)
+ 
+ 	case ytdlSavedMsg:
+ 		m.save.finishDownload()
+@@ -705,6 +717,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+ 
+ 	case playback.StopMsg:
+ 		m.player.Stop()
++		m.cancelPendingStart()
+ 		m.notifyAll()
+ 		return m, nil
+ 
+@@ -760,6 +773,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
  			return m, nil
  		}
  		m.playlist.Replace(tracks)
@@ -3975,7 +7540,7 @@ index e676be5..ffcfe89 100644
  		m.setInitialHeaderState(tracks)
  		m.loadedPlaylist = msg.Playlist
  		cmd := m.playCurrentTrack()
-@@ -891,6 +893,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+@@ -891,6 +905,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
  		if msg.Band > 0 || (msg.Band == 0 && msg.Name == "") {
  			// Set a specific band (0-9).
  			m.player.SetEQBand(msg.Band, msg.Value)
@@ -3984,7 +7549,7 @@ index e676be5..ffcfe89 100644
  			m.saveEQ()
  			if msg.Reply != nil {
  				msg.Reply <- ipc.Response{OK: true, EQPreset: m.EQPresetName()}
-@@ -992,6 +996,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+@@ -992,6 +1008,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
  		} else {
  			resp.Theme = &ipc.ThemeInfo{Name: theme.DefaultName}
  		}
@@ -3992,7 +7557,7 @@ index e676be5..ffcfe89 100644
  		if msg.Reply != nil {
  			msg.Reply <- resp
  		}
-@@ -1014,6 +1019,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+@@ -1014,6 +1031,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
  		return m, nil
  	}
  

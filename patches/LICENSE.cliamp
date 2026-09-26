@@ -1,6 +1,6 @@
 MIT License
 
-Copyright (c) 2026 hatake716
+Copyright (c) Bjarne Øverli
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -19,12 +19,3 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-
-----------------------------------------------------------------------------
-
-patches/cliamp-1.50.0-gui-ipc.patch modifies cliamp
-(https://github.com/bjarneo/cliamp), Copyright (c) Bjarne Øverli, MIT License
-(see patches/LICENSE.cliamp). The patch contains excerpts of cliamp's source
-code as diff context and removed lines; those excerpts remain under cliamp's
-copyright and license. The changes added by the patch are
-Copyright (c) 2026 hatake716 and are offered under the same MIT terms as above.

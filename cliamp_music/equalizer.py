@@ -25,6 +25,7 @@ from gi.repository import Adw, Gdk, GLib, Graphene, Gsk, Gtk, Pango  # noqa: E40
 
 from .fullscreen import _label, _rect, _rgba, _set_text, app_while_visible  # noqa: E402
 from .protocol import EQ_BANDS, EQ_MAX_DB, EQ_MIN_DB  # noqa: E402
+from .widgets import install_space_toggle  # noqa: E402
 
 __all__ = ["EqualizerWindow", "band_label", "preset_label", "FALLBACK_PRESETS", "CUSTOM_LABEL"]
 
@@ -216,6 +217,8 @@ class EqualizerWindow(Adw.Window):
             self.set_transient_for(parent)
             self.set_destroy_with_parent(True)
         app_while_visible(self, ctx.app)
+        # Space はメインの窓と同じく再生/一時停止 (プリセットの選択を開かない。Enter で開ける)
+        install_space_toggle(self)
 
         self._handlers: list[int] = []
         self._syncing = False

@@ -9,8 +9,11 @@ cliamp (Go) の応答は `omitempty` なので、0・空文字・false は省か
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import math
+import os
 import re
 import unicodedata
 from dataclasses import dataclass, field
@@ -45,6 +48,15 @@ CATALOG_COMMANDS = frozenset({
 # 拡張 IPC (api 1) のすべてのコマンド。
 ALL_COMMANDS = STATE_COMMANDS | CATALOG_COMMANDS
 
+# 状態を変えるコマンド。cliamp は接続ごとに goroutine で処理するので、別々の接続で
+# 続けて送ると届く順が入れ替わる。CliampClient はこれらを 1 本の列で順に (前の応答を
+# 待ってから) 送る。device は "list" のときだけ読み取り (client が見分ける)。
+ORDERED_COMMANDS = frozenset({
+    "play", "pause", "toggle", "stop", "next", "prev", "seek", "seek_to", "volume",
+    "shuffle", "repeat", "mono", "speed", "eq", "device", "play_index", "replace",
+    "enqueue", "queue_edit", "remove", "load", "queue",
+})
+
 # イコライザの 10 本の帯域 (cliamp の eq_presets.go と同じ並び)。
 EQ_BANDS = ("70", "180", "320", "600", "1K", "3K", "6K", "12K", "14K", "16K")
 
@@ -53,6 +65,9 @@ VOLUME_MAX_DB = 6.0
 EQ_MIN_DB = -12.0
 EQ_MAX_DB = 12.0
 REPEAT_MODES = ("off", "all", "one")
+
+# 添字で指した曲が要求の path と違う (手元の写しが古い) ときの誤り (パッチの ErrStale)。
+STALE = "stale"
 
 # local プロバイダーが履歴から作る仮想のプレイリスト (cliamp の history.PlaylistName)。
 # 書き込めないので「プレイリストに追加」の候補からは外す。
@@ -245,6 +260,9 @@ class Track:
     meta: tuple[tuple[str, str], ...] = ()
     queued: int = 0
     played_at: str = ""
+    # path が UTF-8 でない (Shift_JIS のファイル名など) ときだけ、cliamp が付ける元のバイト列
+    # (base64)。path は表示用 (U+FFFD 入り)。送り返すときも付け、手元のファイルはこれで開く
+    path_raw: str = ""
 
     def __post_init__(self) -> None:
         normalized = _normalize_meta(self.meta)
@@ -302,9 +320,17 @@ class Track:
 
     @property
     def local_path(self) -> str:
-        """手元のファイルの絶対パス。ファイルでなければ空。"""
+        """手元のファイルの絶対パス。ファイルでなければ空。
+
+        path_raw があれば元のバイト列を戻したもの (UTF-8 でない名前は os.fsdecode の
+        surrogateescape の文字列になり、open() でそのまま開ける)。"""
         if not self.is_local_file:
             return ""
+        if self.path_raw:
+            try:
+                return os.fsdecode(base64.b64decode(self.path_raw, validate=True))
+            except (binascii.Error, ValueError):
+                pass
         if self.path.startswith("file://"):
             return unquote(urlsplit(self.path).path)
         return self.path
@@ -341,6 +367,8 @@ class Track:
             wire["queued"] = self.queued
         if self.played_at:
             wire["played_at"] = self.played_at
+        if self.path_raw:
+            wire["path_raw"] = self.path_raw
         return wire
 
     @classmethod
@@ -363,6 +391,7 @@ class Track:
             meta=_normalize_meta(_as_dict(d.get("meta"))),
             queued=_as_int(d.get("queued")),
             played_at=_as_str(d.get("played_at")),
+            path_raw=_as_str(d.get("path_raw")),
         )
 
 
@@ -507,7 +536,8 @@ class Response:
     """1 つの要求への応答。
 
     kind: "ok" | "error" (cliamp が失敗を返した) | "offline" (繋がらない) |
-    "timeout" (時間切れ) | "unsupported" (拡張の無い cliamp。"unknown command")。
+    "timeout" (時間切れ) | "unsupported" (拡張の無い cliamp。"unknown command") |
+    "cancelled" (新しい要求に置き換えられ、送らずに捨てた。検索の打ち直しなど)。
     """
 
     ok: bool
@@ -534,10 +564,14 @@ class Response:
             return "cliamp の応答がありません"
         if self.kind == "unsupported":
             return "この cliamp は拡張 IPC に対応していません"
+        if self.kind == "cancelled":
+            return "取り消しました"
         if self.needs_auth:
             return "サインインが必要です。cliamp の画面でサインインしてください"
         if self.error == "not found":
             return "見つかりません"
+        if self.error == STALE:
+            return "リストが変わっていたので、もう一度選んでください"
         return self.error or "失敗しました"
 
     @classmethod
@@ -547,6 +581,10 @@ class Response:
     @classmethod
     def timeout(cls, detail: str = "") -> "Response":
         return cls(False, {}, detail or "時間切れ", "timeout")
+
+    @classmethod
+    def cancelled(cls, detail: str = "") -> "Response":
+        return cls(False, {}, detail or "取り消しました", "cancelled")
 
 
 # ---------------------------------------------------------------------------
@@ -725,7 +763,7 @@ def parse_lyrics(d: Any) -> Lyrics:
 
 
 def parse_devices(text: str) -> list[tuple[str, bool]]:
-    """`device list` の応答 (device 欄の改行区切り、使用中は先頭 "* ") を (名前, 使用中) に。"""
+    """`device list` の応答 (device 欄の改行区切り、既定の sink は先頭 "* ") を (名前, 印) に。"""
     out = []
     for raw in _as_str(text).splitlines():
         if not raw.strip():
@@ -736,6 +774,76 @@ def parse_devices(text: str) -> list[tuple[str, bool]]:
         if name:
             out.append((name, active))
     return out
+
+
+@dataclass(frozen=True)
+class Device:
+    """出力先 (PulseAudio / PipeWire の sink)。
+
+    name は切り替えに送る sink 名 (`alsa_output.pci-….analog-stereo` など。pactl が受け取る
+    のはこれだけ)、label はメニューに出す名前、active は cliamp が「* 」を付けたもの
+    (既定の sink。cliamp の流れの行き先とは限らない)。"""
+
+    name: str
+    label: str
+    active: bool = False
+
+
+_SINK_KINDS = (
+    ("analog-stereo", "アナログ出力"), ("analog-surround", "アナログ出力 (サラウンド)"),
+    ("iec958", "デジタル出力 (S/PDIF)"), ("hdmi", "HDMI / DisplayPort"),
+    ("usb", "USB オーディオ"),
+)
+
+
+def device_label(name: str) -> str:
+    """sink 名から見出しを作る (説明の無い cliamp のための最後の手段)。
+
+    bluez_output.AC_80_… → 「Bluetooth (AC:80:…)」、alsa_output.….hdmi-stereo-extra1 →
+    「HDMI / DisplayPort 2」、….analog-stereo → 「アナログ出力」。分からない形はそのまま。"""
+    name = _as_str(name).strip()
+    lowered = name.lower()
+    if lowered.startswith("bluez_output.") or lowered.startswith("bluez_sink."):
+        address = name.split(".", 1)[1].split(".", 1)[0].replace("_", ":")
+        return f"Bluetooth ({address})" if address else "Bluetooth"
+    if not lowered.startswith(("alsa_output.", "alsa_sink.")):
+        return name
+    profile = lowered.rsplit(".", 1)[-1]
+    for key, label in _SINK_KINDS:
+        if key in profile:
+            match = re.search(r"-extra(\d+)$", profile)
+            if match and key == "hdmi":
+                return f"{label} {int(match.group(1)) + 1}"
+            if "usb" in lowered and key != "usb":
+                return f"USB オーディオ ({label})"
+            return label
+    return name
+
+
+def parse_device_list(data: Any) -> list[Device]:
+    """`device list` の応答を Device の並びに。
+
+    説明付きの `devices` 配列 ({name, description, active}) があればそれを使い、無ければ
+    `device` 欄の改行区切り (素の cliamp 1.50.0 とパッチ済みの TUI) を読む。説明が無ければ
+    sink 名から見出しを作る (device_label)。同じ見出しが重なれば sink 名を添えて見分ける。"""
+    data = _as_dict(data)
+    out: list[Device] = []
+    items = _as_list(data.get("devices"))
+    if items:
+        for item in items:
+            item = _as_dict(item)
+            name = _as_str(item.get("name")).strip()
+            if not name:
+                continue
+            label = _as_str(item.get("description")).strip() or device_label(name)
+            out.append(Device(name, label, _as_bool(item.get("active"))))
+    else:
+        out = [Device(name, device_label(name), active) for name, active in parse_devices(data.get("device"))]
+    counts: dict[str, int] = {}
+    for device in out:
+        counts[device.label] = counts.get(device.label, 0) + 1
+    return [Device(d.name, f"{d.label} — {d.name}", d.active) if counts[d.label] > 1 and d.label != d.name else d
+            for d in out]
 
 
 # ---------------------------------------------------------------------------
@@ -764,6 +872,20 @@ def linear_to_db(x: float) -> float:
 
 def clamp_volume(db: float) -> float:
     return min(VOLUME_MAX_DB, max(VOLUME_MIN_DB, _as_float(db)))
+
+
+def volume_fraction(db: float) -> float:
+    """音量 dB (-30〜+6) をつまみの位置 0〜1 に (dB に比例。耳の感じ方に近い)。
+
+    再生バーとフルスクリーンの音量のつまみはどちらもこの換算を使う (同じ音量が同じ位置に
+    見えるように)。db_to_linear (MPRIS の振幅) はつまみには使わない。"""
+    span = VOLUME_MAX_DB - VOLUME_MIN_DB
+    return min(1.0, max(0.0, (_as_float(db) - VOLUME_MIN_DB) / span))
+
+
+def fraction_to_volume(fraction: float) -> float:
+    """つまみの位置 0〜1 を音量 dB に (volume_fraction の逆)。"""
+    return VOLUME_MIN_DB + min(1.0, max(0.0, _as_float(fraction))) * (VOLUME_MAX_DB - VOLUME_MIN_DB)
 
 
 def format_time(secs: float | None) -> str:

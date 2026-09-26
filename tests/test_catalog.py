@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 import unittest
+import unittest.mock
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -56,7 +57,8 @@ class Reading(CatalogTest):
 
     def test_playlists_are_cached(self):
         lists = self.get(self.catalog.playlists, "radio")
-        self.assertEqual([p.id for p in lists], ["l:0", "l:1", "l:2", "l:3", "f:0"])
+        # 素の cliamp: 組み込みの l:0 と Radio Browser のカタログ (c:N)
+        self.assertEqual([p.id for p in lists], ["l:0", "c:0", "c:1", "c:2"])
         self.assertEqual(lists[0].provider, "radio")
         self.get(self.catalog.playlists, "radio")
         self.assertEqual(self.count("playlists"), 1)
@@ -70,9 +72,11 @@ class Reading(CatalogTest):
         self.assertEqual([p.id for p in writable], ["ドライブ", "Focus"])
 
     def test_tracks(self):
+        # l:0 (cliamp radio) は M3U の中の 15 本の配信に展開される
         station = self.get(self.catalog.tracks, "radio", "l:0")
-        self.assertEqual(len(station), 1)
-        self.assertTrue(station[0].live and station[0].stream)
+        self.assertEqual(len(station), 15)
+        self.assertTrue(all(t.live and t.stream for t in station))
+        self.assertEqual(station[0].title, "Lofi")
         local = self.get(self.catalog.tracks, "local", "ドライブ")
         self.assertEqual(len(local), 7)
         mix = self.get(self.catalog.tracks, "url", mix_url("abcdefghijk"))
@@ -134,11 +138,14 @@ class Writing(CatalogTest):
         names = [p.name for p in self.get(self.catalog.local_playlists)]
         self.assertIn("新しいリスト", names)
         added = self.get(self.catalog.tracks, "local", "新しいリスト")
-        self.assertEqual(added, [track])
+        # TOML には meta が残らず、stream は path が URL かで決め直される
+        self.assertEqual(added, [Track(path=track.path, title="足す曲", stream=True)])
         removed = self.get(self.catalog.playlist_remove_track, "新しいリスト", 0)
         self.assertTrue(removed.ok)
-        self.assertEqual(self.get(self.catalog.tracks, "local", "新しいリスト"), [])
-        self.assertTrue(self.get(self.catalog.playlist_delete, "新しいリスト").ok)
+        # 最後の曲を外すとプレイリストのファイルごと消える (external/local の RemoveTrack)
+        gone = self.get(self.catalog.tracks, "local", "新しいリスト")
+        self.assertIsInstance(gone, Response)
+        self.assertIn("no such file or directory", gone.message)
         self.assertNotIn("新しいリスト", [p.name for p in self.get(self.catalog.local_playlists)])
 
     def test_invalid_name(self):
@@ -146,10 +153,50 @@ class Writing(CatalogTest):
         self.assertFalse(result.ok)
 
     def test_load(self):
-        result = self.get(self.catalog.load, "radio", "l:1", 0, "Harbor Jazz FM")
+        result = self.get(self.catalog.load, "radio", "l:0", 2, "cliamp ラジオ")
         self.assertTrue(result.ok, result.error)
-        self.assertEqual(self.fake.source, {"provider": "radio", "id": "l:1", "name": "Harbor Jazz FM"})
-        self.assertEqual(self.fake.pl.tracks[0]["path"], "https://stream.example.net/harbor-jazz.mp3")
+        self.assertEqual(result.get("total"), 15)
+        self.assertEqual(self.fake.source, {"provider": "radio", "id": "l:0", "name": "cliamp ラジオ"})
+        self.assertEqual(self.fake.pl.current()[0]["title"], "Synthwave")
+        bad = self.get(self.catalog.load, "radio", "l:0", 99, "cliamp ラジオ")
+        self.assertFalse(bad.ok)
+        self.assertEqual(bad.error, "index out of range")
+
+
+class CacheLimits(CatalogTest):
+    """覚えている結果は期限切れを捨て、検索は新しい 200 件までにする。"""
+
+    def test_expired_entries_are_swept_on_insert(self):
+        from cliamp_music import catalog as catalog_mod
+
+        for i in range(300):
+            self.catalog._cache[("lyrics", "a", f"t{i}")] = (0.0, None)  # 期限切れ
+        self.get(self.catalog.providers)
+        self.assertLess(len(self.catalog._cache), 10)
+        self.assertEqual(catalog_mod.CACHE_CAPS["search"], 200)
+
+    def test_search_entries_are_capped(self):
+        from cliamp_music import catalog as catalog_mod
+
+        with unittest.mock.patch.dict(catalog_mod.CACHE_CAPS, {"search": 5}):
+            for i in range(8):
+                self.get(self.catalog.search, "youtube", f"query {i}")
+        searches = [k for k in self.catalog._cache if k[0] == "search"]
+        self.assertEqual(len(searches), 5)
+        self.assertIn(("search", "youtube", "query 7", 25), searches)
+        self.assertNotIn(("search", "youtube", "query 0", 25), searches)
+
+    def test_superseded_search_is_resent_when_asked_again(self):
+        """「abc」→「abcd」→「abc」: 捨てられた古い語にまた頼まれたら送り直す。"""
+        self.fake.delays["lyrics"] = 0.4
+        for i in range(4):
+            self.catalog.lyrics("x", f"t{i}", lambda r: None)  # worker をふさぐ
+        got = []
+        self.catalog.search("youtube", "abc", got.append, lane="page")
+        self.catalog.search("youtube", "abcd", lambda r: None, lane="page")
+        self.catalog.search("youtube", "abc", got.append, lane="page")
+        self.assertTrue(run_loop(lambda: len(got) == 2, timeout=5))
+        self.assertTrue(all(isinstance(r, list) and r for r in got), got)
 
 
 class LibrarySearch(CatalogTest):

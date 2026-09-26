@@ -106,6 +106,95 @@ class OneShot(unittest.TestCase):
 
 
 @unittest.skipUnless(HAVE_GI, "PyGObject がありません")
+class Lanes(unittest.TestCase):
+    """要求を送る 3 つの列 (順番・状態の読み取り・カタログ)。"""
+
+    def setUp(self):
+        self.path = temp_socket_path()
+        self.fake = FakeCliamp(self.path).start()
+        self.client = CliampClient(self.path)
+
+    def tearDown(self):
+        self.fake.stop()
+
+    def test_state_commands_reach_cliamp_in_call_order(self):
+        """cliamp は接続ごとの goroutine で処理するので、別々の接続で続けて送ると順が入れ替わる。
+        状態を変える要求は 1 本の列で、前の応答を待ってから次を送る。"""
+        for trial in range(20):
+            send_once(self.path, "queue_edit", mode="clear")
+            self.fake.requests.clear()
+            got = []
+            for i in (1, 2, 3, 4):  # main loop を回さずに続けて頼む
+                self.client.request("queue_edit", got.append, mode="add", index=i)
+            self.assertTrue(run_loop(lambda: len(got) == 4))
+            self.assertEqual(send_once(self.path, "playlist").data["queue"], [1, 2, 3, 4], f"{trial} 回目")
+            self.assertEqual([r["index"] for r in self.fake.requests_for("queue_edit")], [1, 2, 3, 4])
+
+    def test_slow_state_command_holds_the_next_one_but_not_reads(self):
+        self.fake.delays["pause"] = 0.8
+        order = []
+        self.client.request("pause", lambda r: order.append("pause"))
+        self.client.request("play", lambda r: order.append("play"))
+        self.client.request("playlist", lambda r: order.append("playlist"))
+        self.assertTrue(run_loop(lambda: len(order) == 3, timeout=4))
+        self.assertEqual(order, ["playlist", "pause", "play"])
+
+    def test_state_commands_do_not_wait_behind_catalog(self):
+        """遅いカタログ系 (検索) が 4 本の worker を埋めても、pause はすぐ届く。"""
+        self.fake.delays["search"] = 3.0
+        slow = []
+        for query in ("yo", "yoa", "yoaso", "yoasobi", "yoasobi 夜"):
+            self.client.request("search", slow.append, provider="youtube", query=query)
+        run_loop(lambda: False, timeout=0.1)
+        got = []
+        self.client.request("pause", got.append)
+        self.assertTrue(run_loop(lambda: got, timeout=1.0), "pause が検索の後ろに並んだ")
+        self.assertTrue(got[0].ok)
+        self.assertEqual(self.fake.state, "paused")
+
+    def test_queued_state_command_times_out_from_submit(self):
+        """順番の列で待つうちに時間切れになったものは送らない (遅れて効かせない)。"""
+        self.fake.delays["pause"] = 0.6
+        got = []
+        self.client.request("pause", got.append, timeout=5.0)
+        self.client.request("toggle", got.append, timeout=0.2)
+        self.assertTrue(run_loop(lambda: len(got) == 2, timeout=3))
+        self.assertEqual(got[1].kind, "timeout")
+        self.assertEqual(self.fake.requests_for("toggle"), [])
+
+    def test_superseded_search_is_not_sent(self):
+        """同じ lane の新しい検索が来たら、まだ送っていない古い検索は送らずに cancelled で返す。"""
+        got = {}
+        # カタログの worker を全部ふさいでから lane 付きの検索を 2 つ頼む
+        self.fake.delays["lyrics"] = 0.5
+        for i in range(client_mod.MAX_WORKERS):
+            self.client.request("lyrics", lambda r: None, artist="x", title=f"t{i}")
+        self.client.request("search", lambda r: got.setdefault("old", r), lane="page", provider="youtube",
+                            query="古い語")
+        self.client.request("search", lambda r: got.setdefault("new", r), lane="page", provider="youtube",
+                            query="新しい語")
+        self.assertTrue(run_loop(lambda: len(got) == 2, timeout=5))
+        self.assertEqual(got["old"].kind, "cancelled")
+        self.assertTrue(got["new"].ok)
+        self.assertEqual([r["query"] for r in self.fake.requests_for("search")], ["新しい語"])
+
+    def test_parse_runs_on_worker(self):
+        import threading
+
+        seen = []
+
+        def parse(response):
+            seen.append(threading.current_thread().name)
+            return len(response.data.get("tracks") or [])
+
+        got = []
+        self.client.request("playlist", lambda r, n: got.append(n), parse=parse)
+        self.assertTrue(run_loop(lambda: got))
+        self.assertEqual(got, [12])
+        self.assertNotEqual(seen[0], threading.main_thread().name)
+
+
+@unittest.skipUnless(HAVE_GI, "PyGObject がありません")
 class Polling(unittest.TestCase):
     def setUp(self):
         self.path = temp_socket_path()

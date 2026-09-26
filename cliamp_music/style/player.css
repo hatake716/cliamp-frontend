@@ -155,6 +155,13 @@ window.music .music-fullscreen.medium .music-fs-title { font-size: 20px; }
 window.music .music-fullscreen.medium .music-fs-subtitle { font-size: 15px; }
 window.music .music-fullscreen.small .music-fs-title { font-size: 17px; }
 window.music .music-fullscreen.small .music-fs-subtitle { font-size: 14px; }
+/* 本当のフルスクリーン (1920x1080 など) では絵と一緒に大きくする */
+window.music .music-fullscreen.xlarge .music-fs-title { font-size: 26px; }
+window.music .music-fullscreen.xlarge .music-fs-subtitle { font-size: 19px; }
+window.music .music-fullscreen.xlarge .music-fs-time { font-size: 12px; }
+window.music .music-fullscreen.xxlarge .music-fs-title { font-size: 31px; }
+window.music .music-fullscreen.xxlarge .music-fs-subtitle { font-size: 23px; }
+window.music .music-fullscreen.xxlarge .music-fs-time { font-size: 13px; }
 
 window.music .music-fs-time {
   font-size: 11px;
@@ -237,6 +244,8 @@ window.music .music-fs-lyrics-message {
 }
 
 window.music .music-fullscreen.small .music-fs-lyrics-message { font-size: 22px; }
+window.music .music-fullscreen.xlarge .music-fs-lyrics-message { font-size: 32px; }
+window.music .music-fullscreen.xxlarge .music-fs-lyrics-message { font-size: 40px; }
 
 /* 次に再生 */
 window.music button.music-fs-pill {

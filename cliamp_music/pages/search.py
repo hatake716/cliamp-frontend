@@ -475,7 +475,8 @@ class SearchPage(PageBase):
         if scope == "library":
             catalog.search_library(query, done)
         else:
-            catalog.search(scope, query, done, SEARCH_LIMIT, force=force)
+            # 打ちながらの検索: まだ送っていない古い語は送らずに捨てる (worker を塞がない)
+            catalog.search(scope, query, done, SEARCH_LIMIT, force=force, lane="search-page")
 
     def _show_results(self, query: str, scope: str, result) -> None:
         if isinstance(result, Response):

@@ -5,8 +5,10 @@
 「12 曲 · 48 分」。ボタンはシャッフルの丸 / 「▶ 再生」/ 「…」(プレイリストとして保存)。
 
 行は番号付き (album の行)。再生中の行は番号の代わりに赤い動く棒。ダブルクリックで
-play_index。リストの中身が変わったときだけ作り直し、曲や状態の変化では印だけ動かす。
-reveal=True なら (作り終えたあとで) 再生中の行までスクロールする。
+play_index。リストが変わったときは差分だけを当てる (ChunkedRows.update: 足した曲は
+末尾に足し、消した曲の行だけ外し、番号を付け直す。待ち行列の位置だけの変化では行に
+触らない)。スクロール位置・選択・開いているメニューを失わない。曲や状態の変化では
+印だけ動かす。reveal=True なら (作り終えたあとで) 再生中の行までスクロールする。
 """
 
 from __future__ import annotations
@@ -58,6 +60,7 @@ class NowPlayingListPage(PageBase):
         self._reveal_tries = 0
         self._reveal_timer = 0
         self._tracks: list[Track] | None = None
+        self._tracks_source: list[Track] | None = None
         self._art_key: object = ()
 
         self.header = DetailHeader(ctx, on_shuffle=weak_call(self.shuffle), on_play=weak_call(self.play_first),
@@ -129,6 +132,7 @@ class NowPlayingListPage(PageBase):
         self._update_header()
         if not tracks:
             self._tracks = []
+            self._tracks_source = None
             self.rows.build([])
             if store.status.total > 0:
                 self.header.set_visible(True)
@@ -139,15 +143,18 @@ class NowPlayingListPage(PageBase):
                                       "曲を選んで再生すると、ここに並びます。")
             return
         self.header.set_visible(True)
-        if tracks != self._tracks:
+        if tracks is not self._tracks_source:
+            # store は中身が変わらない取り直しでは同じ並びを渡す (同じなら何もしない)
+            self._tracks_source = tracks
             self._tracks = list(tracks)
-            self.rows.build(self._tracks)
+            self.rows.update(self._tracks)
         self.state.show_content()
         self._update_current()
         self._try_reveal()
 
     def _show_problem(self, icon: str, title: str, text: str) -> None:
         self._tracks = None
+        self._tracks_source = None
         self.rows.build([])
         self.header.set_visible(False)
         self.header.set_actions_sensitive(False)
@@ -224,7 +231,10 @@ class NowPlayingListPage(PageBase):
     def _on_row(self, row) -> None:
         index = getattr(row, "index", None)
         if index is not None:
-            self.ctx.store.play_index(index, callback=self._toast_failure)
+            # 見えている曲の path も送る (TUI などで並びが動いていたら別の曲を鳴らさない)
+            track = getattr(row, "track", None)
+            self.ctx.store.play_index(index, callback=self._toast_failure,
+                                      path=track.path if track is not None else None)
 
     def _toast_failure(self, response: Response) -> None:
         if not response.ok:

@@ -7,8 +7,11 @@ PlaylistsPage: 大見出し「プレイリスト」。プロバイダーごと�
 PlaylistDetailPage: Apple のアルバムの頁の形。左上に 250px の絵 (先頭 4 曲の 2x2、
 無ければ代わりの絵)、題 (26px/700)、提供元 (26px/400、赤)、情報の行、ボタン
 (シャッフルの丸 / 「▶ 再生」/ 「…」)。下に番号付きの行。ダブルクリックでその曲から
-`load_provider`。ローカルのプレイリストは「…」から削除でき (確認あり)、行の「…」に
-「プレイリストから削除」が出る。
+再生する: 見えている曲の並びをそのまま `replace` で送る (`load_provider` はプロバイダーに
+取り直させて添字で選ぶので、その間にリストが変わっていると別の曲が鳴る)。replace の無い
+cliamp と、とても長いリストだけ `load_provider`。ローカルのプレイリストは「…」から
+削除でき (確認あり)、行の「…」に「プレイリストから削除」が出る。最後の曲を外すと cliamp は
+プレイリストごと消すので、そのときはページを閉じる。
 """
 
 from __future__ import annotations
@@ -19,7 +22,7 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 from gi.repository import Adw, Gio, GObject, Gtk  # noqa: E402
 
-from ..protocol import RECENTLY_PLAYED, PlaylistInfo, Response, Track  # noqa: E402
+from ..protocol import RECENTLY_PLAYED, PlaylistInfo, Response, Source, Track  # noqa: E402
 from ..widgets import MediaCard, SectionHeader, TrackList, TrackRow, format_count  # noqa: E402
 from .home import (  # noqa: E402
     DETAIL_LIST_SIDE,
@@ -38,6 +41,7 @@ from .home import (  # noqa: E402
     is_playing,
     provider_label,
     remember_provider_names,
+    row_key,
     set_playlist_art,
     shuffle_provider,
     total_duration,
@@ -47,6 +51,8 @@ from .home import (  # noqa: E402
 
 CARD = 170
 LOCAL = "local"
+# これより長いリストは replace で送らず load_provider に任せる (要求 1 行は 8 MiB まで)
+REPLACE_MAX_TRACKS = 10000
 
 
 def auth_note(ctx, provider: str) -> str:
@@ -324,6 +330,11 @@ class PlaylistDetailPage(PageBase):
                 if result.needs_auth:
                     self._show_problem("music-note-list-symbolic", "サインインが必要です",
                                        auth_note(self.ctx, self.provider))
+                elif self.is_local and "no such file or directory" in result.error:
+                    # 空になって消えた・TUI で消した。ファイルの場所 (open /…/X.toml) は見せない
+                    if not self._leave_if_gone():
+                        self._show_problem("music-note-list-symbolic", "プレイリストが見つかりません",
+                                           f"「{self.playlist_name}」は削除されたか、名前が変わりました。")
                 else:
                     self._show_problem("music-note-list-symbolic", "プレイリストを読めませんでした", result.message)
                 return
@@ -333,16 +344,34 @@ class PlaylistDetailPage(PageBase):
 
     def on_resync(self) -> None:
         if self.is_local:
-            # 他の画面で曲を足した・消した後 (キャッシュは catalog が捨てている)
-            self.load(force=False)
+            # 他の画面や TUI で曲を足した・消した後。ローカルのファイルは安いので読み直す
+            self.load(force=True)
         else:
             self._update_current()
 
     def _on_local_changed(self, *_args) -> None:
+        if self._leave_if_gone():
+            return
         self.load(force=False)
 
+    def _leave_if_gone(self) -> bool:
+        """このローカルのプレイリストが一覧から消えていれば (最後の曲を外した・削除した)
+        ページを閉じる。一覧が実際に取れているときだけ判断する (最初の空の一覧や未接続では
+        閉じない)。"""
+        ctx = self.ctx
+        store = ctx.store
+        if not self.editable or not store.connected or not store.supports("playlists"):
+            return False
+        if not getattr(ctx, "local_playlists_loaded", False):
+            return False
+        if self.playlist_id in getattr(ctx, "local_playlists", ()):
+            return False
+        self._leave()
+        return True
+
     def _on_connection(self, *_args) -> None:
-        if self.ctx.store.connected and self._keys is None:
+        # 繋ぎ直した cliamp は別物かもしれない (カタログのキャッシュは ctx が捨てている)
+        if self.ctx.store.connected:
             self.load(force=False)
 
     def _show_problem(self, icon: str, title: str, text: str) -> None:
@@ -356,7 +385,7 @@ class PlaylistDetailPage(PageBase):
         self.state.show_empty(icon, title, text)
 
     def _show(self, tracks: list[Track]) -> None:
-        keys = tuple(tracks)
+        keys = tuple(row_key(t) for t in tracks)
         self.header.set_info(info_line(len(tracks), total_duration(tracks)))
         self.header.set_actions_sensitive(bool(tracks))
         self.header.more_button.set_sensitive(self.editable or bool(tracks))
@@ -364,7 +393,8 @@ class PlaylistDetailPage(PageBase):
             self._keys = keys
             self._tracks = list(tracks)
             set_playlist_art(self.ctx, self.header.art, self._tracks, self._art_key(), DetailHeader.ART)
-            self.rows.build(self._tracks)
+            # 曲を外した・足したときは差分だけ (スクロール位置と開いているメニューを失わない)
+            self.rows.update(self._tracks)
         if not tracks:
             self.state.show_empty("music-note-list-symbolic", "曲がありません",
                                   "このプレイリストにはまだ曲がありません。")
@@ -406,7 +436,21 @@ class PlaylistDetailPage(PageBase):
     def _on_row(self, row) -> None:
         index = getattr(row, "index", None)
         if index is not None:
-            self.ctx.load_provider(self.provider, self.playlist_id, index, self.playlist_name)
+            self.play_from(index)
+
+    def play_from(self, index: int) -> None:
+        """index の曲から再生する。見えている並びをそのまま送る (replace)。
+
+        load_provider はプロバイダーに取り直させて添字で選ぶので、見た後でリストが変わって
+        いると (TUI での並べ替え・削除、いいねの追加など) 黙って別の曲が鳴る。"""
+        tracks = self._tracks
+        store = self.ctx.store
+        if (tracks and 0 <= index < len(tracks) and store.supports("replace")
+                and len(tracks) <= REPLACE_MAX_TRACKS):
+            source = Source(provider=self.provider, id=self.playlist_id, name=self.playlist_name)
+            self.ctx.play_tracks(tracks, index, source)
+            return
+        self.ctx.load_provider(self.provider, self.playlist_id, index, self.playlist_name)
 
     # --- ボタン -------------------------------------------------------------------
 
@@ -415,8 +459,8 @@ class PlaylistDetailPage(PageBase):
         return list(self._tracks)
 
     def play_first(self) -> None:
-        """先頭の曲から読み込んで再生する。"""
-        self.ctx.load_provider(self.provider, self.playlist_id, 0, self.playlist_name)
+        """先頭の曲から再生する。"""
+        self.play_from(0)
 
     def shuffle(self) -> None:
         """シャッフルを入れて無作為な曲から再生する。"""

@@ -1,8 +1,20 @@
 """cliamp の IPC ソケットとのやりとり。
 
-- 要求は 1 つにつき 1 本の接続を張り、小さなスレッドプール (最大 4) で送る。
-  cliamp は 1 本の接続の要求を順番に処理するので、カタログ系の長い要求
-  (検索は数秒〜数十秒) の後ろに他の要求を並べないためである。
+- 要求は 1 つにつき 1 本の接続を張る。cliamp は 1 本の接続の要求を順番に処理するので、
+  カタログ系の長い要求 (検索は数秒〜数十秒) の後ろに他の要求を並べないためである。
+- 送る列は 3 つに分ける (どれもスレッドで送り、main loop は待たない):
+  - 順番の列 (ORDERED_COMMANDS: toggle / next / seek_to / queue_edit / replace など、状態を
+    変えるもの): 1 本のスレッドが、前の要求の応答を待ってから次を送る。cliamp は接続ごとの
+    goroutine で処理するので、別々の接続で続けて送ると届く順が入れ替わるため。1 つが
+    offline / timeout で終われば、列に残っているものはすぐ同じ失敗で返す (固まった cliamp に
+    溜めて、後でまとめて届かないように)。
+  - 状態の読み取りの列 (playlist / capabilities / device list など): 小さなプール (2 本)。
+  - カタログの列 (CATALOG_COMMANDS): 最大 4 本のプール。利用者の操作 (load_provider と
+    ローカルのプレイリストの編集) を裏の読み込みより先に送る。lane を付けた要求は、同じ
+    lane の新しい要求が来たら (まだ送っていなければ) 送らずに "cancelled" で返す
+    (検索の打ち直し)。
+  状態系の 2 つの列は待ち時間を「頼んだ時点」から数え、待つうちに時間切れになったものは
+  送らずに timeout で返す (楽観的な表示が戻った後で、古い操作が遅れて届かないように)。
 - 状態 (status) は専用のスレッドが専用の接続で定期的に取る。切れたら
   1→2→4→5 秒の間隔で繋ぎ直し、繋がるたびに capabilities で拡張の有無を調べる。
 - 結果とシグナルは必ず GLib.idle_add で main loop に戻す (GTK のスレッドで待たない)。
@@ -24,6 +36,7 @@ from gi.repository import GLib, GObject
 from . import log
 from .protocol import (
     CATALOG_COMMANDS,
+    ORDERED_COMMANDS,
     Response,
     Status,
     decode_response,
@@ -34,7 +47,10 @@ from .protocol import (
 STATE_TIMEOUT = 5.0
 CATALOG_TIMEOUT = 130.0
 CONNECT_TIMEOUT = 3.0
-MAX_WORKERS = 4
+MAX_WORKERS = 4  # カタログの列
+READ_WORKERS = 2  # 状態の読み取りの列
+# 先に送るカタログ系 (利用者が押した操作。裏の読み込みの後ろに並ばせない)
+URGENT_CATALOG = frozenset({"load_provider", "playlist_add", "playlist_delete", "playlist_remove_track"})
 
 
 def default_socket_path() -> str:
@@ -135,15 +151,105 @@ def send_once(path: str, cmd: str, *, timeout: float | None = None, **fields) ->
     return exchange(path, encode_request(cmd, **fields), default_timeout(cmd) if timeout is None else timeout)
 
 
-def _deliver(callback: Callable[[Response], object], response: Response) -> bool:
+def _deliver(callback: Callable[..., object], response: Response, *extra) -> bool:
     try:
-        callback(response)
+        callback(response, *extra)
     except Exception as exc:  # 呼び出し側の誤りで main loop を止めない
         import traceback
 
         log(f"応答の処理で例外: {exc}")
         traceback.print_exc()
     return GLib.SOURCE_REMOVE
+
+
+def is_ordered(cmd: str, fields: dict) -> bool:
+    """状態を変える (順番の列で送る) 要求か。device は "list" 以外 (切り替え) だけ。"""
+    if cmd not in ORDERED_COMMANDS:
+        return False
+    if cmd == "device":
+        return str(fields.get("name") or "").lower() != "list"
+    return True
+
+
+class _Job:
+    """1 つの要求。worker のスレッドが run() する。"""
+
+    __slots__ = ("cmd", "payload", "timeout", "submitted", "from_submit", "callback", "parse", "lane",
+                 "started", "superseded")
+
+    def __init__(self, cmd: str, payload: bytes, timeout: float, callback, parse, lane: str | None,
+                 from_submit: bool):
+        self.cmd = cmd
+        self.payload = payload
+        self.timeout = timeout
+        self.submitted = time.monotonic()
+        self.from_submit = from_submit
+        self.callback = callback
+        self.parse = parse
+        self.lane = lane
+        self.started = False
+        self.superseded = False
+
+
+class _Pool:
+    """要求を送る worker の群れ。必要になったときに max_workers まで増やす。
+
+    priority: 小さい数を先に送る (同じなら頼んだ順)。fail_fast: 1 つが offline / timeout で
+    終わったら、待っているものをすぐ同じ失敗で返す (順番の列)。"""
+
+    def __init__(self, name: str, max_workers: int, run: Callable[[_Job], Response],
+                 finish: Callable[[_Job, Response], None], *, fail_fast: bool = False):
+        self.name = name
+        self.max_workers = max_workers
+        self._run = run
+        self._finish = finish
+        self._fail_fast = fail_fast
+        self._jobs: queue.PriorityQueue = queue.PriorityQueue()
+        self._workers: list[threading.Thread] = []
+        self._idle = 0
+        self._queued = 0
+        self._seq = 0
+        self._lock = threading.Lock()
+
+    def submit(self, job: _Job, priority: int = 0) -> None:
+        with self._lock:
+            self._seq += 1
+            self._jobs.put((priority, self._seq, job))
+            self._queued += 1
+            # 手の空いた worker より待ちの仕事が多ければ増やす (遅い検索の後ろに並ばせない)。
+            if self._queued > self._idle and len(self._workers) < self.max_workers:
+                worker = threading.Thread(target=self._work, name=self.name, daemon=True)
+                self._workers.append(worker)
+                self._idle += 1
+                worker.start()
+
+    def _take(self, block: bool = True) -> _Job | None:
+        try:
+            _priority, _seq, job = self._jobs.get(block=block)
+        except queue.Empty:
+            return None
+        with self._lock:
+            self._queued -= 1
+        return job
+
+    def _work(self) -> None:
+        while True:
+            job = self._take()
+            with self._lock:
+                self._idle -= 1
+            try:
+                response = self._run(job)
+                self._finish(job, response)
+                if self._fail_fast and response.kind in ("offline", "timeout"):
+                    while (rest := self._take(block=False)) is not None:
+                        failed = Response.offline() if response.kind == "offline" else Response.timeout(
+                            "前の操作に cliamp が応えなかったので送りませんでした")
+                        self._finish(rest, failed)
+            except Exception as exc:
+                log(f"要求の処理で例外: {exc}")
+            finally:
+                with self._lock:
+                    self._idle += 1
 
 
 class CliampClient(GObject.Object):
@@ -177,11 +283,11 @@ class CliampClient(GObject.Object):
         # 操作の応答が来た時点のこの値より新しい status は、操作の後の状態を映している。
         self.last_status_seq: int = 0
 
-        self._jobs: queue.Queue = queue.Queue()
-        self._workers: list[threading.Thread] = []
-        self._idle_workers = 0
-        self._queued = 0
-        self._pool_lock = threading.Lock()
+        self._ordered = _Pool("cliamp-ordered", 1, self._run_job, self._finish_job, fail_fast=True)
+        self._reads = _Pool("cliamp-read", READ_WORKERS, self._run_job, self._finish_job)
+        self._catalog = _Pool("cliamp-request", MAX_WORKERS, self._run_job, self._finish_job)
+        self._lanes: dict[str, _Job] = {}
+        self._lanes_lock = threading.Lock()
 
         self._poll_interval = 0.4
         self._wake = threading.Event()
@@ -193,51 +299,70 @@ class CliampClient(GObject.Object):
 
     # --- 1 要求 1 接続 -----------------------------------------------------
 
-    def request(self, cmd: str, callback: Callable[[Response], object] | None = None, *,
-                timeout: float | None = None, **fields) -> None:
+    def request(self, cmd: str, callback: Callable[..., object] | None = None, *,
+                timeout: float | None = None, lane: str | None = None,
+                parse: Callable[[Response], object] | None = None, **fields) -> None:
         """要求を 1 つ送る。callback(Response) は main loop で必ず 1 回呼ばれる。
 
-        timeout の既定: 状態系 5 秒、カタログ系 130 秒。値が None の欄は送らない。
+        timeout の既定: 状態系 5 秒 (頼んだ時点から数える)、カタログ系 130 秒。
+        値が None の欄は送らない。
+        lane: カタログ系で、同じ lane の後の要求が来たら (まだ送っていなければ) 送らずに
+        Response.cancelled で返す (検索の打ち直しなど)。
+        parse: worker のスレッドで応答を読む関数。渡すと callback(Response, 結果) で呼ぶ
+        (長いリストの解析で main loop を止めない。例外は None として渡す)。
         """
         if timeout is None:
             timeout = default_timeout(cmd)
         payload = encode_request(cmd, **fields)
-        path = self.socket_path
+        catalog = cmd in CATALOG_COMMANDS
+        job = _Job(cmd, payload, timeout, callback, parse, lane if catalog else None, not catalog)
+        if catalog:
+            if lane:
+                with self._lanes_lock:
+                    previous = self._lanes.get(lane)
+                    if previous is not None and not previous.started:
+                        previous.superseded = True
+                    self._lanes[lane] = job
+            self._catalog.submit(job, 0 if cmd in URGENT_CATALOG else 1)
+        elif is_ordered(cmd, fields):
+            self._ordered.submit(job)
+        else:
+            self._reads.submit(job)
 
-        def job() -> None:
-            response = exchange(path, payload, timeout)
-            if response.kind == "offline":
-                # 状態取得のスレッドにすぐ確かめさせる (未接続の表示を早く出す)。
-                self._wake.set()
-            if callback is not None:
-                GLib.idle_add(_deliver, callback, response)
+    def _run_job(self, job: _Job) -> Response:
+        """worker のスレッドで 1 要求を送り、応答を返す。"""
+        with self._lanes_lock:
+            job.started = True
+            if job.lane and self._lanes.get(job.lane) is job:
+                del self._lanes[job.lane]
+            superseded = job.superseded
+        if superseded:
+            return Response.cancelled()
+        timeout = job.timeout
+        if job.from_submit:
+            timeout -= time.monotonic() - job.submitted
+            if timeout <= 0:
+                # 待つうちに時間切れ。遅れて届くと楽観的な表示が戻った後で効いてしまうので送らない
+                return Response.timeout("cliamp への要求が待ちきれませんでした")
+        response = exchange(self.socket_path, job.payload, timeout)
+        if response.kind == "offline":
+            # 状態取得のスレッドにすぐ確かめさせる (未接続の表示を早く出す)。
+            self._wake.set()
+        return response
 
-        self._submit(job)
-
-    def _submit(self, job: Callable[[], None]) -> None:
-        with self._pool_lock:
-            self._jobs.put(job)
-            self._queued += 1
-            # 手の空いた worker より待ちの仕事が多ければ増やす (遅い検索の後ろに並ばせない)。
-            if self._queued > self._idle_workers and len(self._workers) < MAX_WORKERS:
-                worker = threading.Thread(target=self._work, name="cliamp-request", daemon=True)
-                self._workers.append(worker)
-                self._idle_workers += 1
-                worker.start()
-
-    def _work(self) -> None:
-        while True:
-            job = self._jobs.get()
-            with self._pool_lock:
-                self._queued -= 1
-                self._idle_workers -= 1
-            try:
-                job()
-            except Exception as exc:
-                log(f"要求の処理で例外: {exc}")
-            finally:
-                with self._pool_lock:
-                    self._idle_workers += 1
+    @staticmethod
+    def _finish_job(job: _Job, response: Response) -> None:
+        if job.callback is None:
+            return
+        if job.parse is None:
+            GLib.idle_add(_deliver, job.callback, response)
+            return
+        try:
+            parsed = job.parse(response)
+        except Exception as exc:
+            log(f"応答の解析で例外: {exc}")
+            parsed = None
+        GLib.idle_add(_deliver, job.callback, response, parsed)
 
     # --- 状態の定期取得 ------------------------------------------------------
 
@@ -262,9 +387,13 @@ class CliampClient(GObject.Object):
         self._thread = None
 
     def set_poll_interval(self, seconds: float) -> None:
-        """状態を取る間隔。表示中 0.4 秒、隠れているとき 1.5 秒の想定。"""
-        self._poll_interval = min(10.0, max(0.05, float(seconds)))
-        self._wake.set()
+        """状態を取る間隔。表示中 0.4 秒、隠れているとき 1.5 秒の想定。
+
+        変わったときだけ状態取得のスレッドを起こす (窓のフォーカスが動くたびに余計に取らない)。"""
+        interval = min(10.0, max(0.05, float(seconds)))
+        if interval != self._poll_interval:
+            self._poll_interval = interval
+            self._wake.set()
 
     def poll_now(self) -> None:
         """次の状態取得を待たずに今すぐ取らせる (操作の直後に使う)。"""

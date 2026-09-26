@@ -753,6 +753,21 @@ window.music .music-queue-header.next {
   border-top: 1px solid var(--m-separator);
 }
 
+/* 待ち行列の後の続き (出どころの名前)。区切りの線は待ち行列の見出しが持つ */
+window.music .music-queue-header.continued {
+  margin-top: 18px;
+}
+
+window.music .music-queue-subtitle {
+  margin: 0 8px 4px 8px;
+  font-size: 12px;
+  color: var(--m-secondary);
+}
+
+window.music .music-queue-note.music-queue-continue {
+  margin-top: 10px;
+}
+
 window.music .music-queue-note {
   margin: 6px 8px 8px 8px;
   font-size: 12px;
@@ -792,4 +807,14 @@ window.music .music-offline-socket {
 window.music box.music-player-bar button.music-toggle-circle:checked:disabled {
   background-color: transparent;
   color: var(--m-tertiary);
+}
+
+/* 右パネルを内容の上に重ねている間 (1080sp 以下) は、再生バーがパネルの下端に掛かることが
+   ある。最後の行までバーの上へ送れるよう、下に余白を足す */
+window.music stack.music-panel-stack.under-bar .music-queue-content {
+  padding-bottom: 96px;
+}
+
+window.music stack.music-panel-stack.under-bar .music-lyrics {
+  padding-bottom: 72px;
 }

@@ -34,13 +34,14 @@ from gi.repository import Adw, Gdk, Gio, GLib, Graphene, Gsk, Gtk, Pango  # noqa
 from . import log  # noqa: E402
 from .artwork import placeholder_colors  # noqa: E402
 from .protocol import (  # noqa: E402
-    VOLUME_MAX_DB,
     VOLUME_MIN_DB,
     Lyrics,
     Status,
     Track,
     format_time,
+    fraction_to_volume,
     track_key,
+    volume_fraction,
 )
 from .widgets import (  # noqa: E402
     Artwork,
@@ -132,16 +133,6 @@ def time_texts(position: float, duration: float) -> tuple[str, str]:
         position = min(position, float(duration))
         return format_time(position), "−" + format_time(max(0.0, float(duration) - position))
     return format_time(position), ""
-
-
-def volume_fraction(db: float) -> float:
-    """音量 dB (-30〜+6) をつまみの位置 0〜1 に (dB に比例。耳の感じ方に近い)。"""
-    span = VOLUME_MAX_DB - VOLUME_MIN_DB
-    return min(1.0, max(0.0, (float(db) - VOLUME_MIN_DB) / span))
-
-
-def fraction_to_volume(fraction: float) -> float:
-    return VOLUME_MIN_DB + min(1.0, max(0.0, float(fraction))) * (VOLUME_MAX_DB - VOLUME_MIN_DB)
 
 
 def lyrics_subject(status: Status) -> tuple[str, str] | None:
@@ -778,6 +769,7 @@ class TransportRow(Gtk.CenterBox):
 
     # (端の丸の直径, 端の記号, 送りの幅, 送りの記号, 再生の幅, 再生の記号, 中央の間隔)
     SIZES = {
+        "xlarge": (40, 21, 60, 36, 72, 46, 32),
         "large": (34, 18, 50, 30, 60, 38, 26),
         "medium": (28, 15, 38, 24, 44, 30, 16),
         "small": (24, 14, 32, 19, 34, 23, 10),
@@ -877,17 +869,18 @@ def _device_popup(button: Gtk.MenuButton, store) -> None:
     group.add_action(select)
     button.insert_action_group("vol", group)
 
-    def done(devices) -> None:
+    def done(devices, error: str = "") -> None:
         menu.remove_all()
         if not devices:
-            menu.append("出力先を取得できません", "vol.none")
+            menu.append(error or "出力先を取得できません", "vol.none")
             return
-        for name, active in devices:
-            item = Gio.MenuItem.new(name.replace("_", "__"), None)
-            item.set_action_and_target_value("vol.device", GLib.Variant.new_string(name))
+        for device in devices:
+            # 見出しは説明 (無ければ sink 名から作ったもの)。切り替えには sink 名を送る
+            item = Gio.MenuItem.new(device.label.replace("_", "__"), None)
+            item.set_action_and_target_value("vol.device", GLib.Variant.new_string(device.name))
             menu.append_item(item)
-            if active:
-                select.set_state(GLib.Variant.new_string(name))
+            if device.active:
+                select.set_state(GLib.Variant.new_string(device.name))
 
     store.list_devices(done)
 
@@ -1350,7 +1343,14 @@ class LyricsView(Gtk.Widget):
 def _play_row(row) -> None:
     ctx = getattr(row, "ctx", None)
     if ctx is not None and row.index is not None:
-        ctx.store.play_index(row.index)
+        ctx.store.play_index(row.index, path=row.track.path if row.track is not None else None)
+
+
+def _play_queued(row) -> None:
+    """待ち行列の行: その曲より前の待ち行列を外して next (play_index は待ち行列から外さない)。"""
+    ctx = getattr(row, "ctx", None)
+    if ctx is not None and row.index is not None:
+        ctx.store.play_queued(row.index)
 
 
 def _clear_queue(_button, store) -> None:
@@ -1377,8 +1377,10 @@ class UpNextView(Gtk.Box):
 
     上に「シャッフル」「リピート」の横長のカプセル。その下に「次に再生」
     (待ち行列。見出しの右に赤い「消去」)、続いて今のリストから次に来る曲。
-    行のダブルクリックでその曲を再生する。`refresh()` で store から作り直す
-    (中身が同じなら作り直さない)。`update_status(status)` でカプセルを合わせる。
+    行のダブルクリックでその曲を再生する (待ち行列の曲は store.play_queued)。
+    シャッフルとリピート (すべて) で一巡の後も続くときは、そう書き添える (up_next は
+    今の一巡の残りだけ)。`refresh()` で store から作り直す (中身が同じなら作り直さない)。
+    `update_status(status)` でカプセルを合わせる。
     """
 
     MAX_ROWS = 120
@@ -1448,10 +1450,11 @@ class UpNextView(Gtk.Box):
         elif store.api < 1 or not store.supports("playlist"):
             signature = ("unsupported",)
         else:
+            # シャッフルとリピートでも空のときの文と添え書きが変わる (up_next が同じでも)
             signature = (tuple((i, pl.track_at(i).path if pl.track_at(i) else "") for i in pl.queue),
                          tuple((i, pl.track_at(i).path if pl.track_at(i) else "")
                                for i in pl.up_next[: self.MAX_ROWS]),
-                         pl.source.name, status.index)
+                         pl.source.name, status.index, status.shuffle, status.repeat)
         if signature == self._signature and not force:
             return
         self._signature = signature
@@ -1464,8 +1467,13 @@ class UpNextView(Gtk.Box):
             return
         queue = [(i, pl.track_at(i)) for i in pl.queue if pl.track_at(i) is not None]
         upcoming = [(i, pl.track_at(i)) for i in pl.up_next[: self.MAX_ROWS] if pl.track_at(i) is not None]
+        reshuffle = store.continues_by_reshuffle()
         if not queue and not upcoming:
-            self._show_empty("次に再生する曲はありません", None)
+            if reshuffle:
+                self._show_empty("このあとシャッフルし直して続けて再生します",
+                                 "いまのシャッフルの一巡が終わると、並びを混ぜ直して続きます。")
+            else:
+                self._show_empty("次に再生する曲はありません", None)
             return
         self._stack.set_visible_child_name("list")
         if queue:
@@ -1485,6 +1493,11 @@ class UpNextView(Gtk.Box):
                 header = SectionHeader("次に再生")
                 self._content.append(self._section(header, pl.source.name or None))
             self._content.append(self._rows(upcoming, "nowplaying"))
+        if reshuffle and len(pl.up_next) < 200:
+            note = _label("このあとシャッフルし直して続けて再生します", "music-fs-queue-subtitle")
+            note.set_margin_start(8)
+            note.set_margin_top(14)
+            self._content.append(note)
 
     def _show_empty(self, title: str, description: str | None) -> None:
         self._empty.set_title(title)
@@ -1507,9 +1520,10 @@ class UpNextView(Gtk.Box):
     def _rows(self, items, context: str) -> TrackList:
         rows = TrackList(selectable=True)
         rows.add_css_class("music-fs-rows")
+        activate = _play_queued if context == "queue" else _play_row
         for index, track in items:
             rows.append(TrackRow(self.ctx, track, variant="queue", index=index, menu_context=context,
-                                 on_activate=_play_row))
+                                 on_activate=activate))
         return rows
 
 
@@ -1551,9 +1565,13 @@ class FullscreenPlayer(Gtk.Box):
     """
 
     TICK_MS = 200
-    # (名前, 条件, 絵の大きさ, 歌詞の文字, 操作の列の大きさ)。後ろほど優先。曲名と副題の文字は CSS
+    # (名前, 条件, 絵の大きさ, 歌詞の文字, 操作の列の大きさ)。後ろほど優先。曲名と副題の文字は CSS。
+    # large は窓 (1180x760 ほど) の大きさ。本当のフルスクリーン (1920x1080 など) では xlarge
+    # (絵は高さの 4 割ほど。Apple のフルスクリーンも窓より大きく描く)、1440p 以上は xxlarge
     LEVELS = (
         ("large", None, 360, 34, "large"),
+        ("xlarge", "min-width: 1400px and min-height: 900px", 440, 42, "xlarge"),
+        ("xxlarge", "min-width: 2200px and min-height: 1300px", 560, 52, "xlarge"),
         ("medium", "max-width: 1060px or max-height: 720px", 300, 30, "large"),
         ("small", "max-width: 860px or max-height: 600px", 240, 26, "medium"),
     )
@@ -1761,7 +1779,8 @@ class FullscreenPlayer(Gtk.Box):
         self.set_level(level)
 
     def set_level(self, level: str) -> None:
-        """大きさの段 ("large" / "medium" / "small")。ふつうは窓の大きさで自動で決まる。"""
+        """大きさの段 ("xxlarge" / "xlarge" / "large" / "medium" / "small")。ふつうは窓の
+        大きさで自動で決まる。"""
         sizes = {name: rest for name, _cond, *rest in self.LEVELS}
         if level not in sizes or level == self._level:
             return
@@ -1883,8 +1902,7 @@ class FullscreenPlayer(Gtk.Box):
         self.volume.update(status)
         self.queue.update_status(status)
         live = status.is_live
-        seekable = (track is not None and not live and status.duration > 0 and store.supports("seek_to"))
-        self.scrubber.set_interactive(seekable)
+        self.scrubber.set_interactive(store.can_seek())
         self.scrubber.set_visible(not live)
         # 読み込み中は副題が「読み込み中…」になるので、印には出さない
         if live:

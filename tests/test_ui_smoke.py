@@ -460,9 +460,12 @@ class AppSmokeTest(unittest.TestCase):
             handled = keys.emit("key-pressed", Gdk.KEY_space, 0, Gdk.ModifierType(0))
             check(not handled and requests("toggle") == before, "検索欄の Space が再生/一時停止に使われた")
             check(not app.lookup_action("next").get_enabled(), "入力中に Ctrl+→ (次へ) が入力欄に譲られない")
+            # Ctrl+. は GtkText の絵文字の選択。入力中に停止へ使わない
+            check(not app.lookup_action("stop").get_enabled(), "入力中に Ctrl+. (停止) が入力欄に譲られない")
             window.set_focus(None)
             yield 0.2
             check(app.lookup_action("next").get_enabled(), "入力欄を離れても Ctrl+→ (次へ) が戻らない")
+            check(app.lookup_action("stop").get_enabled(), "入力欄を離れても Ctrl+. (停止) が戻らない")
             handled = keys.emit("key-pressed", Gdk.KEY_space, 0, Gdk.ModifierType(0))
             yield (lambda: requests("toggle") > before, 3, "Space で再生/一時停止にならない")
             check(handled, "Space を窓が受け取らない")
@@ -483,9 +486,9 @@ class AppSmokeTest(unittest.TestCase):
             window._fullscreen_player.set_mode("queue")
             yield 0.5
             # 次に再生を何度か作り直し、外した行が (二重の後始末で落ちずに) 解放されるか
-            tracks = list(store().playlist.tracks)
-            for picks in ((tracks[5], tracks[7]), (tracks[1],)):
-                store().enqueue(list(picks), "next")
+            for picks in ((5, 7), (1,)):
+                for index in picks:
+                    store().queue_edit("add", index=index)
                 yield (lambda: len(store().playlist.queue) >= len(picks), 3, "待ち行列に入らない")
                 yield 0.4
                 store().queue_edit("clear")
@@ -515,6 +518,28 @@ class AppSmokeTest(unittest.TestCase):
             app.equalizer.close()
             app.activate_action("refresh", None)
             yield 0.4
+
+            # 右パネルを内容に重ねて出す幅 (1080sp 以下) でも再生バーは押せる (パネルの覆いの下にしない)
+            from gi.repository import Graphene
+
+            window.set_default_size(1000, 700)
+            yield (lambda: window.panel_split.get_collapsed(), 3, "1000 で右パネルが重ねにならない")
+            window.show_panel("queue")
+            yield 0.8
+            for widget, name in ((bar.play, "再生"), (bar.volume, "音量"), (bar.queue_button, "次に再生")):
+                ok, point = widget.compute_point(window, Graphene.Point().init(widget.get_width() / 2,
+                                                                               widget.get_height() / 2))
+                picked = window.pick(point.x, point.y, Gtk.PickFlags.DEFAULT) if ok else None
+                check(picked is not None and (picked is widget or picked.is_ancestor(widget)),
+                      f"右パネルを重ねている間、再生バーの「{name}」が押せない ({type(picked).__name__})")
+                check(widget.get_mapped(), f"右パネルを重ねている間、再生バーの「{name}」が見えない")
+            before = requests("toggle")
+            bar.play.emit("clicked")
+            yield (lambda: requests("toggle") > before, 3, "重ねたパネルの間に再生バーの再生が効かない")
+            bar.queue_button.set_active(False)
+            yield (lambda: window.panel == "", 3, "再生バーの「次に再生」でパネルが閉じない")
+            window.set_default_size(1180, 760)
+            yield (lambda: not window.panel_split.get_collapsed(), 3, "広げても右パネルが重ねのまま")
 
             # 狭い幅 (サイドバーを畳む)
             window.set_default_size(760, 700)
