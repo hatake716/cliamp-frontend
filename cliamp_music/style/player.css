@@ -25,6 +25,7 @@ window.music.music-mini {
   --m-over-glass: rgba(255, 255, 255, 0.13);
   --m-over-glass-hover: rgba(255, 255, 255, 0.20);
   --m-over-edge: rgba(255, 255, 255, 0.17);
+  --m-over-warning: #ffe1ad;                    /* 再生できなかった曲の理由 (どの絵の上でも読める淡い琥珀) */
 }
 
 /* 絵の上のガラスのカプセル (✕ / ミニプレーヤー、音量、切り替え、ミニプレーヤーの右上) */
@@ -149,6 +150,11 @@ window.music .music-fs-subtitle {
   font-size: 17px;
   font-weight: 500;
   color: var(--m-over-secondary);
+}
+
+window.music .music-fs-subtitle.problem {
+  color: var(--m-over-warning);
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.35);
 }
 
 window.music .music-fullscreen.medium .music-fs-title { font-size: 20px; }
@@ -364,6 +370,11 @@ window.music.music-mini .music-mini-compact-title {
 window.music.music-mini .music-mini-compact-subtitle {
   font-size: 12px;
   color: rgba(255, 255, 255, 0.66);
+}
+
+window.music.music-mini .music-mini-subtitle.problem,
+window.music.music-mini .music-mini-compact-subtitle.problem {
+  color: var(--m-over-warning);
 }
 
 window.music.music-mini .music-mini-compact menubutton.music-mini-more > button {

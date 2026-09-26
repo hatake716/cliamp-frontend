@@ -4,11 +4,69 @@
 macOS 27 の「ミュージック」風に操作する GTK4 + libadwaita のアプリ
 (アプリ ID `org.nixos.Music`、実行ファイル `cliamp-music`)。
 
+![ホーム](docs/screenshots/home.png)
+
 再生そのものは常駐している cliamp が行い、このアプリは IPC
-(`~/.config/cliamp/cliamp.sock`) だけを通して操作する。ライブラリ・検索・次に再生・
-歌詞などを使うには、cliamp 側にも IPC の拡張 (`patches/cliamp-1.50.0-gui-ipc.patch`、
-仕様は [PROTOCOL.md](PROTOCOL.md)) を当てる。当てていない cliamp にも繋がり、そのときは
-再生の操作だけが使える。画面の設計は [DESIGN.md](DESIGN.md)。
+(`~/.config/cliamp/cliamp.sock`) だけを通して操作する。アプリを閉じても音楽は止まらず、
+端末の cliamp (TUI) や、cliamp を操作するほかの道具 (Open-Voice など) と同時に使える。
+ライブラリ・検索・次に再生・歌詞などを使うには、cliamp 側にも IPC の拡張
+(`patches/cliamp-1.50.0-gui-ipc.patch`、仕様は [PROTOCOL.md](PROTOCOL.md)) を当てる。
+当てていない cliamp にも繋がり、そのときは再生の操作だけが使える。画面の設計は
+[DESIGN.md](DESIGN.md)。
+
+## できること
+
+- **サイドバー**: 検索・ホーム・ラジオ、ライブラリ (最近再生した項目・再生中のリスト)、
+  プレイリスト (cliamp のローカルのプレイリストと、Spotify など cliamp に登録された
+  プロバイダーのもの)。窓の端まで続く macOS 27 の形で、記号は赤。
+- **再生バー**: 画面の下に浮かぶガラスのカプセル。シャッフル・前へ・再生・次へ・
+  リピート、アートワークと曲名、ドラッグでシークできる細い線、再生速度・イコライザ・
+  リンクのコピー、歌詞と次に再生のパネル、出力先 (cliamp の `device`)、音量。
+- **ホーム**: 最近再生した YouTube の曲から作るステーション (YouTube のミックス)、
+  最近再生した項目、プレイリスト、日本の人気のラジオ局。
+- **検索**: YouTube (cliamp の yt-dlp の検索)、Spotify (登録されていれば)、ライブラリ
+  (ローカルのプレイリストと履歴)。トップの結果と曲の一覧、最近の検索、カテゴリーのタイル。
+- **ラジオ**: cliamp ラジオ (組み込みの局とお気に入り) と
+  [Radio Browser](https://www.radio-browser.info/) の人気局・局の検索。
+- **プレイリストの詳細と再生中のリスト**: アルバムのページの形。再生中の行に動くバー。
+  「…」メニューから次に再生・最後に再生・プレイリストに追加・ステーションを作成など。
+- **右パネル**: 歌詞 (cliamp が LRCLIB / NetEase から取る同期歌詞。今の行を追い、
+  行を押すとその時刻へ) と、次に再生 (待ち行列・このあとの曲・履歴)。
+- **フルスクリーンプレーヤー**: アートワークをぼかした背景に大きな歌詞か次に再生。
+- **ミニプレーヤー** (アートワーク全面の正方形と横長) と **イコライザ** (cliamp の
+  10 バンドとプリセット、再生速度)。
+- 再生に失敗したときは、理由 (「YouTube のサインインが必要な曲です」など) を再生バーと
+  トーストに出す。cliamp が止まっている・繋がらないときは「cliamp を起動」を出し、
+  繋ぎ直す。
+
+| | |
+|---|---|
+| ![プレイリスト](docs/screenshots/playlist.png) | ![検索](docs/screenshots/search-results.png) |
+| ![次に再生](docs/screenshots/queue.png) | ![フルスクリーンプレーヤー](docs/screenshots/fullscreen-lyrics.png) |
+
+<img src="docs/screenshots/mini-square.png" alt="ミニプレーヤー" width="240">
+
+画面写真は試験用の偽の cliamp (`tests/fake_cliamp.py`) と、そのために描いた絵で撮ったもの
+(`scripts/shoot.py`)。
+
+## 仕組み
+
+```
+ミュージック (GTK) ──IPC (改行区切りの JSON)──▶ cliamp (tmux の中の TUI、常駐)
+                     ~/.config/cliamp/cliamp.sock        └ 再生・yt-dlp・プロバイダー
+```
+
+- 状態は専用の接続で 0.4 秒ごとに取る (窓が隠れている間は 1.5 秒)。状態を変える操作は
+  送った順に届け、検索のような遅い要求に待たされない列に分けてある。
+- パッチは cliamp の IPC にコマンドを **足す** だけで、既存のコマンド・`cliamp status` の
+  平文の出力・TUI のキー操作は変えない (Open-Voice がそれで cliamp を操作しているため)。
+  ネットワークを待つ要求 (検索・プレイリスト・歌詞) は TUI の描画を止めない所で処理する。
+- アプリは MPRIS の名前を取らない (GNOME のメディアの操作や Open-Voice からは、今まで
+  どおり cliamp が 1 つのプレーヤーとして見える)。
+- アートワークは cliamp が持っていないので、アプリが曲から求める: YouTube の曲は
+  サムネイル (黒帯を除いて正方形に切り抜く)、Spotify は oEmbed、手元のファイルは埋め込みの
+  絵か同じフォルダの cover.jpg、ラジオは局の favicon。取れなければ色の代わりの絵。
+  `~/.cache/cliamp-music/` に 256 MiB まで置く。
 
 ## NixOS で使う
 
@@ -17,7 +75,8 @@ flake の入力に足し、モジュールを読み込む:
 ```nix
 {
   inputs.cliamp-music = {
-    url = "git+file:///home/takeshi/git/cliamp-frontend";  # 取り出している枝をそのまま使う
+    url = "github:hatake716/cliamp-frontend";
+    # 手元のクローンを使うなら: url = "git+file:///path/to/cliamp-frontend?ref=main";
     inputs.nixpkgs.follows = "nixpkgs";
   };
 
@@ -82,6 +141,42 @@ GNOME の「ミュージック」(gnome-music) も日本語では「ミュージ
 などのテーマではアイコンもほぼ同じ赤い四角の音符になる。アプリの一覧や検索で見分けられ
 ないので、使わないなら `programs.cliamp-music.hideGnomeMusic = true;` (または
 `environment.gnome.excludePackages = [ pkgs.gnome-music ];`) で外す。
+
+## キー操作
+
+macOS の Command は Ctrl に置き換えてある。
+
+| キー | 動作 |
+|---|---|
+| Space | 再生 / 一時停止 (文字の入力中とメニューの中は除く) |
+| Ctrl+→ / Ctrl+← | 次へ / 前へ |
+| Shift+Ctrl+→ / ← | 10 秒進む / 戻る (Ctrl+Alt+矢印は GNOME の作業領域の切り替えと重なるため) |
+| Ctrl+↑ / Ctrl+↓ | 音量 ±2 dB |
+| Ctrl+. | 停止 |
+| Ctrl+L | 再生中の曲をリストで表示 |
+| Ctrl+F | 検索 |
+| Ctrl+Alt+U | 次に再生 (右パネル) |
+| Shift+Ctrl+L | 歌詞 (右パネル) |
+| Shift+Ctrl+F | フルスクリーンプレーヤー (Esc で戻る) |
+| Shift+Ctrl+M | ミニプレーヤー |
+| Ctrl+Alt+E | イコライザ |
+| Ctrl+R | ページを更新 |
+| Ctrl+0 | メインの窓 |
+| Ctrl+W / Ctrl+Q | 窓を閉じる / 終了 (cliamp の再生は続く) |
+
+## 制限
+
+- 配色は暗色だけ (このアプリを作った環境が暗色で固定のため)。
+- ライブラリに出るのは cliamp が持っているものだけ: ローカルのプレイリスト (TOML)、
+  履歴、cliamp に登録したプロバイダー (Spotify・Navidrome・Jellyfin など) のプレイリスト。
+  YouTube Music のライブラリは、cliamp に Google の OAuth の client_id / client_secret を
+  設定してサインインしない限り出ない (検索と再生は yt-dlp で使える)。
+- サインインはアプリからは始めない (cliamp がブラウザを開くため)。端末の cliamp で行う。
+- 歌詞は行ごと (cliamp の LRC)。Apple のような単語ごとの色の移り変わりは無い。
+- ローカルのプレイリストに保存できるのは cliamp の TOML にある項目だけなので、ラジオの局
+  (ライブ配信) は「プレイリストに追加」できない。
+- 確かめたのは Xvfb (合成なし、cairo の描画) と、無音の出口で動かした本物のパッチ済み
+  cliamp まで。Wayland の合成あり・GL の描画・HiDPI での見え方は実機で確かめていない。
 
 ## 開発
 

@@ -51,7 +51,7 @@ REQUIRED_ICONS = (
     "search", "home", "radio", "recent", "note", "note-list", "grid", "queue", "lyrics",
     "shuffle", "repeat", "repeat-one", "play", "pause", "next", "previous", "stop",
     "volume", "volume-mute", "output", "more", "star", "back", "forward", "chevron-right",
-    "close", "miniplayer", "fullscreen", "plus", "equalizer", "station", "clear",
+    "close", "miniplayer", "fullscreen", "plus", "equalizer", "station", "clear", "warning",
 )
 SVG = "{http://www.w3.org/2000/svg}"
 
@@ -179,6 +179,64 @@ class IconFilesTest(unittest.TestCase):
         self.assertTrue(root.find(f"{SVG}desc").text)
 
 
+def _lines(layout) -> list[str]:
+    data = layout.get_text().encode("utf-8")
+    out = []
+    for i in range(layout.get_line_count()):
+        line = layout.get_line_readonly(i)
+        out.append(data[line.start_index:line.start_index + line.length].decode("utf-8"))
+    return out
+
+
+@unittest.skipUnless(HAVE_GI, "PyGObject がありません")
+class PathWrapTest(unittest.TestCase):
+    """ファイルのパスは "/" の直後でだけ折り返し、語の途中で "-" を足さない。"""
+
+    PATHS = (
+        "/tmp/nix-shell.pDVMAx/cm-shoot-5d8dkglc/cliamp.sock",
+        "/home/user/.config/cliamp/cliamp.sock",
+        "/run/user/1000/some-long-directory-name/cliamp.sock",
+        "/tmp/曲の置き場/cliamp.sock",
+    )
+
+    def layout(self, path: str, width_px: int, attrs=None):
+        gi.require_version("PangoCairo", "1.0")
+        from gi.repository import Pango, PangoCairo
+
+        layout = Pango.Layout.new(PangoCairo.FontMap.get_default().create_context())
+        layout.set_text(path, -1)
+        layout.set_wrap(Pango.WrapMode.WORD)
+        layout.set_width(width_px * Pango.SCALE)
+        layout.set_attributes(W.path_wrap_attributes(path) if attrs is None else attrs)
+        return layout
+
+    def test_breaks_only_after_slashes(self):
+        for path in self.PATHS:
+            for width in (40, 90, 160, 260):
+                with self.subTest(path=path, width=width):
+                    lines = _lines(self.layout(path, width))
+                    self.assertEqual("".join(lines), path)
+                    for line in lines[:-1]:
+                        self.assertTrue(line.endswith("/"), lines)
+
+    def test_check_catches_mid_word_breaks(self):
+        """この試験の判定が本当に働くか (属性なしなら "-" や語の途中で折れること)。"""
+        from gi.repository import Pango
+
+        lines = _lines(self.layout(self.PATHS[2], 90, attrs=Pango.AttrList()))
+        self.assertFalse(all(line.endswith("/") for line in lines[:-1]), lines)
+
+    def test_no_inserted_hyphens(self):
+        from gi.repository import Pango
+
+        attrs = W.path_wrap_attributes(self.PATHS[0])
+        kinds = [a.klass.type for a in attrs.get_attributes()]
+        self.assertIn(Pango.AttrType.INSERT_HYPHENS, kinds)
+        hyphens = [a for a in attrs.get_attributes() if a.klass.type == Pango.AttrType.INSERT_HYPHENS]
+        self.assertEqual(hyphens[0].as_int().value, 0)
+        self.assertEqual(W.path_wrap_attributes("").get_attributes()[0].klass.type, Pango.AttrType.INSERT_HYPHENS)
+
+
 # --------------------------------------------------------------------------
 # 部品を置くもの
 
@@ -224,6 +282,28 @@ class WindowCase(unittest.TestCase):
         self.window.set_child(child)
         self.window.present()
         self.assertTrue(run_until(child.get_mapped), "表示されませんでした")
+
+
+@unittest.skipUnless(HAVE_DISPLAY, "画面 (DISPLAY) がありません")
+class PathLabelTest(WindowCase):
+    def test_narrow_label_wraps_at_slashes_and_keeps_the_whole_path(self):
+        path = "/tmp/nix-shell.pDVMAx/cm-shoot-5d8dkglc/cliamp.sock"
+        label = W.PathLabel(path)
+        box = Gtk.Box()
+        box.set_size_request(170, -1)
+        label.set_hexpand(True)
+        box.append(label)
+        self.window.set_default_size(170, 200)
+        self.show(box)
+        self.assertTrue(run_until(lambda: label.get_layout().get_line_count() > 1))
+        lines = _lines(label.get_layout())
+        for line in lines[:-1]:
+            self.assertTrue(line.endswith("/"), lines)
+        self.assertEqual(label.get_text(), path)
+        self.assertEqual(label.get_tooltip_text(), path)
+        self.assertTrue(label.get_selectable())
+        label.set_path("/run/user/1000/cliamp.sock")
+        self.assertEqual(label.get_tooltip_text(), "/run/user/1000/cliamp.sock")
 
 
 @unittest.skipUnless(HAVE_DISPLAY, "画面 (DISPLAY) がありません")

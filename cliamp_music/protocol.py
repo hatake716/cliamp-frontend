@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import functools
 import json
 import math
 import os
@@ -444,6 +445,7 @@ class Status:
     source: Source = field(default_factory=Source)
     stream_title: str = ""
     buffering: bool = False
+    playback_error: str = ""
     api: int = 0
     seq: int = 0
     stamp: float = 0.0
@@ -461,12 +463,25 @@ class Status:
         return self.track.display_title if self.track else ""
 
     @property
+    def playback_problem(self) -> tuple[str, str] | None:
+        """いまの曲が再生できなかった理由 (短い日本語, 全文)。無ければ None。
+
+        読み込み中 (やり直している間) は出さない (cliamp も次の開始で消す)。"""
+        if self.buffering or self.track is None or not self.playback_error.strip():
+            return None
+        return describe_playback_error(self.playback_error)
+
+    @property
     def display_subtitle(self) -> str:
-        """再生バーの副題。読み込み中は「読み込み中…」、ラジオは局名。"""
+        """再生バーの副題。読み込み中は「読み込み中…」、再生できなかったらその理由の短文、
+        ラジオは局名。"""
         if self.buffering:
             return "読み込み中…"
         if not self.track:
             return ""
+        problem = self.playback_problem
+        if problem is not None:
+            return problem[0]
         if self.stream_title.strip():
             return self.track.display_title
         return self.track.subtitle
@@ -680,8 +695,194 @@ def parse_status(d: Any) -> Status:
         source=Source.from_wire(d.get("source")),
         stream_title=_as_str(d.get("stream_title")),
         buffering=_as_bool(d.get("buffering")),
+        playback_error=_as_str(d.get("playback_error")),
         api=_as_int(d.get("api")),
     )
+
+
+# --- 再生の失敗 (status の playback_error) ---------------------------------------------
+
+PLAYBACK_ERROR_SHORT_MAX = 80  # 知らない誤りを短文にするときの長さ (文字)
+PLAYBACK_ERROR_DETAIL_MAX = 1200  # ツールチップに出す全文の長さ (文字)
+
+_HTTP_DENIED = re.compile(r"\b(?:http(?: error| status)?\s*(?:403|429)|403 forbidden|429 too many requests)\b"
+                          r"|too many requests|rate.?limit")
+_HTTP_GONE = re.compile(r"\bhttp(?: error| status)?\s*(?:404|410)\b|404 not found|410 gone")
+_YTDL_PREFIX = re.compile(r"^(?:yt-dlp(?: seek)?:\s*)+", re.IGNORECASE)
+_ERROR_PREFIX = re.compile(r"^(?:error|fatal):\s*", re.IGNORECASE)
+_EXTRACTOR_PREFIX = re.compile(r"^\[[^\]\s]+\]\s*(?:[\w-]{1,64}:\s+)?")
+# 見分けに使わない部分: URL (Go の url.Error は "Get \"https://…\"")、引用符の中 (%q)、
+# 手元のパス (os.PathError は "open /music/…/x.flac: no such file or directory")。曲名や
+# フォルダ名の語 ("Timeout"、"Spotify Singles"、"Private Video") で理由を取り違えない。
+_URL = re.compile(r"\b[a-z][a-z0-9+.-]*://([^\s\"'<>/?#]*)[^\s\"'<>]*")
+_QUOTED = re.compile(r'"[^"\n]*"')
+_LOCAL_PATH = re.compile(r"(?<![\w.:/~-])~?/[^\s/:][^\n]*?(?=:\s|:?$)", re.MULTILINE)
+# yt-dlp の抽出器 ("ERROR: [soundcloud] 123: …"、"[youtube:tab]")
+_EXTRACTOR_TAG = re.compile(r"\[([a-z][a-z0-9_.-]*)(?::[\w.-]+)?\]")
+_EXTRACTOR_SERVICES = (("youtube", "YouTube"), ("soundcloud", "SoundCloud"), ("spotify", "Spotify"),
+                       ("bandcamp", "Bandcamp"), ("vimeo", "Vimeo"))
+# Go の exec.Error ('exec: "yt-dlp": executable file not found in $PATH')
+_MISSING_EXEC = re.compile(r'exec: "([^"\n]+)": executable file not found')
+_CLASSIFY_MAX = 8000  # 見分けに使う長さ (cliamp は 2 KiB で切る。古い・知らない送り手に備える)
+
+
+def _any_in(text: str, needles: Iterable[str]) -> bool:
+    return any(needle in text for needle in needles)
+
+
+def _service_of(plain: str, hosts: str) -> str:
+    """誤りの出どころ。yt-dlp の抽出器の印 ([soundcloud] など) を先に見る (cliamp の yt-dlp の
+    誤りはどれも "yt-dlp: " で始まるので、それだけでは YouTube と決めない)。plain はパスと URL を
+    除いた文、hosts は URL のホスト名。"""
+    tag = _EXTRACTOR_TAG.search(plain)
+    if tag is not None:
+        name = tag.group(1)
+        return next((label for key, label in _EXTRACTOR_SERVICES if name.startswith(key)), "")
+    both = f"{plain} {hosts}"
+    if "spotify" in both:
+        return "Spotify"
+    if "soundcloud" in both:
+        return "SoundCloud"
+    if _any_in(both, ("youtube", "youtu.be", "ytsearch", "yt-dlp")):
+        return "YouTube"
+    return ""
+
+
+def _classify_text(text: str) -> tuple[str, str]:
+    """見分けに使う (小文字の文, URL のホスト名)。URL・引用符の中・手元のパスを除く。"""
+    low = text[:_CLASSIFY_MAX].lower().replace("\u2019", "'")
+    hosts = " ".join(m.group(1) for m in _URL.finditer(low))
+    plain = _URL.sub(" ", low)
+    plain = _QUOTED.sub(" ", plain)
+    plain = _LOCAL_PATH.sub(" ", plain)
+    return plain, hosts
+
+
+def _playback_error_lines(text: str) -> list[str]:
+    return [" ".join(line.split()) for line in _as_str(text).replace("\r", "\n").split("\n") if line.strip()]
+
+
+def _clean_error_line(lines: list[str]) -> str:
+    """知らない誤りの短文: yt-dlp なら ERROR の行 (WARNING の行は飛ばす) を、前置き
+    ("yt-dlp: ERROR: [youtube] ID: ") を除いて、長ければ省略する。"""
+    if not lines:
+        return ""
+    pick = next((line for line in lines if "error:" in line.lower()), lines[0])
+    line = _YTDL_PREFIX.sub("", pick)
+    line = _ERROR_PREFIX.sub("", line)
+    line = _EXTRACTOR_PREFIX.sub("", line).strip() or pick
+    if len(line) > PLAYBACK_ERROR_SHORT_MAX:
+        line = line[: PLAYBACK_ERROR_SHORT_MAX - 1].rstrip() + "…"
+    return line
+
+
+@functools.lru_cache(maxsize=32)
+def _describe_playback_error(text: str) -> tuple[str, str]:
+    return _describe(text)
+
+
+def describe_playback_error(text: str) -> tuple[str, str]:
+    """cliamp の再生の誤り (status の playback_error) を (短い日本語, 全文) にする。
+
+    短文は再生バーの副題・フルスクリーン・ミニプレーヤー・トーストに、全文はツールチップに出す。
+    yt-dlp の誤りは stderr がそのまま来る (WARNING の行が先に並ぶこともある)。知らない誤りは
+    最初の意味のある行 (yt-dlp なら ERROR の行) を 80 字ほどに縮めて出す。空なら ("", "")。
+    status は 1 秒に何度も届き、再生バー・フルスクリーン・ミニプレーヤーがそれぞれ引くので覚えておく。
+    """
+    return _describe_playback_error(_as_str(text))
+
+
+def _describe(text: str) -> tuple[str, str]:
+    lines = _playback_error_lines(text)
+    if not lines:
+        return "", ""
+    whole = "\n".join(lines)
+    detail = whole
+    if len(detail) > PLAYBACK_ERROR_DETAIL_MAX:
+        detail = detail[: PLAYBACK_ERROR_DETAIL_MAX - 1].rstrip() + "…"
+    # 見分けは切り詰める前の全体で (ERROR の行が長い前置きの後ろにあっても見落とさない)。
+    # パスや URL の中の語では決めない (low)。道具の有無だけは引用符の中 ("yt-dlp") も見る (full)。
+    full = whole[:_CLASSIFY_MAX].lower()
+    low, hosts = _classify_text(whole)
+    service = _service_of(low, hosts)
+
+    # サインイン (Spotify のセッション切れ、cliamp の ErrNeedsAuth "sign-in required")
+    if service == "Spotify" and _any_in(low, ("sign-in required", "auth", "credential", "token", "login",
+                                              "log in", "401", "cliamp spotify reset")):
+        return "Spotify へのサインインが必要です (cliamp の端末で)", detail
+    if "sign-in required" in low:
+        return "サインインが必要です (cliamp の端末で)", detail
+    # 非公開・削除 (「Private video. Sign in if you've been granted access」はサインインではない)
+    if _any_in(low, ("private video", "video is private", "this video has been removed",
+                     "has been removed by the uploader", "account associated with this video has been terminated",
+                     "video has been removed", "no longer available")):
+        return "この動画は再生できません (非公開か削除)", detail
+    # 年齢確認・ボット確認・メンバー限定 (YouTube のサインインか Cookie が要る)
+    if _any_in(low, ("confirm your age", "age-restricted", "age restricted", "inappropriate for some users",
+                     "not a bot", "sign in to confirm", "--cookies", "cookies-from-browser",
+                     "members-only", "join this channel", "login required", "requires authentication")):
+        return (f"{service} の" if service and service != "Spotify" else "配信元の") + \
+            "サインインが必要な曲です (cliamp の設定で Cookie を使う)", detail
+    if _any_in(low, ("in your country", "geo restrict", "geo-restrict", "not available in your region")):
+        return "この地域では再生できない動画です", detail
+    if _any_in(low, ("video unavailable", "this video is not available", "this video is unavailable",
+                     "content isn't available", "content is not available")):
+        return "この動画は再生できません (非公開か削除)", detail
+    # 一時的な拒否 (HTTP 403 / 429、回数の制限)
+    if _HTTP_DENIED.search(low):
+        return (f"{service} に" if service else "配信元に") + "一時的に拒否されました", detail
+    if _HTTP_GONE.search(low):
+        if service == "YouTube":
+            return "この動画は再生できません (非公開か削除)", detail
+        return "見つかりません (リンクが切れています)", detail
+    # ネットワーク・名前解決
+    if _any_in(low, ("no such host", "name resolution", "name or service not known", "nodename nor servname",
+                     "network is unreachable", "network is down", "no route to host", "connection refused",
+                     "connection reset", "i/o timeout", "tls handshake timeout", "unable to download webpage",
+                     "failed to resolve", "getaddrinfo", "errno -2]", "errno -3]", "urlopen error",
+                     "connection timed out", "dial tcp", "dial udp", "server misbehaving",
+                     "unable to connect", "network error")):
+        return "ネットワークに繋がりません", detail
+    if _any_in(low, ("timed out", "timeout", "deadline exceeded")):
+        return "読み込みが時間切れになりました", detail
+    # 再生に要る道具
+    missing = _MISSING_EXEC.search(full)
+    missing_tool = os.path.basename(missing.group(1)) if missing is not None else ""
+    if "yt-dlp is required" in full or missing_tool == "yt-dlp":
+        return "再生に yt-dlp が要ります", detail
+    if "ffmpeg is required" in full or missing_tool in ("ffmpeg", "ffprobe"):
+        return "再生に ffmpeg が要ります", detail
+    if "no episodes found in feed" in low:
+        return "このフィードにはエピソードがありません", detail
+    # 手元のファイル
+    if "no such file or directory" in low or "cannot find the file" in low:
+        return "ファイルが見つかりません", detail
+    if "permission denied" in low:
+        return "ファイルを読めません (アクセス権がありません)", detail
+    if "unsupported url" in low:
+        return "この URL は再生できません", detail
+    # 読めない形式・壊れたファイル (cliamp の "decode: …"、ffmpeg の誤り)
+    if _any_in(low, ("decode", "unsupported", "unknown format", "invalid data found", "not a valid",
+                     "no audio", "could not find codec", "format not recognized", "ffmpeg",
+                     "unexpected eof", "bad header", "invalid header", "no decoder",
+                     "moov atom not found", "end of file")):
+        return "このファイルは再生できません", detail
+    return _clean_error_line(lines), detail
+
+
+def playback_error_headline(short: str) -> str:
+    """短文から末尾の括弧書き (「(cliamp の設定で Cookie を使う)」などの手当て) を除いた見出し。
+    幅の限られたトーストに使う (手当ては再生バーのツールチップとフルスクリーンに出る)。"""
+    head = re.sub(r"\s*\([^()]*\)\s*$", "", _as_str(short)).strip()
+    return head or _as_str(short).strip()
+
+
+def playback_error_tooltip(short: str, detail: str) -> str:
+    """再生できなかった理由のツールチップ: 短文 (手当てを含む) と cliamp の誤りの全文。"""
+    short, detail = _as_str(short).strip(), _as_str(detail).strip()
+    if not detail or detail == short:
+        return short
+    return f"{short}\n\n{detail}" if short else detail
 
 
 def parse_tracks(d: Any) -> list[Track]:

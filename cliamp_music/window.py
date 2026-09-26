@@ -59,7 +59,7 @@ from .pages import Bindings, create_page, is_sidebar_page, page_key  # noqa: E40
 from .panels import LyricsPanel, QueuePanel  # noqa: E402
 from .playerbar import BAR_HEIGHT, PlayerBar  # noqa: E402
 from .sidebar import Sidebar  # noqa: E402
-from .widgets import CircleButton, EmptyState, inside_popover, space_toggles  # noqa: E402
+from .widgets import CircleButton, EmptyState, PathLabel, inside_popover, space_toggles  # noqa: E402
 
 MIN_WIDTH, MIN_HEIGHT = 760, 520
 SIDEBAR_WIDTH = 220
@@ -280,13 +280,9 @@ class MusicWindow(Adw.ApplicationWindow):
             "cliamp が動いていないか、ソケットに繋がりません。",
             button_label="cliamp を起動", on_button=self._on_start_cliamp)
         self.offline_state.set_margin_bottom(BAR_HEIGHT + BAR_BOTTOM_MARGIN)
-        self.offline_socket = Gtk.Label()
+        # ソケットのパス: "/" でだけ折り返す (語の途中で折って "-" を足さない)
+        self.offline_socket = PathLabel()
         self.offline_socket.add_css_class("music-offline-socket")
-        self.offline_socket.set_selectable(True)
-        self.offline_socket.set_wrap(True)
-        self.offline_socket.set_wrap_mode(Pango.WrapMode.CHAR)
-        self.offline_socket.set_justify(Gtk.Justification.CENTER)
-        self.offline_socket.set_max_width_chars(48)
         self.offline_state.insert_child_after(self.offline_socket, self.offline_state.description_label)
         view.set_content(self.offline_state)
         return view
@@ -693,7 +689,7 @@ class MusicWindow(Adw.ApplicationWindow):
         self.offline.set_visible(show_offline)
         self.banner.set_revealed(connected and store.api < 1)
         if show_offline:
-            self.offline_socket.set_text(self.ctx.client.socket_path)
+            self.offline_socket.set_path(self.ctx.client.socket_path)
 
     def _probe_done(self) -> bool:
         return getattr(self.ctx.client, "_announced", None) is not None

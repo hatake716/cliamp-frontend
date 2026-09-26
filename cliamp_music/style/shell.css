@@ -474,6 +474,12 @@ window.music box.music-player-bar .music-bar-subtitle.loading {
   color: var(--m-tertiary);
 }
 
+/* 再生できなかった曲: 理由の短文と丸の中の ! (全文はツールチップ) */
+window.music box.music-player-bar .music-bar-subtitle.problem,
+window.music box.music-player-bar .music-bar-problem-icon {
+  color: var(--m-warning);
+}
+
 window.music box.music-player-bar .music-bar-time {
   font-size: 11px;
   font-weight: 500;

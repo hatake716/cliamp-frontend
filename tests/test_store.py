@@ -621,6 +621,96 @@ if __name__ == "__main__":
     unittest.main()
 
 
+FAIL_YT = {"path": "https://www.youtube.com/watch?v=__fail__age", "title": "年齢確認の曲", "artist": "誰か",
+           "duration": 200, "stream": True}
+OK_YT = {"path": "https://www.youtube.com/watch?v=okokokokok1", "title": "ふつうの曲", "artist": "誰か",
+         "duration": 200, "stream": True}
+SIGN_IN = "YouTube のサインインが必要な曲です (cliamp の設定で Cookie を使う)"
+
+
+class PlaybackFailure(StoreWithFake):
+    """再生できなかった曲 (status の playback_error)。"""
+
+    def setUp(self):
+        super().setUp()
+        self.failed: list[str] = []
+        self.store.connect("playback-failed", lambda s: self.failed.append(s.status.playback_error))
+
+    def start_failing(self):
+        self.store.replace([Track.from_wire(FAIL_YT), Track.from_wire(OK_YT)], 0)
+        self.wait(lambda: self.store.status.playback_problem is not None)
+
+    def test_failure_is_shown_and_announced_once(self):
+        self.start_failing()
+        st = self.store.status
+        self.assertEqual(st.state, "stopped")
+        self.assertEqual(st.track.title, "年齢確認の曲")
+        self.assertEqual(st.playback_problem[0], SIGN_IN)
+        self.assertEqual(st.display_subtitle, SIGN_IN)
+        self.assertIn("Sign in to confirm your age", st.playback_problem[1])
+        run_loop(lambda: False, 0.4)  # 何度問い合わせても 1 度だけ
+        self.assertEqual(len(self.failed), 1)
+        self.assertIn("Sign in to confirm your age", self.failed[0])
+        # 止めても残る (いまの曲はまだ失敗した曲)
+        self.store.stop()
+        run_loop(lambda: False, 0.3)
+        self.assertIsNotNone(self.store.status.playback_problem)
+        self.assertEqual(len(self.failed), 1)
+
+    def test_retry_clears_at_once_and_a_new_failure_is_announced_again(self):
+        self.start_failing()
+        self.wait(lambda: len(self.failed) == 1)
+        self.store.play()  # 止まっているので toggle
+        self.assertIsNone(self.store.status.playback_problem)  # 応答を待たずに消える
+        self.assertEqual(self.store.status.state, "playing")
+        self.wait(lambda: len(self.failed) == 2)
+        self.assertEqual(self.store.status.playback_problem[0], SIGN_IN)
+        run_loop(lambda: False, 0.3)
+        self.assertEqual(len(self.failed), 2)
+
+    def test_next_track_clears(self):
+        self.start_failing()
+        self.store.next()
+        self.assertIsNone(self.store.status.playback_problem)
+        self.wait(lambda: self.store.status.state == "playing" and self.store.status.track.title == "ふつうの曲")
+        run_loop(lambda: False, 0.3)
+        self.assertIsNone(self.store.status.playback_problem)
+        self.assertEqual(self.store.status.playback_error, "")
+        self.assertEqual(len(self.failed), 1)
+
+    def test_refused_restart_does_not_announce_the_same_failure_again(self):
+        """始め直す操作が断られたら (stale など) 何も始まっていない。楽観的に消した失敗が
+        また見えても、新しい失敗として知らせ直さない。"""
+        self.start_failing()
+        self.wait(lambda: len(self.failed) == 1)
+        responses = []
+        self.store.play_index(1, path="/somewhere/else.flac", callback=responses.append)
+        self.assertIsNone(self.store.status.playback_problem)  # 応答を待たずに消える
+        self.wait(lambda: responses)
+        self.assertFalse(responses[0].ok)
+        self.wait(lambda: self.store.status.playback_problem is not None)
+        run_loop(lambda: False, 0.3)
+        self.assertEqual(len(self.failed), 1)
+        # 本当に始め直してまた失敗すれば知らせる
+        self.store.play_index(0, path=FAIL_YT["path"])
+        self.wait(lambda: len(self.failed) == 2)
+
+    def test_failure_already_there_when_connecting_is_not_announced(self):
+        self.fake.dispatch({"cmd": "replace", "tracks": [FAIL_YT], "index": 0})
+        client = CliampClient(self.path)
+        client.set_poll_interval(0.05)
+        store = PlayerStore(client)
+        failed = []
+        store.connect("playback-failed", lambda s: failed.append(1))
+        client.start()
+        try:
+            self.wait(lambda: store.status.playback_problem is not None)
+            run_loop(lambda: False, 0.3)
+            self.assertEqual(failed, [])
+        finally:
+            client.stop()
+
+
 class FakeBehaviour(unittest.TestCase):
     """偽の cliamp 自体の振る舞い (他の試験や撮影がこれに頼るので確かめておく)。"""
 
@@ -674,6 +764,44 @@ class FakeBehaviour(unittest.TestCase):
         status = legacy.dispatch({"cmd": "status"})
         self.assertNotIn("api", status)
         self.assertEqual(set(status["track"]), {"title", "artist", "path"})
+
+    def test_failing_tracks(self):
+        """path に __fail__ を含む曲は鳴らせず、本物と同じ文言と消え方をする。"""
+        self.call("replace", tracks=[FAIL_YT, OK_YT, {"path": "/music/__fail__.flac", "title": "無いファイル"}], index=0)
+        status = self.call("status")
+        self.assertEqual(status["state"], "stopped")
+        self.assertTrue(status["playback_error"].startswith("yt-dlp: ERROR: [youtube] "), status["playback_error"])
+        self.assertIn("Sign in to confirm your age", status["playback_error"])
+        self.call("stop")
+        self.assertIn("Sign in", self.call("status")["playback_error"])  # 止めても残る
+        self.call("play_index", index=1)
+        status = self.call("status")
+        self.assertEqual((status["state"], status["playback_error"]), ("playing", ""))
+        self.call("play_index", index=2)
+        self.assertEqual(self.call("status")["playback_error"],
+                         "open source: open /music/__fail__.flac: no such file or directory")
+        # 止まっている間にいまの曲が別の曲になれば出さない
+        self.call("remove", index=2)
+        status = self.call("status")
+        self.assertNotEqual(status["track"]["path"], "/music/__fail__.flac")
+        self.assertEqual(status["playback_error"], "")
+
+    def test_failing_track_fails_after_buffering(self):
+        fake = FakeCliamp(temp_socket_path(), buffer_secs=0.3)
+        fake.dispatch({"cmd": "replace", "tracks": [FAIL_YT], "index": 0})
+        status = fake.dispatch({"cmd": "status"})
+        self.assertTrue(status["buffering"])
+        self.assertEqual(status["playback_error"], "")
+        self.assertEqual(status["state"], "stopped")  # 止まった状態からの読み込み中 (本物と同じ)
+        self.assertTrue(run_loop(lambda: not fake.dispatch({"cmd": "status"})["buffering"], timeout=2))
+        status = fake.dispatch({"cmd": "status"})
+        self.assertEqual(status["state"], "stopped")
+        self.assertIn("Sign in to confirm your age", status["playback_error"])
+        # 読み込み中に止めれば失敗しない
+        fake.dispatch({"cmd": "play_index", "index": 0})
+        fake.dispatch({"cmd": "stop"})
+        run_loop(lambda: False, 0.4)
+        self.assertEqual(fake.dispatch({"cmd": "status"})["playback_error"], "")
 
     def test_play_does_nothing_when_stopped(self):
         self.call("stop")

@@ -29,6 +29,7 @@ from .protocol import (  # noqa: E402
     Source,
     Track,
     mix_url,
+    playback_error_headline,
     valid_playlist_name,
 )
 from .radio import RadioBrowser  # noqa: E402
@@ -80,6 +81,7 @@ class AppContext(GObject.Object):
         self._local_playlists_loaded = False
         self._playlist_menus: deque[Gio.Menu] = deque(maxlen=32)
         self.store.connect("connection-changed", self._on_connection)
+        self.store.connect("playback-failed", self._on_playback_failed)
         if self.store.connected:
             self.refresh_local_playlists()
 
@@ -98,6 +100,18 @@ class AppContext(GObject.Object):
             return window.toast(text)
         log(text)
         return None
+
+    def _on_playback_failed(self, store: PlayerStore) -> None:
+        """いまの曲が再生できなかった (新しい失敗ごとに 1 度)。理由の短文をトーストに出す
+        (全文は再生バーの副題のツールチップ)。"""
+        status = store.status
+        problem = status.playback_problem
+        if problem is None or status.track is None:
+            return
+        title = status.track.display_title
+        if len(title) > 18:
+            title = title[:17] + "…"
+        self.toast(f"「{title}」を再生できません — {playback_error_headline(problem[0])}")
 
     def _toast_failure(self, prefix: str):
         def done(response: Response) -> None:

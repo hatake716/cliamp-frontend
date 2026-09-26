@@ -118,6 +118,17 @@ class Status:
     repeat: str           # "off" | "all" | "one" (小文字に正規化)
     mono: bool; speed: float; eq_preset: str; eq: list[float]
     gen: int; source: Source; stream_title: str; buffering: bool; api: int
+    playback_error: str   # いまの曲の最後の開始が失敗した理由 (cliamp の文言のまま。無ければ "")
+    playback_problem -> (短文, 全文) | None   # 読み込み中は None。display_subtitle は短文になる
+
+def describe_playback_error(text) -> (short_ja, detail)  # 年齢確認・非公開・403/429・ネットワーク・
+                                                         # 読めない形式・Spotify のサインインなど。
+                                                         # 知らない誤りは最初の行を 80 字ほどに。
+                                                         # パス・URL・引用符の中の語では決めない
+                                                         # (曲名やフォルダ名の "Timeout" など)。出どころ
+                                                         # (YouTube / SoundCloud …) は yt-dlp の [抽出器] で
+def playback_error_headline(short) -> str   # 末尾の括弧書き (手当て) を除く (トースト用)
+def playback_error_tooltip(short, detail) -> str
 
 @dataclass
 class PlaylistState:
@@ -193,6 +204,8 @@ class PlayerStore(GObject.Object):
     #  "playlist-changed"   リストの写し (self.playlist) を取り直した
     #  "history-changed"    self.history を取り直した
     #  "connection-changed" 接続や api が変わった
+    #  "playback-failed"    いまの曲が再生できなかった (新しい失敗ごとに 1 度。繋いだ直後の失敗は除く。
+    #                       始め直す操作が断られたときは、また見える同じ失敗を知らせ直さない)
     def __init__(self, client: CliampClient)
     status: Status; playlist: PlaylistState; history: list[Track]
     connected: bool; api: int; supports(cmd) -> bool
@@ -374,8 +387,9 @@ Adw.ApplicationWindow.music.music-window   既定 1180x760、最小 760x520
 内容の中に置くとバーが押せなくなる。重ねている間、バーはパネルの左に収まればそこへ縮め、
 収まらなければ列の幅のままパネルの上に出す (パネルの一覧は下に余白を足して最後まで送れる)。
 
-未接続のとき: ナビゲーションの上に全面の空状態「cliamp に接続できません」と
-「cliamp を起動」ボタン (`systemctl --user start cliamp.service`。環境変数
+未接続のとき: ナビゲーションの上に全面の空状態「cliamp に接続できません」、ソケットのパス
+(`PathLabel`: "/" の直後でだけ折り返し、語の途中で "-" を足さない。3 行を越えれば真ん中を省く。
+選んで写せ、ツールチップにも全体) と「cliamp を起動」ボタン (`systemctl --user start cliamp.service`。環境変数
 CLIAMP_MUSIC_START_COMMAND で替えられる)。拡張の無い cliamp (api 0) のときは上端に細い帯
 「この cliamp は拡張 IPC に対応していません。再生の操作だけ使えます」。そのうえで:
 ホームは棚をすべて隠して説明だけを出し、検索とラジオは範囲・検索欄・節を隠して空状態
@@ -411,7 +425,13 @@ macOS 27 の形: 窓の端まで続く帯 (浮かない)、赤い記号、選択
    リピート (オフ → すべて → 1 曲、1 曲のときは「1」の印)
 2. アートワーク 36px (角 5)。押すとメニュー: 「ミニプレーヤー」「フルスクリーンプレーヤー」
 3. 曲名 (13px/600) と「アーティスト — アルバム」(12px、副次色)。ラジオは ICY の曲名を
-   曲名に、局名を副題に。読み込み中は副題を「読み込み中…」
+   曲名に、局名を副題に。読み込み中は副題を「読み込み中…」。再生できなかった曲 (status の
+   `playback_error`) は副題を理由の短文 (`describe_playback_error`。例「YouTube のサインインが
+   必要な曲です (cliamp の設定で Cookie を使う)」) にし、丸の中の ! と琥珀色 (`--m-warning`
+   #ffb340。赤は操作の色なので使わない) で出す。ツールチップは短文と cliamp の誤りの全文。
+   フルスクリーンとミニプレーヤーも曲名の下に同じ短文を淡い琥珀 (`--m-over-warning`) で 2 行まで
+   出す。新しい失敗ごとに 1 度だけトースト「「曲名」を再生できません — 見出し」。曲を始め直す
+   操作では応答を待たずに消す
 4. その下に細い再生位置の線 (3px、ホバーで 5px とつまみ)。ドラッグで `seek_to`。
    ホバーで経過時間と残り時間を小さく出す。ライブ配信では線を出さず「ライブ」
 5. 「…」: 再生速度 ▸ (0.5〜2.0)、イコライザ…、再生中のリストを表示、リンクをコピー、ブラウザで開く

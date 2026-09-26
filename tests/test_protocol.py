@@ -370,5 +370,211 @@ class Helpers(unittest.TestCase):
         self.assertEqual(p.relative_time("2026-09-26T11:00:00Z", now.timestamp()), "1 時間前")
 
 
+# 本物の yt-dlp が年齢確認の要る動画で出した stderr (cliamp が "yt-dlp: " を付けて包む)。
+AGE_GATE = ("yt-dlp: ERROR: [youtube] x8VYWazR5mE: Sign in to confirm your age. This video may be "
+            "inappropriate for some users. Use --cookies-from-browser or --cookies for the authentication. "
+            "See  https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp  for how to "
+            "manually pass cookies. Also see  https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-"
+            "youtube-cookies  for tips on effectively exporting YouTube cookies")
+
+
+class PlaybackError(unittest.TestCase):
+    """describe_playback_error: cliamp・yt-dlp の誤りの文言 → (短い日本語, 全文)。"""
+
+    SIGN_IN = "YouTube のサインインが必要な曲です (cliamp の設定で Cookie を使う)"
+    GONE = "この動画は再生できません (非公開か削除)"
+
+    def short(self, text: str) -> str:
+        return p.describe_playback_error(text)[0]
+
+    def test_age_and_bot_checks_need_sign_in(self):
+        for text in (
+            AGE_GATE,
+            "yt-dlp: ERROR: [youtube] abcdefghijk: Sign in to confirm you\u2019re not a bot. "
+            "Use --cookies-from-browser or --cookies for the authentication.",
+            "yt-dlp: ERROR: [youtube] abcdefghijk: Sign in to confirm you're not a bot. This helps protect our community.",
+            "yt-dlp: ERROR: [youtube] abcdefghijk: This video is age-restricted and only available on YouTube.",
+            "yt-dlp: ERROR: [youtube] abcdefghijk: Join this channel to get access to members-only content like this video",
+        ):
+            with self.subTest(text=text[:60]):
+                self.assertEqual(self.short(text), self.SIGN_IN)
+
+    def test_unavailable_private_or_removed(self):
+        for text in (
+            "yt-dlp: ERROR: [youtube] abcdefghijk: Video unavailable",
+            "yt-dlp: ERROR: [youtube] abcdefghijk: Video unavailable. This video has been removed by the uploader",
+            # 「Sign in if you've been granted access」はサインインの案内ではなく非公開の印
+            "yt-dlp: ERROR: [youtube] abcdefghijk: Private video. Sign in if you've been granted access to this video",
+            "yt-dlp: ERROR: [youtube] abcdefghijk: Video unavailable. This video is no longer available because "
+            "the YouTube account associated with this video has been terminated.",
+            "yt-dlp: ERROR: [youtube] abcdefghijk: HTTP Error 404: Not Found",
+        ):
+            with self.subTest(text=text[:60]):
+                self.assertEqual(self.short(text), self.GONE)
+
+    def test_warning_lines_before_the_error(self):
+        text = ("yt-dlp: WARNING: [youtube] abcdefghijk: nsig extraction failed: Some formats may be missing\n"
+                "         Install PhantomJS to workaround the issue\n"
+                "ERROR: [youtube] abcdefghijk: Video unavailable")
+        short, detail = p.describe_playback_error(text)
+        self.assertEqual(short, self.GONE)
+        self.assertIn("Install PhantomJS", detail)
+
+    def test_geo_block(self):
+        self.assertEqual(self.short("yt-dlp: ERROR: [youtube] abcdefghijk: The uploader has not made this video "
+                                    "available in your country"), "この地域では再生できない動画です")
+
+    def test_denied_403_429(self):
+        self.assertEqual(self.short("yt-dlp: ERROR: unable to download video data: HTTP Error 403: Forbidden"),
+                         "YouTube に一時的に拒否されました")
+        self.assertEqual(self.short("yt-dlp: ERROR: [youtube] abcdefghijk: HTTP Error 429: Too Many Requests"),
+                         "YouTube に一時的に拒否されました")
+        self.assertEqual(self.short("open source: http status 403 Forbidden"), "配信元に一時的に拒否されました")
+        self.assertEqual(self.short("open source: http status 429 Too Many Requests"), "配信元に一時的に拒否されました")
+
+    def test_link_gone(self):
+        self.assertEqual(self.short("open source: http status 404 Not Found"), "見つかりません (リンクが切れています)")
+
+    def test_network_and_dns(self):
+        for text in (
+            'open source: http get: Get "https://ice.example/stream": dial tcp: lookup ice.example: no such host',
+            "yt-dlp: ERROR: [youtube] abcdefghijk: Unable to download API page: <urlopen error [Errno -3] "
+            "Temporary failure in name resolution> (caused by URLError(gaierror(-3, 'Temporary failure in name resolution')))",
+            'open source: http get: Get "https://x.example/a.mp3": dial tcp 192.0.2.1:443: connect: connection refused',
+            'open source: http get: Get "https://x.example/a.mp3": dial tcp 192.0.2.1:443: connect: network is unreachable',
+        ):
+            with self.subTest(text=text[:60]):
+                self.assertEqual(self.short(text), "ネットワークに繋がりません")
+
+    def test_timeout(self):
+        self.assertEqual(self.short("timed out waiting for audio data (30s)"), "読み込みが時間切れになりました")
+
+    def test_undecodable_files(self):
+        for text in (
+            "decode: ffmpeg decode: exit status 1",
+            "decode: flac.NewSeek: flac.parseStreamInfo: invalid FLAC signature; expected \"fLaC\", got \"RIFF\"",
+            "decode: mp3: no audio frames found (unsupported format?)",
+            "open source: /music/a.xyz: unknown format",
+            "yt-dlp: ffmpeg start: exit status 1",
+        ):
+            with self.subTest(text=text[:60]):
+                self.assertEqual(self.short(text), "このファイルは再生できません")
+
+    def test_local_file_problems_and_tools(self):
+        self.assertEqual(self.short("open source: open /music/gone.flac: no such file or directory"),
+                         "ファイルが見つかりません")
+        self.assertEqual(self.short("open source: open /music/a.flac: permission denied"),
+                         "ファイルを読めません (アクセス権がありません)")
+        self.assertEqual(self.short("ffmpeg is required to play .m4a files — install it with your package manager"),
+                         "再生に ffmpeg が要ります")
+        self.assertEqual(self.short('yt-dlp start: exec: "yt-dlp": executable file not found in $PATH'),
+                         "再生に yt-dlp が要ります")
+        self.assertEqual(self.short("no episodes found in feed"), "このフィードにはエピソードがありません")
+
+    def test_spotify_and_generic_sign_in(self):
+        for text in (
+            "custom streamer: spotify: stream auth error after silent reconnect: sign-in required",
+            "custom streamer: spotify: stream auth error, silent reconnect failed: sign-in required",
+            "spotify: web api token unavailable, run 'cliamp spotify reset' and sign in again: sign-in required",
+        ):
+            with self.subTest(text=text[:60]):
+                self.assertEqual(self.short(text), "Spotify へのサインインが必要です (cliamp の端末で)")
+        self.assertEqual(self.short("sign-in required"), "サインインが必要です (cliamp の端末で)")
+
+    def test_unknown_error_is_a_cleaned_first_line(self):
+        self.assertEqual(self.short("yt-dlp: ERROR: [generic] Unsupported URL: https://example.com/x"),
+                         "この URL は再生できません")
+        short, detail = p.describe_playback_error(
+            "yt-dlp: ERROR: [soundcloud] 12345: The frobnicator declined to cooperate with the request because "
+            "of a reason that is much longer than eighty characters\nsecond line")
+        self.assertTrue(short.startswith("The frobnicator declined"), short)
+        self.assertLessEqual(len(short), p.PLAYBACK_ERROR_SHORT_MAX)
+        self.assertTrue(short.endswith("…"))
+        self.assertIn("second line", detail)
+        self.assertEqual(self.short("  something odd happened  "), "something odd happened")
+
+    def test_words_in_paths_and_urls_do_not_decide(self):
+        """曲のパスやフォルダ名・URL の中の語 (Timeout、Spotify、Private Video、403) で理由を
+        取り違えない。見分けるのは cliamp・yt-dlp の文言の部分だけ。"""
+        for text, want in (
+            ("open source: open /music/Timeout/x.flac: no such file or directory", "ファイルが見つかりません"),
+            ("open source: open /music/Spotify Singles/Authority - x.flac: no such file or directory",
+             "ファイルが見つかりません"),
+            ("open source: open /music/Private Video/x.flac: permission denied",
+             "ファイルを読めません (アクセス権がありません)"),
+            ("decode: ffmpeg decode: /music/Timed Out/x.m4a: Invalid data found when processing input",
+             "このファイルは再生できません"),
+            ('open source: http get: Get "https://ice.example/private-video/403-timeout.mp3": dial tcp: '
+             "lookup ice.example: no such host", "ネットワークに繋がりません"),
+            ("yt-dlp: ERROR: [generic] Unsupported URL: https://example.com/video-unavailable/403",
+             "この URL は再生できません"),
+        ):
+            with self.subTest(text=text[:60]):
+                self.assertEqual(self.short(text), want)
+
+    def test_service_follows_the_extractor(self):
+        """cliamp の yt-dlp の誤りはどれも "yt-dlp: " で始まる。出どころは抽出器の印で決める。"""
+        self.assertEqual(self.short("yt-dlp: ERROR: [soundcloud] 123: HTTP Error 403: Forbidden"),
+                         "SoundCloud に一時的に拒否されました")
+        self.assertEqual(self.short("yt-dlp: ERROR: [soundcloud] 123: HTTP Error 404: Not Found"),
+                         "見つかりません (リンクが切れています)")
+        self.assertEqual(self.short("yt-dlp: ERROR: [vimeo] 123: This video is only available for registered "
+                                    "users. Use --cookies-from-browser or --cookies for the authentication."),
+                         "Vimeo のサインインが必要な曲です (cliamp の設定で Cookie を使う)")
+        self.assertEqual(self.short("yt-dlp: ERROR: [generic] x: HTTP Error 429: Too Many Requests"),
+                         "配信元に一時的に拒否されました")
+        self.assertEqual(self.short("yt-dlp: ERROR: [youtube:tab] PLx: HTTP Error 403: Forbidden"),
+                         "YouTube に一時的に拒否されました")
+
+    def test_missing_tool_is_the_one_named(self):
+        self.assertEqual(self.short('yt-dlp seek: ffmpeg start: exec: "ffmpeg": executable file not found in $PATH'),
+                         "再生に ffmpeg が要ります")
+        self.assertEqual(self.short("open source: http get: context deadline exceeded"), "読み込みが時間切れになりました")
+
+    def test_error_line_after_a_long_preamble(self):
+        text = "yt-dlp: " + "\n".join(f"note {i}: " + "x" * 90 for i in range(20)) + \
+            "\nERROR: [youtube] abcdefghijk: Sign in to confirm your age."
+        short, detail = p.describe_playback_error(text)
+        self.assertEqual(short, self.SIGN_IN)
+        self.assertLessEqual(len(detail), p.PLAYBACK_ERROR_DETAIL_MAX)
+
+    def test_detail_is_the_whole_text_and_empty_is_empty(self):
+        short, detail = p.describe_playback_error(AGE_GATE)
+        self.assertEqual(detail, " ".join(AGE_GATE.split()))
+        self.assertEqual(p.describe_playback_error(""), ("", ""))
+        self.assertEqual(p.describe_playback_error("  \n "), ("", ""))
+        self.assertEqual(p.describe_playback_error(None), ("", ""))
+        long = "x" * 5000
+        self.assertLessEqual(len(p.describe_playback_error(long)[1]), p.PLAYBACK_ERROR_DETAIL_MAX)
+
+    def test_headline_and_tooltip(self):
+        self.assertEqual(p.playback_error_headline(self.SIGN_IN), "YouTube のサインインが必要な曲です")
+        self.assertEqual(p.playback_error_headline("Spotify へのサインインが必要です (cliamp の端末で)"),
+                         "Spotify へのサインインが必要です")
+        self.assertEqual(p.playback_error_headline("ネットワークに繋がりません"), "ネットワークに繋がりません")
+        self.assertEqual(p.playback_error_headline("(only brackets)"), "(only brackets)")
+        short, detail = p.describe_playback_error(AGE_GATE)
+        self.assertEqual(p.playback_error_tooltip(short, detail), f"{self.SIGN_IN}\n\n{detail}")
+        # 知らない誤りで短文が全文と同じなら重ねない
+        self.assertEqual(p.playback_error_tooltip(*p.describe_playback_error("odd")), "odd")
+        self.assertEqual(p.playback_error_tooltip("", ""), "")
+
+    def test_status_carries_the_problem(self):
+        st = parse_status({"ok": True, "state": "stopped", "playback_error": AGE_GATE,
+                           "track": {"path": "https://www.youtube.com/watch?v=x8VYWazR5mE", "title": "t", "artist": "a"}})
+        self.assertEqual(st.playback_error, AGE_GATE)
+        self.assertEqual(st.playback_problem, (self.SIGN_IN, " ".join(AGE_GATE.split())))
+        self.assertEqual(st.display_subtitle, self.SIGN_IN)
+        self.assertEqual(st.display_title, "t")
+        st.buffering = True  # やり直している間は出さない
+        self.assertIsNone(st.playback_problem)
+        self.assertEqual(st.display_subtitle, "読み込み中…")
+        # 省かれていれば (omitempty) 無し
+        st = parse_status({"ok": True, "state": "playing", "track": {"path": "x", "title": "t", "artist": "a"}})
+        self.assertEqual(st.playback_error, "")
+        self.assertIsNone(st.playback_problem)
+        self.assertEqual(st.display_subtitle, "a")
+
+
 if __name__ == "__main__":
     unittest.main()

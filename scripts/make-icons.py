@@ -419,6 +419,10 @@ icons["station"] = svg(
 # 丸の中の × (消去)
 icons["clear"] = svg("clear", circle(8, 8, 7.2), cross(8, 8, 3.0, 1.5, hole=True))
 
+# 丸の中の ! (再生できなかった曲。exclamationmark.circle.fill)
+icons["warning"] = svg("warning", circle(8, 8, 7.2), rrect(7.05, 3.5, 8.95, 9.3, 0.95, hole=True),
+                       circle(8, 11.75, 1.1, hole=True))
+
 OUT.mkdir(parents=True, exist_ok=True)
 for name, data in icons.items():
     (OUT / f"music-{name}-symbolic.svg").write_text(data)

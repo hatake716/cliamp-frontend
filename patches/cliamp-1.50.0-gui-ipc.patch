@@ -15,6 +15,12 @@ PROTOCOL.md。
 - status に曲の詳しい情報・EQ・リストの世代番号 (gen)・出どころ・ICY の
   曲名・読み込み中の印を足し、yt-dlp のシーク待ちの間はシーク先を返す。
   capabilities で拡張の有無と版を返す。
+- status に playback_error を足す: いまの曲の最後の開始 (yt-dlp・流れの開始、
+  手元のファイルの Play、フィードの展開、yt-dlp のシークによる組み直し) が失敗した
+  理由 (ipc/playerr.go, ui/model/ipc_gui_playerr.go)。次の開始と gapless で消え、
+  失敗した曲がいまの曲でなければ出さない。TUI の m.err は設定の保存や歌詞など
+  再生と関係の無い誤りにも使われ、再生が始まっても残ることがあるので別に持つ。
+  daemon も同じ意味で返す。
 - 要求 1 行の上限を 64 KiB から 8 MiB に広げる (replace で曲の一覧を送るため)。
   超えたときは黙って切らずに "request too large" と返す。
 - --daemon でも状態系はすべて同じ意味で動く。可視化に頼る bands は、待ち時間
@@ -63,10 +69,10 @@ TUI のキー割り当ては変えない。
 いるため。同じ理由で、IPC の処理は TUI のオーバーレイを開かず、フォーカスも
 動かさない。
 
-変更は新しいファイル (ipc/gui.go, ipc/shutdown.go, playlist/gui.go,
-ui/model/ipc_gui.go, ui/model/ipc_gui_stale.go, player/supersede.go,
-external/local/gui.go, external/radio/gui.go, catalog.go, daemon_gui.go と
-各試験) に寄せ、既存のファイルには型のフィールド、呼び出し、世代番号を
+変更は新しいファイル (ipc/gui.go, ipc/shutdown.go, ipc/playerr.go, playlist/gui.go,
+ui/model/ipc_gui.go, ui/model/ipc_gui_stale.go, ui/model/ipc_gui_playerr.go,
+player/supersede.go, external/local/gui.go, external/radio/gui.go, catalog.go,
+daemon_gui.go と各試験) に寄せ、既存のファイルには型のフィールド、呼び出し、世代番号を
 増やす行など最小限だけを足している。
 上流のファイルが変わって当たらなくなったらビルドが落ちる (cliamp.nix は
 版が 1.50.0 でなければ評価の時点で止める)。go.mod は変えず、新しく import
@@ -883,7 +889,7 @@ index 0000000..027990d
 +	}
 +}
 diff --git a/daemon.go b/daemon.go
-index 88e4221..de39c45 100644
+index 88e4221..30a79c3 100644
 --- a/daemon.go
 +++ b/daemon.go
 @@ -21,7 +21,7 @@ import (
@@ -913,7 +919,7 @@ index 88e4221..de39c45 100644
  
  	ticker := time.NewTicker(250 * time.Millisecond)
  	defer ticker.Stop()
-@@ -66,9 +68,16 @@ func runDaemon(p *player.Player, pl *playlist.Playlist, localProv *local.Provide
+@@ -66,9 +68,19 @@ func runDaemon(p *player.Player, pl *playlist.Playlist, localProv *local.Provide
  // internally thread-safe so blocking I/O (Play, PlayYTDL) runs without it.
  type daemon struct {
  	mu        sync.Mutex
@@ -928,10 +934,13 @@ index 88e4221..de39c45 100644
 +	buffering   bool           // playTrack が再生の準備を待っている間
 +	playSeq     uint64         // playTrack のたびに増える。最新の開始だけが buffering を下ろす
 +	seekState                  // seek_to の進行 (daemon_gui.go)
++
++	// status の playback_error (いまの曲の最後の開始の失敗)
++	playFail ipc.PlaybackFailure
  }
  
  func (d *daemon) Send(msg any) {
-@@ -93,6 +102,7 @@ func (d *daemon) Send(msg any) {
+@@ -93,6 +105,7 @@ func (d *daemon) Send(msg any) {
  
  	case playback.StopMsg:
  		d.player.Stop()
@@ -939,7 +948,7 @@ index 88e4221..de39c45 100644
  
  	case playback.NextMsg:
  		d.nextTrack()
-@@ -139,6 +149,15 @@ func (d *daemon) Send(msg any) {
+@@ -139,6 +152,15 @@ func (d *daemon) Send(msg any) {
  
  	case ipc.StatusRequestMsg:
  		reply(m.Reply, d.statusResponse())
@@ -955,7 +964,7 @@ index 88e4221..de39c45 100644
  	}
  }
  
-@@ -168,16 +187,19 @@ func (d *daemon) playCurrent() {
+@@ -168,16 +190,19 @@ func (d *daemon) playCurrent() {
  // Caller must hold d.mu; the lock is held again on return.
  func (d *daemon) playTrack(track playlist.Track) {
  	dur := time.Duration(track.DurationSecs) * time.Second
@@ -970,7 +979,7 @@ index 88e4221..de39c45 100644
 -	if err != nil {
 -		applog.Warn("daemon: play %q: %v", track.Path, err)
 +	for retry := 0; ; retry++ {
-+		seq := d.beginPlay()
++		seq := d.beginPlay(track.Path)
 +		d.mu.Unlock()
 +		var err error
 +		if playlist.IsYTDL(track.Path) {
@@ -985,7 +994,7 @@ index 88e4221..de39c45 100644
  	}
  }
  
-@@ -231,6 +253,7 @@ func (d *daemon) handleLoad(m ipc.LoadMsg) {
+@@ -231,6 +256,7 @@ func (d *daemon) handleLoad(m ipc.LoadMsg) {
  		return
  	}
  	d.playlist.Replace(tracks)
@@ -993,7 +1002,7 @@ index 88e4221..de39c45 100644
  	d.playCurrent()
  	reply(m.Reply, ipc.Response{OK: true, Playlist: m.Playlist, Total: len(tracks)})
  }
-@@ -358,6 +381,7 @@ func (d *daemon) statusResponse() ipc.Response {
+@@ -358,6 +384,7 @@ func (d *daemon) statusResponse() ipc.Response {
  	mono := d.player.Mono()
  	resp.Mono = &mono
  	resp.Speed = d.player.Speed()
@@ -1003,10 +1012,10 @@ index 88e4221..de39c45 100644
  
 diff --git a/daemon_gui.go b/daemon_gui.go
 new file mode 100644
-index 0000000..e368df6
+index 0000000..83b83ef
 --- /dev/null
 +++ b/daemon_gui.go
-@@ -0,0 +1,300 @@
+@@ -0,0 +1,316 @@
 +package main
 +
 +// daemon_gui.go — GUI 向け拡張 IPC (ipc/gui.go) の状態系コマンドを daemon
@@ -1069,6 +1078,9 @@ index 0000000..e368df6
 +	if d.seeking && d.player.IsPlaying() {
 +		resp.Position = d.seekTarget.Seconds()
 +	}
++	if cur, idx := d.playlist.Current(); idx >= 0 {
++		resp.PlaybackError = d.playFail.Text(cur.Path)
++	}
 +}
 +
 +func (d *daemon) setListSource(src ipc.SourceInfo) {
@@ -1085,9 +1097,11 @@ index 0000000..e368df6
 +}
 +
 +// beginPlay は playTrack の開始ごとに呼ぶ (d.mu を持った状態で)。
-+// 読み込み待ちを立て、前の曲のシークを取り消し、この開始の番号を返す。
-+func (d *daemon) beginPlay() uint64 {
++// 読み込み待ちを立て、前の曲のシークと前の開始の失敗を取り消し、この開始の
++// 番号を返す。
++func (d *daemon) beginPlay(path string) uint64 {
 +	d.playSeq++
++	d.playFail.Begin(path)
 +	d.buffering = true
 +	d.seeking = false
 +	d.seekSeq++ // 待っている seek_to は前の曲のもの
@@ -1121,6 +1135,7 @@ index 0000000..e368df6
 +	d.buffering = false
 +	if err != nil {
 +		applog.Warn("daemon: play %q: %v", track.Path, err)
++		d.playFail.Fail(err)
 +	}
 +	return false
 +}
@@ -1167,6 +1182,16 @@ index 0000000..e368df6
 +	d.mu.Lock()
 +	if seq == d.seekSeq {
 +		d.seeking = false
++		// yt-dlp の曲のシークは yt-dlp を起こし直すので、失敗すると音が止まった
++		// ままになる (HTTP の流れは前の流れに戻る)。TUI と同じく再生の失敗とし、
++		// 後のシークが成功すれば消す。
++		if d.player.IsYTDLSeek() {
++			if err != nil {
++				d.playFail.FailSeek(err)
++			} else {
++				d.playFail.SeekOK()
++			}
++		}
 +	}
 +	d.mu.Unlock()
 +	if err != nil {
@@ -1309,10 +1334,10 @@ index 0000000..e368df6
 +}
 diff --git a/daemon_gui_test.go b/daemon_gui_test.go
 new file mode 100644
-index 0000000..261812a
+index 0000000..9721e08
 --- /dev/null
 +++ b/daemon_gui_test.go
-@@ -0,0 +1,381 @@
+@@ -0,0 +1,385 @@
 +package main
 +
 +// daemon (--daemon) の GUI 拡張 IPC の試験。プレイヤーは偽物 (音は出さない)。
@@ -1344,6 +1369,7 @@ index 0000000..261812a
 +	position  time.Duration
 +	duration  time.Duration
 +	seekDelay time.Duration
++	seekErr   error // Seek が返す値
 +	seeks     int
 +	cancels   int
 +}
@@ -1390,6 +1416,9 @@ index 0000000..261812a
 +	time.Sleep(delay)
 +	f.mu.Lock()
 +	defer f.mu.Unlock()
++	if f.seekErr != nil {
++		return f.seekErr
++	}
 +	f.position += d
 +	return nil
 +}
@@ -1692,6 +1721,124 @@ index 0000000..261812a
 +	status, err := ipc.Send(sock, ipc.Request{Cmd: "status"})
 +	if err != nil || status.Buffering == nil || !*status.Buffering {
 +		t.Fatalf("status while starting = %+v, %v", status, err)
++	}
++}
+diff --git a/daemon_playerr_test.go b/daemon_playerr_test.go
+new file mode 100644
+index 0000000..89e79ae
+--- /dev/null
++++ b/daemon_playerr_test.go
+@@ -0,0 +1,112 @@
++package main
++
++// daemon の status の playback_error の試験 (TUI 側は ui/model/ipc_gui_playerr_test.go)。
++
++import (
++	"errors"
++	"testing"
++	"time"
++
++	"cliamp/internal/playback"
++	"cliamp/ipc"
++	"cliamp/player"
++)
++
++func daemonStatus(d *daemon) ipc.Response {
++	return daemonSend(d, func(r chan ipc.Response) any { return ipc.StatusRequestMsg{Reply: r} })
++}
++
++// 開始の失敗は、その曲がいまの曲の間だけ playback_error に出て、次の開始で消える。
++func TestDaemonPlaybackError(t *testing.T) {
++	ageGate := errors.New("yt-dlp: ERROR: [youtube] x8VYWazR5mE: Sign in to confirm your age.")
++	d, eng := newTestDaemon(t, -1, "a", "b")
++	eng.playErrs = []error{ageGate}
++	daemonSend(d, func(r chan ipc.Response) any { return ipc.PlayIndexMsg{Index: 0, Reply: r} })
++	status := daemonStatus(d)
++	if status.PlaybackError != ageGate.Error() || status.State != "stopped" || status.Track.Path != "a.flac" {
++		t.Fatalf("status after a failed start = %+v", status)
++	}
++
++	// 止まっている間に別の曲がいまの曲になったら出さない。戻れば出す。
++	d.mu.Lock()
++	d.playlist.SetIndex(1)
++	d.mu.Unlock()
++	if got := daemonStatus(d).PlaybackError; got != "" {
++		t.Fatalf("playback_error for another track = %q", got)
++	}
++	d.mu.Lock()
++	d.playlist.SetIndex(0)
++	d.mu.Unlock()
++	if got := daemonStatus(d).PlaybackError; got != ageGate.Error() {
++		t.Fatalf("playback_error back on the failed track = %q", got)
++	}
++
++	// やり直し (toggle) で消え、読み込み中にも出さない。
++	eng.block = make(chan struct{})
++	done := make(chan struct{})
++	go func() {
++		d.Send(playback.PlayPauseMsg{})
++		close(done)
++	}()
++	waitFor(t, func() bool { d.mu.Lock(); defer d.mu.Unlock(); return d.buffering })
++	if got := daemonStatus(d).PlaybackError; got != "" {
++		t.Fatalf("playback_error while retrying = %q", got)
++	}
++	close(eng.block)
++	<-done
++	if status := daemonStatus(d); status.PlaybackError != "" || status.State != "playing" {
++		t.Fatalf("status after a successful retry = %+v", status)
++	}
++}
++
++// 追い越された開始 (ErrSuperseded) は失敗ではない。
++func TestDaemonPlaybackErrorIgnoresSuperseded(t *testing.T) {
++	d, eng := newTestDaemon(t, -1, "a")
++	eng.playErrs = []error{player.ErrSuperseded}
++	daemonSend(d, func(r chan ipc.Response) any { return ipc.PlayIndexMsg{Index: 0, Reply: r} })
++	if got := daemonStatus(d).PlaybackError; got != "" {
++		t.Fatalf("playback_error for ErrSuperseded = %q", got)
++	}
++}
++
++// yt-dlp の曲のシークの失敗 (音が止まったまま) も出す。
++func TestDaemonPlaybackErrorFromSeek(t *testing.T) {
++	d, eng := newTestDaemon(t, 0, "a")
++	seekErr := errors.New("yt-dlp seek: yt-dlp: ERROR: [youtube] a: HTTP Error 403: Forbidden")
++	eng.mu.Lock()
++	eng.seekErr = seekErr
++	eng.mu.Unlock()
++	d.Send(playback.SetPositionMsg{Position: 30 * time.Second})
++	waitFor(t, func() bool { d.mu.Lock(); defer d.mu.Unlock(); return !d.seeking })
++	d.seekMu.Lock() // 走っているシークが終わるまで待つ
++	d.seekMu.Unlock()
++	if got := daemonStatus(d).PlaybackError; got != seekErr.Error() {
++		t.Fatalf("playback_error after a failed yt-dlp seek = %q", got)
++	}
++	// 次のシークが成功すれば消える。
++	eng.mu.Lock()
++	eng.seekErr = nil
++	eng.mu.Unlock()
++	d.Send(playback.SetPositionMsg{Position: 40 * time.Second})
++	waitFor(t, func() bool { d.mu.Lock(); defer d.mu.Unlock(); return !d.seeking })
++	d.seekMu.Lock()
++	d.seekMu.Unlock()
++	if got := daemonStatus(d).PlaybackError; got != "" {
++		t.Fatalf("playback_error after a successful seek = %q", got)
++	}
++	eng.mu.Lock()
++	eng.seekErr = seekErr
++	eng.mu.Unlock()
++	d.Send(playback.SetPositionMsg{Position: 50 * time.Second})
++	waitFor(t, func() bool { d.mu.Lock(); defer d.mu.Unlock(); return !d.seeking })
++	d.seekMu.Lock()
++	d.seekMu.Unlock()
++	if got := daemonStatus(d).PlaybackError; got != seekErr.Error() {
++		t.Fatalf("playback_error after the second failed seek = %q", got)
++	}
++	// 曲を始め直せば (同じ曲でも) 消える。
++	daemonSend(d, func(r chan ipc.Response) any { return ipc.PlayIndexMsg{Index: 0, Reply: r} })
++	if got := daemonStatus(d).PlaybackError; got != "" {
++		t.Fatalf("playback_error after restarting = %q", got)
 +	}
 +}
 diff --git a/external/local/gui.go b/external/local/gui.go
@@ -3834,8 +3981,91 @@ index 0000000..24007c9
 +		t.Fatalf("QueueEditMsg = %+v", got)
 +	}
 +}
+diff --git a/ipc/playerr.go b/ipc/playerr.go
+new file mode 100644
+index 0000000..8ab8419
+--- /dev/null
++++ b/ipc/playerr.go
+@@ -0,0 +1,77 @@
++package ipc
++
++// playerr.go — status の playback_error (いまの曲が鳴らせなかった理由)。
++//
++// TUI の m.err (画面の "ERR: …") は、設定の保存やプロバイダーの読み込みなど
++// 再生と関係の無い誤りにも使われ、再生が始まっても消えないことがある。GUI には
++// 「いまの曲の最後の開始が失敗した」ことだけを伝えたいので、別に持つ。
++// TUI (ui/model) と daemon が同じ型を使う。
++
++import "unicode/utf8"
++
++// playbackErrorMax は playback_error の上限 (バイト)。yt-dlp は WARNING を
++// 何行も出すことがあり、status は 1 秒に何度も問い合わせられるため。
++const playbackErrorMax = 2048
++
++// PlaybackFailure は、最後に始めた曲と、その開始が失敗した理由を持つ。
++// ゼロ値は「失敗していない」。
++type PlaybackFailure struct {
++	started string // 最後に始めた曲の path
++	path    string // 失敗した曲の path
++	text    string // 失敗の理由 (空なら失敗していない)
++	seek    bool   // 失敗したのが yt-dlp のシーク (後のシークが成功すれば消える)
++}
++
++// Begin は再生を始めるたびに (同じ曲のやり直しも、gapless で次の曲へ進んだ
++// ときも) 呼ぶ。前の失敗を消し、始めた曲を覚える。
++func (f *PlaybackFailure) Begin(path string) {
++	*f = PlaybackFailure{started: path}
++}
++
++// Fail は最後の開始が err で失敗したときに呼ぶ。err が nil なら何もしない。
++// 追い越された開始 (player.ErrSuperseded) は呼ぶ側で除くこと。
++func (f *PlaybackFailure) Fail(err error) { f.fail(err, false) }
++
++// FailSeek は yt-dlp の曲のシーク (yt-dlp を起こし直す) が err で失敗したときに
++// 呼ぶ。音は止まったままになるので再生の失敗とするが、後のシークが成功すれば
++// 音が戻るので SeekOK で消える。
++func (f *PlaybackFailure) FailSeek(err error) { f.fail(err, true) }
++
++// SeekOK は yt-dlp の曲のシークが成功したときに呼ぶ。シークの失敗だけを消す
++// (開始の失敗は、シークでは直らない)。
++func (f *PlaybackFailure) SeekOK() {
++	if f.seek {
++		*f = PlaybackFailure{started: f.started}
++	}
++}
++
++func (f *PlaybackFailure) fail(err error, seek bool) {
++	if err == nil {
++		return
++	}
++	f.path = f.started
++	f.text = truncateUTF8(err.Error(), playbackErrorMax)
++	f.seek = seek
++}
++
++// Text はいまの曲 (path が current) の失敗の理由を返す。失敗していないか、
++// いまの曲が失敗した曲でなければ (止まっている間にリストが変わったなど) 空。
++func (f PlaybackFailure) Text(current string) string {
++	if f.text == "" || current != f.path {
++		return ""
++	}
++	return f.text
++}
++
++// truncateUTF8 は s を limit バイト以内に、文字の途中で切らずに縮める
++// (縮めたときは末尾に "…" を付ける)。
++func truncateUTF8(s string, limit int) string {
++	if len(s) <= limit {
++		return s
++	}
++	cut := limit - len("…")
++	for cut > 0 && !utf8.RuneStart(s[cut]) {
++		cut--
++	}
++	return s[:cut] + "…"
++}
 diff --git a/ipc/protocol.go b/ipc/protocol.go
-index aac71fc..b4e9a66 100644
+index aac71fc..7753c94 100644
 --- a/ipc/protocol.go
 +++ b/ipc/protocol.go
 @@ -17,6 +17,19 @@ type Request struct {
@@ -3858,32 +4088,34 @@ index aac71fc..b4e9a66 100644
  }
  
  // Response is the JSON response sent by the server.
-@@ -42,6 +55,24 @@ type Response struct {
+@@ -42,6 +55,26 @@ type Response struct {
  	Items      []string   `json:"items,omitempty"`
  	Theme      *ThemeInfo `json:"theme,omitempty"`
  	Bands      []float64  `json:"bands,omitempty"`
 +
 +	// GUI 拡張 (gui.go)。
-+	API         int            `json:"api,omitempty"`
-+	Commands    []string       `json:"commands,omitempty"`
-+	EQPresets   []string       `json:"eq_presets,omitempty"`
-+	EQ          []float64      `json:"eq,omitempty"`
-+	Tracks      []TrackInfo    `json:"tracks,omitempty"`
-+	Queue       []int          `json:"queue,omitempty"`
-+	UpNext      []int          `json:"up_next,omitempty"`
-+	Gen         uint64         `json:"gen,omitempty"`
-+	Source      *SourceInfo    `json:"source,omitempty"`
-+	StreamTitle string         `json:"stream_title,omitempty"`
-+	Buffering   *bool          `json:"buffering,omitempty"`
-+	Providers   []ProviderInfo `json:"providers,omitempty"`
-+	Playlists   []PlaylistInfo `json:"playlists,omitempty"`
-+	Lyrics      []LyricLine    `json:"lyrics,omitempty"`
-+	Synced      *bool          `json:"synced,omitempty"`
-+	NeedsAuth   bool           `json:"needs_auth,omitempty"`
++	API         int         `json:"api,omitempty"`
++	Commands    []string    `json:"commands,omitempty"`
++	EQPresets   []string    `json:"eq_presets,omitempty"`
++	EQ          []float64   `json:"eq,omitempty"`
++	Tracks      []TrackInfo `json:"tracks,omitempty"`
++	Queue       []int       `json:"queue,omitempty"`
++	UpNext      []int       `json:"up_next,omitempty"`
++	Gen         uint64      `json:"gen,omitempty"`
++	Source      *SourceInfo `json:"source,omitempty"`
++	StreamTitle string      `json:"stream_title,omitempty"`
++	Buffering   *bool       `json:"buffering,omitempty"`
++	// PlaybackError は status だけに付く。いまの曲の最後の開始が失敗した理由 (playerr.go)。
++	PlaybackError string         `json:"playback_error,omitempty"`
++	Providers     []ProviderInfo `json:"providers,omitempty"`
++	Playlists     []PlaylistInfo `json:"playlists,omitempty"`
++	Lyrics        []LyricLine    `json:"lyrics,omitempty"`
++	Synced        *bool          `json:"synced,omitempty"`
++	NeedsAuth     bool           `json:"needs_auth,omitempty"`
  }
  
  // ThemeInfo carries the active theme name and its resolved hex colors.
-@@ -65,10 +96,30 @@ type PluginDispatcher interface {
+@@ -65,10 +98,30 @@ type PluginDispatcher interface {
  }
  
  // TrackInfo is the track metadata in a status response.
@@ -5707,6 +5939,90 @@ index 57357b1..a471241 100644
  	p.repeat = mode
  }
  
+diff --git a/status_plain_test.go b/status_plain_test.go
+new file mode 100644
+index 0000000..31003d1
+--- /dev/null
++++ b/status_plain_test.go
+@@ -0,0 +1,78 @@
++package main
++
++// `cliamp status` の平文の出力は、拡張のフィールド (playback_error など) が
++// 応答に増えても変わらない (Open-Voice がこの出力を読んでいる)。
++
++import (
++	"context"
++	"io"
++	"os"
++	"path/filepath"
++	"testing"
++
++	"cliamp/ipc"
++)
++
++type fixedStatus struct{ resp ipc.Response }
++
++func (f fixedStatus) Send(msg any) {
++	if m, ok := msg.(ipc.StatusRequestMsg); ok {
++		m.Reply <- f.resp
++	}
++}
++
++// plainStatus は HOME を一時ディレクトリにして (利用者のソケットには繋がない)、
++// resp を返すサーバーに `cliamp status` を打った出力を返す。
++func plainStatus(t *testing.T, resp ipc.Response, args ...string) string {
++	t.Helper()
++	home, err := os.MkdirTemp("", "st")
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { os.RemoveAll(home) })
++	t.Setenv("HOME", home)
++	sock := ipc.DefaultSocketPath()
++	if filepath.Dir(sock) != filepath.Join(home, ".config", "cliamp") {
++		t.Fatalf("socket %s is not under the temporary HOME", sock)
++	}
++	if err := os.MkdirAll(filepath.Dir(sock), 0o700); err != nil {
++		t.Fatal(err)
++	}
++	srv, err := ipc.NewServerWith(sock, fixedStatus{resp}, ipc.Options{})
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer srv.Close()
++
++	r, w, err := os.Pipe()
++	if err != nil {
++		t.Fatal(err)
++	}
++	stdout := os.Stdout
++	os.Stdout = w
++	runErr := statusCommand().Run(context.Background(), append([]string{"status"}, args...))
++	os.Stdout = stdout
++	w.Close()
++	out, _ := io.ReadAll(r)
++	if runErr != nil {
++		t.Fatal(runErr)
++	}
++	return string(out)
++}
++
++func TestStatusPlainTextIgnoresPlaybackError(t *testing.T) {
++	off := false
++	base := ipc.Response{
++		OK: true, State: "stopped", Volume: -6, Shuffle: &off, Repeat: "Off", Mono: &off, Speed: 1, EQPreset: "Flat",
++		Track: &ipc.TrackInfo{Title: "Song", Artist: "Artist", Path: "https://www.youtube.com/watch?v=x8VYWazR5mE"},
++	}
++	want := "State: stopped\nTrack: Song\nArtist: Artist\nVolume: -6 dB\nShuffle: off\nRepeat: Off\nMono: off\nSpeed: 1.00x\nEQ: Flat\n"
++	if got := plainStatus(t, base); got != want {
++		t.Fatalf("plain status without an error:\n%q\nwant\n%q", got, want)
++	}
++	failed := base
++	failed.PlaybackError = "yt-dlp: ERROR: [youtube] x8VYWazR5mE: Sign in to confirm your age."
++	if got := plainStatus(t, failed); got != want {
++		t.Fatalf("plain status with playback_error:\n%q\nwant\n%q", got, want)
++	}
++}
 diff --git a/ui/model/commands.go b/ui/model/commands.go
 index 3ebd2df..e53a93f 100644
 --- a/ui/model/commands.go
@@ -5820,10 +6136,10 @@ index 3ebd2df..e53a93f 100644
  
 diff --git a/ui/model/ipc_gui.go b/ui/model/ipc_gui.go
 new file mode 100644
-index 0000000..a0f2a4b
+index 0000000..019f738
 --- /dev/null
 +++ b/ui/model/ipc_gui.go
-@@ -0,0 +1,383 @@
+@@ -0,0 +1,384 @@
 +package model
 +
 +// ipc_gui.go — GUI 向け拡張 IPC (ipc/gui.go) の状態系コマンドを TUI で処理する。
@@ -5901,6 +6217,7 @@ index 0000000..a0f2a4b
 +	resp.StreamTitle = m.streamTitle
 +	buffering := m.buffering || m.feedLoading || m.feedTrackPending
 +	resp.Buffering = &buffering
++	resp.PlaybackError = m.playbackError()
 +}
 +
 +// setListSource はいまのリストの出どころを覚える。リストが別の経路で
@@ -6207,12 +6524,453 @@ index 0000000..a0f2a4b
 +	ipc.SendReply(msg.Reply, ipc.Response{OK: true, Total: m.playlist.Len(), Gen: m.playlist.Gen()})
 +	return cmd
 +}
+diff --git a/ui/model/ipc_gui_playerr.go b/ui/model/ipc_gui_playerr.go
+new file mode 100644
+index 0000000..1ad11a9
+--- /dev/null
++++ b/ui/model/ipc_gui_playerr.go
+@@ -0,0 +1,55 @@
++package model
++
++// ipc_gui_playerr.go — status の playback_error を TUI で持つ。
++//
++// m.err (画面の "ERR: …") は設定の保存・プロバイダーの読み込み・歌詞など、
++// 再生と関係の無い誤りにも使われ、再生が始まっても消えないことがある。GUI には
++// 「いまの曲の最後の開始が失敗した」ことだけを伝えるので、再生の失敗の経路
++// (流れ・yt-dlp の開始の失敗、手元のファイルの同期の Play の失敗、フィードの
++// 展開の失敗、yt-dlp のシークによる組み直しの失敗) でだけ立て、次の開始
++// (beginPlay。同じ曲のやり直しも) と gapless で次の曲へ進んだときに消す。
++
++import (
++	"errors"
++
++	"cliamp/player"
++)
++
++// errNoEpisodes はフィードの曲を展開したらエピソードが無かったとき (鳴らせない)。
++var errNoEpisodes = errors.New("no episodes found in feed")
++
++// playFailed は最後の開始が err で失敗したことを記録する。追い越された開始
++// (ErrSuperseded) は失敗ではない (新しい開始が進んでいる)。
++func (m *Model) playFailed(err error) {
++	if errors.Is(err, player.ErrSuperseded) {
++		return
++	}
++	m.playFail.Fail(err)
++}
++
++// seekFinished はシークの完了 (seekTickMsg) を受ける。yt-dlp の曲はシークの
++// たびに yt-dlp を起こし直し、失敗すると音が止まったままになるので、再生の
++// 失敗として記録する (後のシークが成功すれば音が戻るので消す)。HTTP の流れの
++// シークは失敗しても前の流れに戻り、手元のファイルのシークは曲を止めないので
++// 記録しない。シークの後に別の曲を始めていたら (playSeq が進んでいたら) 古い
++// 曲のシークなので捨てる。
++func (m *Model) seekFinished(msg seekTickMsg) {
++	if msg.seq != m.playSeq || !m.player.IsYTDLSeek() {
++		return
++	}
++	if msg.err == nil {
++		m.playFail.SeekOK()
++		return
++	}
++	m.playFail.FailSeek(msg.err)
++}
++
++// playbackError は status の playback_error。いまの曲が最後に失敗した曲の
++// ときだけ返す。
++func (m *Model) playbackError() string {
++	cur, idx := m.playlist.Current()
++	if idx < 0 {
++		return ""
++	}
++	return m.playFail.Text(cur.Path)
++}
+diff --git a/ui/model/ipc_gui_playerr_test.go b/ui/model/ipc_gui_playerr_test.go
+new file mode 100644
+index 0000000..dda2933
+--- /dev/null
++++ b/ui/model/ipc_gui_playerr_test.go
+@@ -0,0 +1,374 @@
++package model
++
++// status の playback_error (ipc_gui_playerr.go) の試験。
++
++import (
++	"encoding/json"
++	"errors"
++	"fmt"
++	"strings"
++	"testing"
++	"time"
++
++	tea "charm.land/bubbletea/v2"
++
++	"cliamp/internal/playback"
++	"cliamp/ipc"
++	"cliamp/player"
++	"cliamp/playlist"
++)
++
++// ageGateErr は yt-dlp が年齢確認の要る動画で出す誤り (cliamp は stderr をそのまま包む)。
++var ageGateErr = errors.New("yt-dlp: ERROR: [youtube] x8VYWazR5mE: Sign in to confirm your age. " +
++	"This video may be inappropriate for some users. Use --cookies-from-browser or --cookies for the authentication.")
++
++// failEngine は開始やシークの失敗を返せるプレイヤー。
++type failEngine struct {
++	guiFakeEngine
++	playErr    error // Play が返す値
++	ytdlErr    error // PlayYTDL が返す値
++	seekErr    error // Seek / SeekYTDL が返す値
++	ytdlSeek   bool  // IsYTDLSeek (yt-dlp を起こし直すシーク)
++	streamSeek bool  // IsStreamSeek (シークを Cmd で行う)
++}
++
++func (f *failEngine) Play(path string, _ time.Duration) error {
++	f.playCalls = append(f.playCalls, path)
++	if f.playErr != nil {
++		f.playing = false
++		return f.playErr
++	}
++	f.playing = true
++	return nil
++}
++
++func (f *failEngine) PlayYTDL(path string, _ time.Duration) error {
++	f.playCalls = append(f.playCalls, path)
++	if f.ytdlErr != nil {
++		return f.ytdlErr
++	}
++	f.playing = true
++	return nil
++}
++
++func (f *failEngine) Seek(time.Duration) error     { return f.seekErr }
++func (f *failEngine) SeekYTDL(time.Duration) error { return f.seekErr }
++func (f *failEngine) IsYTDLSeek() bool             { return f.ytdlSeek }
++func (f *failEngine) IsStreamSeek() bool           { return f.streamSeek }
++
++func newFailModel(tracks ...playlist.Track) (Model, *failEngine) {
++	m, _ := newGUITestModel()
++	eng := &failEngine{}
++	m.player = eng
++	m.playlist.Replace(tracks)
++	m.playlist.SetIndex(0)
++	return m, eng
++}
++
++func ytTrack(id string) playlist.Track {
++	return playlist.Track{Path: "https://www.youtube.com/watch?v=" + id, Title: id, Stream: true}
++}
++
++func statusOf(t *testing.T, m Model) (Model, ipc.Response) {
++	t.Helper()
++	return sendGUI(t, m, func(r chan ipc.Response) tea.Msg { return ipc.StatusRequestMsg{Reply: r} })
++}
++
++func playbackErrorOf(t *testing.T, m Model) string {
++	t.Helper()
++	_, resp := statusOf(t, m)
++	return resp.PlaybackError
++}
++
++// yt-dlp の開始の失敗 (年齢確認) は、いまの曲のまま止まった状態で
++// playback_error に出る。同じ曲をやり直すと、始めた時点で消える。
++func TestPlaybackErrorFromFailedYTDLStart(t *testing.T) {
++	m, eng := newFailModel(ytTrack("x8VYWazR5mE"), ytTrack("b"))
++	eng.ytdlErr = ageGateErr
++	m = settle(t, m, m.playCurrentTrack())
++
++	m, resp := statusOf(t, m)
++	if resp.PlaybackError != ageGateErr.Error() {
++		t.Fatalf("playback_error = %q, want the yt-dlp error", resp.PlaybackError)
++	}
++	if resp.State != "stopped" || resp.Track == nil || resp.Track.Path != ytTrack("x8VYWazR5mE").Path {
++		t.Fatalf("status = state %q track %+v, want the failed track, stopped", resp.State, resp.Track)
++	}
++	if m.err == nil {
++		t.Fatal("the TUI's own ERR line should still show the error")
++	}
++
++	// やり直し: 読み込み中は失敗を出さない (新しい開始が進んでいる)。
++	eng.ytdlErr = nil
++	cmd := m.playCurrentTrack()
++	if got := playbackErrorOf(t, m); got != "" {
++		t.Fatalf("playback_error while retrying = %q, want empty", got)
++	}
++	m = settle(t, m, cmd)
++	if got := playbackErrorOf(t, m); got != "" {
++		t.Fatalf("playback_error after a successful retry = %q, want empty", got)
++	}
++}
++
++// 別の曲を始めたら (失敗した曲から移ったら) 消える。
++func TestPlaybackErrorClearedByNextTrack(t *testing.T) {
++	m, eng := newFailModel(ytTrack("a"), ytTrack("b"))
++	eng.ytdlErr = ageGateErr
++	m = settle(t, m, m.playCurrentTrack())
++	if playbackErrorOf(t, m) == "" {
++		t.Fatal("expected a playback error")
++	}
++	eng.ytdlErr = nil
++	m, cmd := update(m, playback.NextMsg{})
++	m = settle(t, m, cmd)
++	if got := playbackErrorOf(t, m); got != "" {
++		t.Fatalf("playback_error after next = %q, want empty", got)
++	}
++}
++
++// 失敗した曲がいまの曲でなくなったら (止まっている間に別の行が選ばれた、
++// リストが差し替わった) 出さない。
++func TestPlaybackErrorOnlyForTheFailedTrack(t *testing.T) {
++	m, eng := newFailModel(ytTrack("a"), ytTrack("b"))
++	eng.ytdlErr = ageGateErr
++	m = settle(t, m, m.playCurrentTrack())
++	m.playlist.SetIndex(1)
++	if got := playbackErrorOf(t, m); got != "" {
++		t.Fatalf("playback_error for another track = %q, want empty", got)
++	}
++	m.playlist.SetIndex(0)
++	if got := playbackErrorOf(t, m); got != ageGateErr.Error() {
++		t.Fatalf("playback_error back on the failed track = %q", got)
++	}
++}
++
++// 手元のファイルの同期の Play の失敗 (無いファイル・読めない形式) も出す。
++// Spotify のサインイン切れは TUI ではサインインの画面を出して ERR を出さないが、
++// GUI には理由を渡す。
++func TestPlaybackErrorFromSynchronousPlay(t *testing.T) {
++	missing := errors.New("open source: open /music/gone.flac: no such file or directory")
++	m, eng := newFailModel(playlist.Track{Path: "/music/gone.flac", Title: "gone"})
++	eng.playErr = missing
++	m = settle(t, m, m.playCurrentTrack())
++	if got := playbackErrorOf(t, m); got != missing.Error() {
++		t.Fatalf("playback_error = %q, want %q", got, missing)
++	}
++
++	auth := fmt.Errorf("custom streamer: spotify: stream auth error after silent reconnect: %w", playlist.ErrNeedsAuth)
++	m, eng = newFailModel(playlist.Track{Path: "spotify:track:abc", Title: "s"})
++	eng.playErr = auth
++	m = settle(t, m, m.playCurrentTrack())
++	if got := playbackErrorOf(t, m); got != auth.Error() {
++		t.Fatalf("playback_error = %q, want %q", got, auth)
++	}
++	if m.err != nil || !m.provSignIn {
++		t.Fatalf("TUI: err=%v provSignIn=%v, want the sign-in overlay without ERR", m.err, m.provSignIn)
++	}
++}
++
++// 再生と関係の無い誤り (プロバイダーの読み込み・設定の保存など、Update に
++// そのまま届く error) は m.err には出ても playback_error には出ない。
++func TestPlaybackErrorIgnoresUnrelatedErrors(t *testing.T) {
++	m, _ := newFailModel(playlist.Track{Path: "/music/a.flac", Title: "a"})
++	m = settle(t, m, m.playCurrentTrack())
++	m, _ = update(m, errors.New("save config: permission denied"))
++	if m.err == nil {
++		t.Fatal("expected the TUI ERR line")
++	}
++	if got := playbackErrorOf(t, m); got != "" {
++		t.Fatalf("playback_error = %q, want empty for an unrelated error", got)
++	}
++}
++
++// 追い越された古い開始の失敗や ErrSuperseded は記録しない。
++func TestPlaybackErrorIgnoresStaleStarts(t *testing.T) {
++	m, eng := newFailModel(ytTrack("a"), ytTrack("b"))
++	eng.ytdlErr = ageGateErr
++	late := runCmd(m.playCurrentTrack()) // a の開始は失敗で終わるが、届くのは b の後
++	m.playlist.SetIndex(1)
++	eng.ytdlErr = nil
++	m = settle(t, m, m.playCurrentTrack()) // b が鳴る
++	for _, msg := range late {
++		m, _ = update(m, msg)
++	}
++	if got := playbackErrorOf(t, m); got != "" {
++		t.Fatalf("playback_error from a superseded start = %q", got)
++	}
++
++	m, eng = newFailModel(ytTrack("a"))
++	eng.ytdlErr = player.ErrSuperseded
++	m = settle(t, m, m.playCurrentTrack())
++	if got := playbackErrorOf(t, m); got != "" {
++		t.Fatalf("playback_error for ErrSuperseded = %q", got)
++	}
++
++	// 手元のファイルの同期の Play も、裏で始まった別の開始に追い越されうる。
++	m, eng = newFailModel(playlist.Track{Path: "/music/a.flac", Title: "a"})
++	eng.playErr = player.ErrSuperseded
++	m = settle(t, m, m.playCurrentTrack())
++	if got := playbackErrorOf(t, m); got != "" {
++		t.Fatalf("playback_error for a superseded synchronous Play = %q", got)
++	}
++}
++
++// フィードの展開の失敗・エピソードが無いときも、その曲の失敗として出す。
++func TestPlaybackErrorFromFeedResolution(t *testing.T) {
++	feed := playlist.Track{Path: "https://example.com/podcast.xml", Title: "pod", Feed: true}
++	for _, tc := range []struct {
++		msg  func(m Model) feedTrackResolvedMsg
++		want string
++	}{
++		{func(m Model) feedTrackResolvedMsg {
++			return feedTrackResolvedMsg{err: errors.New("http status 404 Not Found"), seq: m.playSeq, epoch: m.playlist.Epoch()}
++		}, "http status 404 Not Found"},
++		{func(m Model) feedTrackResolvedMsg {
++			return feedTrackResolvedMsg{seq: m.playSeq, epoch: m.playlist.Epoch()}
++		}, errNoEpisodes.Error()},
++	} {
++		m, _ := newFailModel(feed)
++		_ = m.playCurrentTrack() // 展開の Cmd はネットワークに出るので走らせない
++		m, _ = update(m, tc.msg(m))
++		m, resp := statusOf(t, m)
++		if resp.PlaybackError != tc.want || *resp.Buffering {
++			t.Fatalf("playback_error = %q buffering=%v, want %q", resp.PlaybackError, *resp.Buffering, tc.want)
++		}
++	}
++}
++
++// yt-dlp の曲のシーク (yt-dlp の起こし直し) の失敗は音が止まるので出す。
++// HTTP の流れのシークの失敗 (前の流れに戻る) と、別の曲を始めた後に届いた
++// 古いシークの失敗は出さない。
++func TestPlaybackErrorFromYTDLSeek(t *testing.T) {
++	seekErr := errors.New("yt-dlp seek: yt-dlp: ERROR: [youtube] a: HTTP Error 403: Forbidden")
++	// 長さの分かる yt-dlp の曲は Seek (IsStreamSeek) を、分からない曲は SeekYTDL を通る。
++	for _, known := range []bool{true, false} {
++		m, eng := newFailModel(ytTrack("a"), ytTrack("b"))
++		m = settle(t, m, m.playCurrentTrack())
++		eng.seekErr = seekErr
++		eng.ytdlSeek = true
++		eng.streamSeek = known
++		m, cmd := update(m, playback.SetPositionMsg{Position: 30 * time.Second})
++		if cmd == nil {
++			t.Fatal("expected an async seek")
++		}
++		m = settle(t, m, cmd)
++		if got := playbackErrorOf(t, m); got != seekErr.Error() {
++			t.Fatalf("known=%v: playback_error after a failed yt-dlp seek = %q", known, got)
++		}
++		// 次のシークが成功すれば (yt-dlp を起こし直せたら) 音が戻るので消える。
++		eng.seekErr = nil
++		m, cmd = update(m, playback.SetPositionMsg{Position: 40 * time.Second})
++		m = settle(t, m, cmd)
++		if got := playbackErrorOf(t, m); got != "" {
++			t.Fatalf("known=%v: playback_error after a successful seek = %q", known, got)
++		}
++	}
++
++	// 開始の失敗は、(前の曲の流れへの) シークが成功しても消えない。
++	{
++		m, eng := newFailModel(ytTrack("a"))
++		eng.ytdlErr = ageGateErr
++		m = settle(t, m, m.playCurrentTrack())
++		eng.ytdlSeek, eng.streamSeek = true, true
++		m, cmd := update(m, playback.SetPositionMsg{Position: 30 * time.Second})
++		m = settle(t, m, cmd)
++		if got := playbackErrorOf(t, m); got != ageGateErr.Error() {
++			t.Fatalf("a successful seek cleared the start failure: %q", got)
++		}
++	}
++
++	m, eng := newFailModel(playlist.Track{Path: "https://example.com/ep.mp3", Title: "ep", Stream: true}, ytTrack("b"))
++	m = settle(t, m, m.playCurrentTrack())
++	eng.seekErr = errors.New("seek reconnect: http get: connection refused")
++	eng.streamSeek = true
++	m, cmd := update(m, playback.SetPositionMsg{Position: 30 * time.Second})
++	m = settle(t, m, cmd)
++	if got := playbackErrorOf(t, m); got != "" {
++		t.Fatalf("playback_error after a failed HTTP seek = %q, want empty", got)
++	}
++
++	m, eng = newFailModel(ytTrack("a"), ytTrack("b"))
++	m = settle(t, m, m.playCurrentTrack())
++	eng.seekErr = seekErr
++	eng.ytdlSeek = true
++	eng.streamSeek = true
++	m, seek := update(m, playback.SetPositionMsg{Position: 30 * time.Second})
++	m, next := update(m, playback.NextMsg{})
++	m = settle(t, m, next)
++	m = settle(t, m, seek)
++	if got := playbackErrorOf(t, m); got != "" {
++		t.Fatalf("playback_error from the previous track's seek = %q, want empty", got)
++	}
++}
++
++// 止めても (stop) 失敗は残る (TUI の ERR と同じ。いまの曲はまだ失敗した曲)。
++// JSON では、失敗していなければ playback_error は省かれる。
++func TestPlaybackErrorWire(t *testing.T) {
++	m, eng := newFailModel(ytTrack("a"))
++	m, resp := statusOf(t, m)
++	raw, _ := json.Marshal(resp)
++	if strings.Contains(string(raw), "playback_error") {
++		t.Fatalf("status without an error carries playback_error: %s", raw)
++	}
++	eng.ytdlErr = ageGateErr
++	m = settle(t, m, m.playCurrentTrack())
++	m, _ = update(m, playback.StopMsg{})
++	_, resp = statusOf(t, m)
++	raw, _ = json.Marshal(resp)
++	if !strings.Contains(string(raw), `"playback_error":"yt-dlp: ERROR: [youtube] x8VYWazR5mE`) {
++		t.Fatalf("status after stop: %s", raw)
++	}
++}
++
++// 長すぎる理由は文字の途中で切らずに縮める。
++func TestPlaybackErrorTruncated(t *testing.T) {
++	long := errors.New(strings.Repeat("あ", 2000))
++	m, eng := newFailModel(ytTrack("a"))
++	eng.ytdlErr = long
++	m = settle(t, m, m.playCurrentTrack())
++	got := playbackErrorOf(t, m)
++	if len(got) > 2048 || !strings.HasSuffix(got, "…") || !strings.HasPrefix(got, "あああ") {
++		t.Fatalf("truncated playback_error: len=%d suffix=%q", len(got), got[len(got)-6:])
++	}
++	for _, r := range got {
++		if r == '�' {
++			t.Fatal("truncation split a character")
++		}
++	}
++}
++
++// gaplessEngine は次の tick で gapless が次の曲へ進んだと答える。
++type gaplessEngine struct {
++	failEngine
++	advanced bool
++}
++
++func (f *gaplessEngine) GaplessAdvanced() bool {
++	adv := f.advanced
++	f.advanced = false
++	return adv
++}
++
++// gapless で次の曲へ進んだら (開始を経ずに曲が変わったら) 前の失敗は消える。
++// 1 曲リピートで同じ曲へ進んだときも、その曲は新しく鳴り始めている。
++func TestPlaybackErrorClearedByGaplessAdvance(t *testing.T) {
++	m, _ := newGUITestModel()
++	eng := &gaplessEngine{}
++	m.player = eng
++	m.playlist.Replace([]playlist.Track{ytTrack("a")})
++	m.playlist.SetIndex(0)
++	m.playlist.SetRepeat(playlist.RepeatOne)
++	m = settle(t, m, m.playCurrentTrack())
++	eng.seekErr = errors.New("yt-dlp seek: timed out waiting for audio data (30s)")
++	eng.ytdlSeek, eng.streamSeek = true, true
++	m, cmd := update(m, playback.SetPositionMsg{Position: 30 * time.Second})
++	m = settle(t, m, cmd)
++	if playbackErrorOf(t, m) == "" {
++		t.Fatal("expected a playback error after the failed seek")
++	}
++	eng.advanced = true
++	m, _ = update(m, tickMsg(time.Now()))
++	if got := playbackErrorOf(t, m); got != "" {
++		t.Fatalf("playback_error after a gapless advance = %q, want empty", got)
++	}
++}
 diff --git a/ui/model/ipc_gui_stale.go b/ui/model/ipc_gui_stale.go
 new file mode 100644
-index 0000000..92f5dee
+index 0000000..102223f
 --- /dev/null
 +++ b/ui/model/ipc_gui_stale.go
-@@ -0,0 +1,119 @@
+@@ -0,0 +1,121 @@
 +package model
 +
 +// ipc_gui_stale.go — 遅れて届いた古い非同期の結果を捨てる。
@@ -6236,8 +6994,10 @@ index 0000000..92f5dee
 +// beginPlay は playTrack のたびに呼び、この開始の番号を返す。フィードの曲なら
 +// 展開待ちの印を立て、そうでなければ前のフィードの展開待ちを取り消す
 +// (新しい開始が勝つ。遅れて届く展開の結果は dropStaleFeed で捨てる)。
-+func (m *Model) beginPlay(feed bool) uint64 {
++// 前の開始の失敗 (playback_error) もここで消す。
++func (m *Model) beginPlay(path string, feed bool) uint64 {
 +	m.playSeq++
++	m.playFail.Begin(path)
 +	switch {
 +	case feed:
 +		m.feedTrackPending = true
@@ -7369,7 +8129,7 @@ index d41136f..97117e4 100644
  	m.loadedPlaylist = m.plManager.selPlaylist
  	if startIdx < 0 || startIdx >= m.playlist.Len() {
 diff --git a/ui/model/model.go b/ui/model/model.go
-index e9ec48c..313541d 100644
+index e9ec48c..7ad4423 100644
 --- a/ui/model/model.go
 +++ b/ui/model/model.go
 @@ -6,6 +6,7 @@ import (
@@ -7380,7 +8140,7 @@ index e9ec48c..313541d 100644
  	"cliamp/luaplugin"
  	"cliamp/player"
  	"cliamp/playlist"
-@@ -221,6 +222,18 @@ type Model struct {
+@@ -221,6 +222,20 @@ type Model struct {
  	// row in the provider browser. Empty when no provider playlist is active.
  	activeProviderPlaylistID string
  
@@ -7395,12 +8155,14 @@ index e9ec48c..313541d 100644
 +	playSeq          uint64
 +	preloadSeq       uint64
 +	feedTrackPending bool
++	// status の playback_error: いまの曲の最後の開始が失敗した理由 (ipc_gui_playerr.go)。
++	playFail ipc.PlaybackFailure
 +
  	// exitResume holds the playback state captured just before player.Close()
  	// so ResumeState() can read it after the player is shut down.
  	exitResume struct {
 diff --git a/ui/model/playback.go b/ui/model/playback.go
-index ec55d60..e695611 100644
+index ec55d60..d20b830 100644
 --- a/ui/model/playback.go
 +++ b/ui/model/playback.go
 @@ -170,10 +170,12 @@ func (m *Model) removeSelectedFromPlaylist() {
@@ -7409,7 +8171,7 @@ index ec55d60..e695611 100644
  func (m *Model) playTrack(track playlist.Track) tea.Cmd {
 -	if track.Feed || playlist.IsFeed(track.Path) {
 +	feed := track.Feed || playlist.IsFeed(track.Path)
-+	seq := m.beginPlay(feed)
++	seq := m.beginPlay(track.Path, feed)
 +	if feed {
  		m.feedLoading = true
  		m.status.Show("Loading feed...", statusTTLLong)
@@ -7430,7 +8192,7 @@ index ec55d60..e695611 100644
  	}
  	// Fire now-playing notification for Navidrome tracks.
  	m.nowPlaying(track)
-@@ -213,8 +215,11 @@ func (m *Model) playTrack(track playlist.Track) tea.Cmd {
+@@ -213,9 +215,13 @@ func (m *Model) playTrack(track playlist.Track) tea.Cmd {
  		m.buffering = true
  		m.bufferingAt = time.Now()
  		m.err = nil
@@ -7441,8 +8203,10 @@ index ec55d60..e695611 100644
 +	// async start still in flight is superseded and its message ignored).
 +	m.buffering = false
  	if err := m.player.Play(track.Path, dur); err != nil {
++		m.playFailed(err)
  		// Provider session went stale (e.g. Spotify auth expired and
  		// silent reconnect failed). Surface the standard sign-in
+ 		// overlay rather than the raw stream error.
 diff --git a/ui/model/preload.go b/ui/model/preload.go
 index 97a9696..584f5f9 100644
 --- a/ui/model/preload.go
@@ -7470,11 +8234,82 @@ index 97a9696..584f5f9 100644
 -	return preloadLocalCmd(m.player, next.Path, nextDur)
 +	return preloadLocalCmd(m.player, next.Path, nextDur, m.beginPreload())
  }
+diff --git a/ui/model/seek.go b/ui/model/seek.go
+index 4bed338..63562eb 100644
+--- a/ui/model/seek.go
++++ b/ui/model/seek.go
+@@ -12,8 +12,12 @@ import (
+ // before actually executing the yt-dlp seek (restart).
+ const seekDebounceTicks = 8 // ~800ms at 100ms tick interval
+ 
+-// seekTickMsg fires when the async seek completes.
+-type seekTickMsg struct{}
++// seekTickMsg fires when the async seek completes. err is the seek's error and
++// seq the playSeq when it was requested (ipc_gui_playerr.go).
++type seekTickMsg struct {
++	err error
++	seq uint64
++}
+ 
+ // doSeek handles a seek keypress. For yt-dlp streams, accumulates into a
+ // single target position and debounces. For HTTP seekable streams, dispatches
+@@ -24,18 +28,16 @@ func (m *Model) doSeek(d time.Duration) tea.Cmd {
+ }
+ 
+ func (m *Model) streamSeekRelative(delta time.Duration) tea.Cmd {
+-	p := m.player
++	p, seq := m.player, m.playSeq
+ 	return func() tea.Msg {
+-		p.Seek(delta)
+-		return seekTickMsg{}
++		return seekTickMsg{err: p.Seek(delta), seq: seq}
+ 	}
+ }
+ 
+ func (m *Model) streamSeekAbsolute(target time.Duration) tea.Cmd {
+-	p := m.player
++	p, seq := m.player, m.playSeq
+ 	return func() tea.Msg {
+-		p.Seek(target - p.Position())
+-		return seekTickMsg{}
++		return seekTickMsg{err: p.Seek(target - p.Position()), seq: seq}
+ 	}
+ }
+ 
+@@ -97,10 +99,9 @@ func (m *Model) commitPendingYTDLSeek() tea.Cmd {
+ 	curPos := m.player.Position()
+ 	d := target - curPos
+ 
+-	p := m.player
++	p, seq := m.player, m.playSeq
+ 	return func() tea.Msg {
+-		p.SeekYTDL(d)
+-		return seekTickMsg{}
++		return seekTickMsg{err: p.SeekYTDL(d), seq: seq}
+ 	}
+ }
+ 
 diff --git a/ui/model/update.go b/ui/model/update.go
-index e676be5..5a5da26 100644
+index e676be5..f0f2ab0 100644
 --- a/ui/model/update.go
 +++ b/ui/model/update.go
-@@ -309,6 +309,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+@@ -96,6 +96,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+ 		if m.seek.timer <= 0 {
+ 			m.seek.active = false
+ 		}
++		m.seekFinished(msg)
+ 		// Grace period: suppress reconnect for a few ticks after seek completes.
+ 		m.seek.grace = 10
+ 		m.seek.graceFor = 0
+@@ -249,6 +250,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+ 			// not a user-visible problem. Clear any pending error so the red
+ 			// message doesn't flash at every track transition.
+ 			m.err = nil
++			m.playFail.Begin(newTrack.Path)
+ 			// Gapless advances without calling playTrack(), so emit now-playing here.
+ 			m.nowPlaying(newTrack)
+ 			cmds = append(cmds, m.preloadNext())
+@@ -309,6 +311,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
  		}
  		m.resetYTDLBatch()
  		m.playlist.Replace(msg)
@@ -7482,7 +8317,7 @@ index e676be5..5a5da26 100644
  		m.setInitialHeaderState(msg)
  		m.plCursor = 0
  		m.plScroll = 0
-@@ -423,12 +424,21 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+@@ -423,12 +426,23 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
  		return m, fetchYTDLBatchCmd(m.ytdlBatch.gen, m.ytdlBatch.url, m.ytdlBatch.offset, ytdlBatchSize)
  
  	case feedTrackResolvedMsg:
@@ -7491,9 +8326,11 @@ index e676be5..5a5da26 100644
 +		}
  		m.feedLoading = false
 +		if msg.err != nil {
++			m.playFailed(msg.err)
 +			return m.Update(msg.err)
 +		}
  		if len(msg.tracks) == 0 {
++			m.playFailed(errNoEpisodes)
  			m.status.Show("No episodes found in feed.", statusTTLDefault)
  			return m, nil
  		}
@@ -7504,7 +8341,7 @@ index e676be5..5a5da26 100644
  		m.setInitialHeaderState(msg.tracks)
  		m.plCursor = 0
  		m.plScroll = 0
-@@ -520,6 +530,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+@@ -520,9 +534,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
  		return m, nil
  
  	case streamPlayedMsg:
@@ -7514,7 +8351,11 @@ index e676be5..5a5da26 100644
  		m.buffering = false
  		if msg.err != nil {
  			m.err = msg.err
-@@ -536,8 +549,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
++			m.playFailed(msg.err)
+ 			if track, idx := m.playlist.Current(); idx >= 0 {
+ 				m.status.Showf(statusTTLLong, "Couldn't play %s — track is gated, restricted, or unavailable.", track.DisplayName())
+ 			}
+@@ -536,8 +554,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
  		return m, m.preloadNext()
  
  	case streamPreloadedMsg:
@@ -7524,7 +8365,7 @@ index e676be5..5a5da26 100644
  
  	case ytdlSavedMsg:
  		m.save.finishDownload()
-@@ -705,6 +717,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+@@ -705,6 +722,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
  
  	case playback.StopMsg:
  		m.player.Stop()
@@ -7532,7 +8373,7 @@ index e676be5..5a5da26 100644
  		m.notifyAll()
  		return m, nil
  
-@@ -760,6 +773,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+@@ -760,6 +778,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
  			return m, nil
  		}
  		m.playlist.Replace(tracks)
@@ -7540,7 +8381,7 @@ index e676be5..5a5da26 100644
  		m.setInitialHeaderState(tracks)
  		m.loadedPlaylist = msg.Playlist
  		cmd := m.playCurrentTrack()
-@@ -891,6 +905,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+@@ -891,6 +910,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
  		if msg.Band > 0 || (msg.Band == 0 && msg.Name == "") {
  			// Set a specific band (0-9).
  			m.player.SetEQBand(msg.Band, msg.Value)
@@ -7549,7 +8390,7 @@ index e676be5..5a5da26 100644
  			m.saveEQ()
  			if msg.Reply != nil {
  				msg.Reply <- ipc.Response{OK: true, EQPreset: m.EQPresetName()}
-@@ -992,6 +1008,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+@@ -992,6 +1013,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
  		} else {
  			resp.Theme = &ipc.ThemeInfo{Name: theme.DefaultName}
  		}
@@ -7557,7 +8398,7 @@ index e676be5..5a5da26 100644
  		if msg.Reply != nil {
  			msg.Reply <- resp
  		}
-@@ -1014,6 +1031,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+@@ -1014,6 +1036,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
  		return m, nil
  	}
  

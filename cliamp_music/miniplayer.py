@@ -35,6 +35,7 @@ from .fullscreen import (  # noqa: E402
     _point,
     _set_text,
     _stops,
+    _show_problem,
     _toggle_class,
     app_while_visible,
     blurred_texture,
@@ -559,6 +560,10 @@ class MiniPlayer(Adw.Window):
             _set_text(label, text)
         self.square_subtitle.set_visible(bool(subtitle))
         self.compact_subtitle.set_visible(bool(subtitle))
+        # 再生できなかった曲: 副題が理由の短文 (琥珀色)、ツールチップに全文。横長は高さが無いので 1 行
+        problem = status.playback_problem if status.state != "offline" else None
+        _show_problem(self.square_subtitle, problem)
+        _show_problem(self.compact_subtitle, problem, wrap=False)
         self.set_title(f"ミニプレーヤー — {title}" if track is not None else "ミニプレーヤー")
         self.square_transport.update(status)
         self.compact_transport.update(status)

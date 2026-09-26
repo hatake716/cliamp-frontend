@@ -218,6 +218,44 @@ class _Conformance:
         self.assertEqual(self.status()["gen"], self.ok("playlist")["gen"])
 
     # ======================================================================
+    # 再生の失敗 (status の playback_error)
+
+    MISSING = "/nonexistent/cliamp-music-conformance/__fail__.flac"
+
+    def test_playback_error_for_a_missing_file(self):
+        """手元に無いファイルは鳴らせず、その曲がいまの曲の間だけ playback_error に理由が出る。
+        止めても残り、次の開始で消える (ネットワークを使わずに必ず失敗する曲)。"""
+        self.ok("shuffle", name="off")
+        self.ok("repeat", name="off")
+        tracks = self.library(2)
+        missing = {"path": self.MISSING, "title": "無いファイル"}
+        self.ok("replace", tracks=[missing] + tracks, index=0)
+        st = self.wait(lambda st: st.get("playback_error"), 6, "playback_error")
+        want = f"open source: open {self.MISSING}: no such file or directory"
+        self.assertEqual(st["playback_error"], want)
+        self.assertEqual(st["state"], "stopped")
+        self.assertEqual(st["track"]["path"], self.MISSING)
+        self.assertEqual(parse_status(st).playback_problem, ("ファイルが見つかりません", want))
+        # 止めても消えない (いまの曲はまだ失敗した曲)
+        self.ok("stop")
+        self.assertEqual(self.status().get("playback_error"), want)
+        # 別の曲を始めれば消え、omitempty で省かれる
+        self.ok("play_index", index=1)
+        self.wait(lambda st: st["state"] == "playing" and st.get("index") == 1, 6, "次の曲の再生")
+        self.assertNotIn('"playback_error"', self.raw("status"))
+        # 止めてから失敗した曲をやり直せば、また失敗する (鳴っている曲から移ると、本物の TUI は
+        # 前の曲を止めずに始めるので、失敗の後も前の曲が鳴り続け、終わると次の曲へ進む)
+        self.ok("stop")
+        self.wait(lambda st: st["state"] == "stopped", 3, "stop")
+        self.ok("play_index", index=0)
+        st = self.wait(lambda st: st.get("playback_error") == want and st["state"] == "stopped", 6, "やり直しの失敗")
+        # 止まっている間にいまの曲が別の曲になれば出さない
+        self.ok("remove", index=0)
+        st = self.status()
+        self.assertEqual(st["track"]["path"], tracks[0]["path"])
+        self.assertNotIn("playback_error", st)
+
+    # ======================================================================
     # seek_to
 
     def test_seek_to_negative_is_error(self):

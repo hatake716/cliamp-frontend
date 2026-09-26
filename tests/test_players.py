@@ -516,6 +516,127 @@ class PlayerBarTest(PlayerTestBase):
         bar.output.popdown()
 
 
+FAIL_TRACK = Track(path="https://www.youtube.com/watch?v=__fail__age", title="年齢確認の曲", artist="誰か",
+                   album="盤", duration=200, stream=True) if HAVE_GI else None
+OK_TRACK = Track(path="https://www.youtube.com/watch?v=okokokokok1", title="ふつうの曲", artist="誰か",
+                 album="盤", duration=200, stream=True) if HAVE_GI else None
+SIGN_IN = "YouTube のサインインが必要な曲です (cliamp の設定で Cookie を使う)"
+
+
+class PlaybackProblemTest(PlayerTestBase):
+    """再生できなかった曲: 再生バー・フルスクリーン・ミニプレーヤーの副題とトースト。"""
+
+    def fail(self):
+        self.store.replace([FAIL_TRACK, OK_TRACK], 0)
+        self.assertTrue(run_loop(lambda: self.store.status.playback_problem is not None, 5.0))
+
+    def recover(self):
+        self.store.next()
+        self.assertTrue(run_loop(lambda: self.store.status.state == "playing"
+                                 and self.store.status.track.title == "ふつうの曲", 5.0))
+
+    def with_css(self):
+        from cliamp_music.app import load_css
+
+        errors: list[str] = []
+        display = Gdk.Display.get_default()
+        for provider, _name in load_css(errors):
+            Gtk.StyleContext.add_provider_for_display(display, provider, Gtk.STYLE_PROVIDER_PRIORITY_USER + 1)
+            self.addCleanup(Gtk.StyleContext.remove_provider_for_display, display, provider)
+        self.assertEqual(errors, [])
+
+    def test_bar_shows_the_reason_in_a_warning_tone(self):
+        from cliamp_music.playerbar import PlayerBar
+
+        self.with_css()
+        bar = PlayerBar(self.ctx)
+        self.host(bar, 900, 80)
+        self.fail()
+        self.assertTrue(run_loop(lambda: bar.subtitle_label.get_text() == SIGN_IN, 3.0),
+                        bar.subtitle_label.get_text())
+        self.assertTrue(bar.subtitle_label.has_css_class("problem"))
+        self.assertFalse(bar.subtitle_label.has_css_class("music-key-text"))  # 赤 (操作の色) にしない
+        self.assertTrue(bar.problem_icon.get_visible())
+        # ツールチップは短文 (手当てまで) と cliamp の誤りの全文
+        tip = bar.subtitle_row.get_tooltip_text()
+        self.assertTrue(tip.startswith(SIGN_IN + "\n\nyt-dlp: ERROR: [youtube]"), tip)
+        self.assertIn("Sign in to confirm your age", tip)
+        self.assertEqual(bar.title_label.get_text(), "年齢確認の曲")
+        # 色は赤 (操作の色 #fa586a) ではなく琥珀色 (#ffb340)
+        run_loop(lambda: False, 0.1)
+        color = bar.subtitle_label.get_color()
+        self.assertGreater(color.red, 0.9)
+        self.assertTrue(0.6 < color.green < 0.8, color.green)
+        self.assertLess(color.blue, 0.35)
+        self.recover()
+        self.assertTrue(run_loop(lambda: bar.subtitle_label.get_text() == "誰か — 盤", 3.0))
+        self.assertFalse(bar.subtitle_label.has_css_class("problem"))
+        self.assertFalse(bar.problem_icon.get_visible())
+        self.assertEqual(bar.subtitle_row.get_tooltip_text(), "誰か — 盤")
+
+    def test_toast_once_per_new_failure(self):
+        self.fail()
+        self.assertTrue(run_loop(lambda: len(self.window.toasts) == 1, 3.0), self.window.toasts)
+        # トーストは幅が限られるので、手当ての括弧書きを除いた見出し
+        self.assertEqual(self.window.toasts[0], "「年齢確認の曲」を再生できません — YouTube のサインインが必要な曲です")
+        run_loop(lambda: False, 1.0)  # 何度問い合わせても重ねない
+        self.assertEqual(len(self.window.toasts), 1)
+        self.store.play()  # やり直してまた失敗すれば、もう 1 度
+        self.assertTrue(run_loop(lambda: len(self.window.toasts) == 2, 3.0), self.window.toasts)
+
+    def test_fullscreen_and_miniplayer_show_it_under_the_title(self):
+        from cliamp_music.miniplayer import MiniPlayer
+
+        fs = fs_mod.FullscreenPlayer(self.ctx)
+        self.host(fs)
+        fs.set_active(True)
+        mini = MiniPlayer(self.ctx)
+        mini.present()
+        self.windows.append(mini)
+        self.fail()
+        self.assertTrue(run_loop(lambda: fs.subtitle_label.get_text() == SIGN_IN
+                                 and mini.square_subtitle.get_text() == SIGN_IN, 3.0))
+        self.assertEqual(fs.title_label.get_text(), "年齢確認の曲")
+        for label in (fs.subtitle_label, mini.square_subtitle, mini.compact_subtitle):
+            self.assertTrue(label.has_css_class("problem"))
+            self.assertTrue(label.get_tooltip_text().startswith(SIGN_IN))
+            self.assertIn("Sign in to confirm your age", label.get_tooltip_text())
+        self.assertEqual(mini.compact_subtitle.get_text(), SIGN_IN)
+        # 幅の狭い列でも手当てまで読めるよう 2 行まで折り返す (横長のミニは 1 行)
+        self.assertTrue(fs.subtitle_label.get_wrap() and mini.square_subtitle.get_wrap())
+        self.assertFalse(mini.compact_subtitle.get_wrap())
+        self.recover()
+        self.assertTrue(run_loop(lambda: fs.subtitle_label.get_text() == "誰か — 盤", 3.0))
+        for label in (fs.subtitle_label, mini.square_subtitle, mini.compact_subtitle):
+            self.assertFalse(label.has_css_class("problem"))
+            self.assertIsNone(label.get_tooltip_text())
+            self.assertFalse(label.get_wrap())
+
+
+class ProblemLabelTest(unittest.TestCase):
+    """_show_problem: 折り返す副題が、空白の無い長い理由 (URL など) で列を押し広げない。"""
+
+    @unittest.skipUnless(HAVE_DISPLAY, "画面が無い")
+    def test_unbreakable_reason_keeps_the_minimum_width_small(self):
+        from gi.repository import Pango
+
+        short = "x" * 79 + "…"  # 空白の無い語 (知らない誤りの短文は 80 字まで)
+        label = fs_mod._label("", "music-fs-subtitle")
+        label.set_text(short)
+        fs_mod._show_problem(label, (short, short + "\n2 行目"))
+        self.assertTrue(label.get_wrap())
+        minimum = label.measure(Gtk.Orientation.HORIZONTAL, -1)[0]
+        self.assertLess(minimum, 120, "空白の無い理由の幅がラベルの最小幅になっている")
+        # 語の途中で折っても "-" を足さない (URL の一部に見える)
+        attrs = label.get_attributes()
+        self.assertIsNotNone(attrs)
+        self.assertTrue(any(a.klass.type == Pango.AttrType.INSERT_HYPHENS for a in attrs.get_attributes()))
+        # 理由が消えれば元に戻す
+        fs_mod._show_problem(label, None)
+        self.assertFalse(label.get_wrap())
+        self.assertIsNone(label.get_attributes())
+
+
 class PanelsTest(PlayerTestBase):
     def queue_panel(self):
         from cliamp_music.panels import QueuePanel

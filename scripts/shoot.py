@@ -28,8 +28,9 @@
 
 撮る画面 (NAME): home, search, search-results, radio, recent, playlists, playlist,
 nowplaying, lyrics, queue, fullscreen-lyrics, fullscreen-queue, mini-square, mini-compact,
-equalizer, stress, narrow, collapsed, collapsed-sidebar, panel-over, disconnected, reconnected, legacy,
-legacy-playlists, legacy-search。
+equalizer, stress, playback-error, playback-error-fullscreen, playback-error-mini, narrow, collapsed,
+collapsed-sidebar,
+panel-over, disconnected, reconnected, legacy, legacy-playlists, legacy-search。
 """
 
 from __future__ import annotations
@@ -64,7 +65,7 @@ FAILURE_PATTERNS = (
 FRAMED = ("home", "search", "search-results", "radio", "recent", "playlists", "playlist",
           "nowplaying", "lyrics", "queue", "fullscreen-lyrics", "fullscreen-queue", "stress",
           "narrow", "collapsed-sidebar", "panel-over", "disconnected", "legacy", "mini-square", "mini-compact",
-          "equalizer")
+          "equalizer", "playback-error", "playback-error-fullscreen", "playback-error-mini")
 
 LONG_TITLE = "夜明け前のプラットホームで君を待つ & <特別版> — とても長い日本語の曲名が再生バーに入りきらないとき"
 LONG_ARTIST = "青い灯台 & <Friends> feat. 真夜中ポスト"
@@ -906,6 +907,60 @@ def child_main(args: argparse.Namespace) -> int:
         if toast is not None:
             toast.dismiss()  # 窓が前に出ていないと時間切れで消えないので、次の場面に残さない
 
+    def scene_playback_error():
+        """再生できなかった曲 (偽の cliamp は path に __fail__ を含む曲を年齢確認の誤りで止める)。"""
+        from cliamp_music.protocol import describe_playback_error, playback_error_tooltip
+
+        window = win()
+        c = ctx()
+        base = library()
+        failing = Track(path="https://www.youtube.com/watch?v=__fail__AgeGate1", title="放課後サイダー (Live)",
+                        artist="小春日和", album="四季録", duration=212, stream=True,
+                        meta=(("art", long_art[2].as_uri()),))
+        c.play_tracks([failing] + base[:5], 0, {"provider": "youtube", "id": "放課後", "name": "放課後"})
+        window.navigate("nowplaying")
+        yield Until(lambda: store().status.playback_problem is not None, 6, "再生できない曲の理由が出ない")
+        bar = window.player_bar
+        short, detail = store().status.playback_problem
+        check(short == describe_playback_error(store().status.playback_error)[0], "短文が合いません")
+        check(short.startswith("YouTube のサインインが必要"), f"年齢確認の誤りの短文が違います ({short!r})")
+        yield Until(lambda: bar.subtitle_label.get_text() == short, 3, "再生バーの副題が理由になりません")
+        check(bar.subtitle_label.has_css_class("problem") and bar.problem_icon.get_visible(),
+              "再生バーの副題が警告の見た目になりません")
+        check(bar.subtitle_row.get_tooltip_text() == playback_error_tooltip(short, detail),
+              "再生バーの副題のツールチップが短文と全文ではありません")
+        check(store().status.state == "stopped", f"再生できない曲で止まりません ({store().status.state})")
+        yield 1.4
+        capture(window, "playback-error")
+        app().activate_action("fullscreen-player", None)
+        yield Until(lambda: window.fullscreen_shown, 3, "フルスクリーンにならない")
+        player = window._fullscreen_player
+        yield Until(lambda: player.subtitle_label.get_text() == short, 3, "フルスクリーンの副題が理由になりません")
+        yield 1.2
+        capture(window, "playback-error-fullscreen")
+        app().activate_action("fullscreen-player", None)
+        yield Until(lambda: not window.fullscreen_shown, 3, "フルスクリーンから戻らない")
+        a = app()
+        a.activate_action("miniplayer", None)
+        yield Until(lambda: a.miniplayer is not None and a.miniplayer.get_mapped(), 5, "ミニプレーヤーが開かない")
+        mini = a.miniplayer
+        mini.set_mode("square")
+        mini.set_hover(True, force=True)
+        yield Until(lambda: mini.square_subtitle.get_text() == short, 3, "ミニプレーヤーの副題が理由になりません")
+        yield 1.2
+        capture(mini, "playback-error-mini")
+        a.activate_action("miniplayer", None)
+        yield 0.5
+        # 次の曲へ進めば消える
+        store().next()
+        yield Until(lambda: store().status.state == "playing" and store().status.playback_problem is None, 6,
+                    "次の曲で理由が消えない")
+        yield Until(lambda: not bar.subtitle_label.has_css_class("problem"), 3, "再生バーの警告が消えない")
+        overlay = getattr(window, "_toasts", None)
+        if overlay is not None and hasattr(overlay, "dismiss_all"):
+            overlay.dismiss_all()  # 窓が前に出ていないと時間切れで消えないので、次の場面に残さない
+        yield 0.4
+
     def scene_narrow():
         window = win()
         window.navigate("home")
@@ -1005,8 +1060,8 @@ def child_main(args: argparse.Namespace) -> int:
 
     scenes = [scene_start, scene_home, scene_search, scene_search_results, scene_radio, scene_recent,
               scene_playlists, scene_playlist, scene_nowplaying, scene_lyrics, scene_queue,
-              scene_fullscreen, scene_miniplayer, scene_equalizer, scene_stress, scene_narrow,
-              scene_disconnected, scene_legacy]
+              scene_fullscreen, scene_miniplayer, scene_equalizer, scene_stress, scene_playback_error,
+              scene_narrow, scene_disconnected, scene_legacy]
 
     def all_steps():
         for scene in scenes:

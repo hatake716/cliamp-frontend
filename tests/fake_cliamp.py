@@ -27,6 +27,10 @@
 - `device list` は PulseAudio の sink 名 (alsa_output.… など)。"* " は既定の sink で、
   切り替えても動かない (本物は move-sink-input で切り替えるため)。
   device_descriptions=True で説明付きの devices 配列も返す (パッチの拡張の形)。
+- path に `__fail__` を含む曲は鳴らせない: 始めると (buffer_secs があれば読み込みの後で)
+  止まり、status の playback_error に本物の文言 (YouTube の曲は yt-dlp の年齢確認の誤り、
+  それ以外は手元のファイルが無いときの誤り) が入る。本物と同じく次の開始で消え、止めても
+  残り、いまの曲が失敗した曲でなければ出さない。
 
 試験の道具: `isolate_display()` (利用者の画面に繋がない)、`temp_socket_path()`、
 `temp_dir(prefix)` (どちらも試験の終わりに消える)、
@@ -187,6 +191,23 @@ SEARCH_TEMPLATES = [
 ]
 UPLOADERS = ["Aurora Lane", "青い灯台", "Kite Theory", "真夜中ポスト", "Tape Garden",
              "ミナト・レイ", "Music Channel JP", "Mira Okafor", "喫茶ムーンライト"]
+
+# path にこれを含む曲は鳴らせない (playback_error の試験と画面写真のため)。
+FAIL_MARK = "__fail__"
+
+
+def playback_error_for(path: str) -> str:
+    """鳴らせない曲で本物の cliamp が返す誤り。YouTube の曲は yt-dlp の年齢確認
+    (cliamp は yt-dlp の stderr を "yt-dlp: " を付けてそのまま包む)、ほかは手元のファイルが無いとき。"""
+    if is_ytdl(path):
+        vid = fake_youtube_id(path)[:11]
+        return (f"yt-dlp: ERROR: [youtube] {vid}: Sign in to confirm your age. This video may be inappropriate "
+                "for some users. Use --cookies-from-browser or --cookies for the authentication. See  "
+                "https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp  for how to manually "
+                "pass cookies. Also see  https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-youtube-cookies"
+                "  for tips on effectively exporting YouTube cookies")
+    return f"open source: open {path}: no such file or directory"
+
 
 # 値が偽でも省かない欄 (Go のポインタと、omitempty の無い TrackInfo の path・LyricLine の t と text)。
 _KEEP = frozenset({"ok", "shuffle", "mono", "buffering", "synced", "path", "t", "text"})
@@ -691,6 +712,11 @@ class FakeCliamp:
         self.device = 0  # cliamp の流れがいま出ている sink
         self._seek_pending: tuple[float, float] | None = None  # (効く時刻, 位置)
         self._old: tuple[float, float, float] | None = None  # 読み込み中に出す前の曲 (位置, 時刻, 長さ)
+        # 再生の失敗 (本物の ipc.PlaybackFailure): 失敗した曲の path と誤り。_failing は
+        # 読み込みの終わりで失敗する開始が進んでいる印
+        self.playback_error = ""
+        self._error_path = ""
+        self._failing = False
         self.source: dict = {}
         self.history: list[tuple[dict, str]] = []
         self.local_playlists: dict[str, list[dict]] = {
@@ -942,12 +968,32 @@ class FakeCliamp:
         self._scrobbled = False
         self._seek_pending = None
         self._playing_duration = self._duration()
+        # 開始のたびに前の失敗を消す (本物の beginPlay)
+        self.playback_error = ""
+        self._error_path = ""
+        track, _ = self.pl.current()
+        self._failing = bool(track and FAIL_MARK in str(track.get("path") or ""))
         if self.buffer_secs > 0:
             self._buffering_until = at + self.buffer_secs
             self._t_base = at + self.buffer_secs
         else:
             self._buffering_until = 0.0
             self._t_base = at
+            if self._failing:
+                self._fail(at)
+
+    def _fail(self, at: float) -> None:
+        """いまの曲の開始が失敗した: 止まり、理由を playback_error に置く。"""
+        track, _ = self.pl.current()
+        path = str(track.get("path") or "") if track else ""
+        self._failing = False
+        self.state = "stopped"
+        self._pos_base = 0.0
+        self._t_base = at
+        self._buffering_until = 0.0
+        self._old = None
+        self.playback_error = playback_error_for(path)
+        self._error_path = path
 
     def _freeze(self, now: float) -> None:
         self._pos_base = self.position(now)
@@ -959,6 +1005,8 @@ class FakeCliamp:
             at, target = self._seek_pending
             self._seek_pending = None
             self._seek_abs(target, at)
+        if self._failing and self.state == "playing" and not self._buffering(now):
+            self._fail(self._buffering_until or now)
         if self._old is not None and not self._buffering(now):
             self._old = None
         for _ in range(1000):
@@ -1083,6 +1131,9 @@ class FakeCliamp:
                 "source": dict(self.source),
                 "stream_title": self._stream_title(track, now),
                 "buffering": buffering,
+                # 本物と同じく、いまの曲が失敗した曲のときだけ
+                "playback_error": (self.playback_error
+                                   if track is not None and track.get("path") == self._error_path else ""),
             })
         return resp
 
@@ -1123,6 +1174,7 @@ class FakeCliamp:
         self._buffering_until = 0.0
         self._old = None
         self._seek_pending = None
+        self._failing = False  # 読み込み中の開始を取り消す (失敗は残る。本物も stop では消さない)
         return {"ok": True}
 
     def _cmd_next(self, req, now):

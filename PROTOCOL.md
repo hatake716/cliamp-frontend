@@ -152,6 +152,7 @@ radio の `l:0` は組み込みの cliamp radio。`tracks` では中の M3U を 
 | `source` | SourceInfo | `status`, `playlist` |
 | `stream_title` | string | `status` (ICY の曲名。ラジオで曲名が変わる) |
 | `buffering` | bool (ポインタ) | `status` (yt-dlp・流れの曲の読み込み待ち、ポッドキャストのフィードの展開中) |
+| `playback_error` | string | `status` (いまの曲の最後の開始が失敗した理由。下の「再生の失敗」) |
 | `providers` | [ProviderInfo] | `providers` |
 | `playlists` | [PlaylistInfo] | `playlists` |
 | `lyrics` | [LyricLine] | `lyrics` |
@@ -182,6 +183,44 @@ index / queue / up_next / source だけを入れ替える。
 - HTTP の流れ (ポッドキャストの音声、長さの分かる URL の曲) の `seek_to` は、応答した後で
   繋ぎ直す (`streamSeekAbsolute`)。繋ぎ直すまで `position` は前の位置のまま止まる。GUI は
   応答の後も、届く位置がシーク先に着くまで (最大 3 秒) シーク先を見せる。
+
+### 再生の失敗 (`playback_error`)
+
+`status` の `playback_error` は、**いまの曲の最後の開始が失敗した** ときだけ付く、その理由の
+文言 (cliamp の誤りそのまま。英語。yt-dlp の誤りは stderr 全体で、WARNING の行が先に並ぶことも
+ある)。2 KiB を越えるときは文字の途中で切らずに縮め、末尾を `…` にする。失敗していなければ
+omitempty で省かれる。`cliamp status` の平文の出力には出さない (`--json` には出る)。
+
+立つとき (どれもその曲の開始の失敗):
+
+- yt-dlp・HTTP の流れの曲の開始の失敗 (`streamPlayedMsg` の誤り。TUI の `ERR: yt-dlp: ERROR: …`)。
+  例: `yt-dlp: ERROR: [youtube] x8VYWazR5mE: Sign in to confirm your age. …`
+- 手元のファイルなどの同期の Play の失敗。例: `open source: open /x.flac: no such file or directory`、
+  `decode: …`。Spotify のセッション切れ (`…: sign-in required`) も含む (TUI はサインインの画面を
+  出して ERR を出さないが、GUI には理由を渡す)。
+- ポッドキャストのフィード (`feed: true`) の展開の失敗と、エピソードが無いとき
+  (`no episodes found in feed`)。
+- yt-dlp の曲のシーク (yt-dlp の起こし直し) の失敗 (`yt-dlp seek: …`)。音が止まったままになるため。
+  このときだけは、後のシークが成功すれば (音が戻れば) 消える。
+
+消えるとき: 次の開始の時点 (同じ曲のやり直し、next / prev / play_index / replace / enqueue、止まった
+曲の toggle など。読み込み中は出ない)、gapless で次の曲へ進んだとき。**止めても (stop) 消えない**
+(いまの曲はまだ失敗した曲)。失敗した曲がいまの曲でなくなれば (止まっている間に remove や別の
+経路で今の曲が変わった) 出さない。
+
+立たないもの: TUI の `ERR:` のうち再生と関係の無いもの (設定の保存、プロバイダーやプレイリストの
+読み込み、歌詞、出力先)、流れの途中の切断 (TUI が自分で繋ぎ直す。繋ぎ直しの開始が失敗すれば
+立つ)、追い越された開始 (`player.ErrSuperseded`)、HTTP の流れのシークの失敗 (前の流れに戻る)。
+
+`state` は、止まった状態から始めて失敗すれば `stopped`。鳴っている曲から next / play_index などで
+別の曲へ移って失敗したときは、TUI は開始の前に前の曲を止めないので、前の曲が鳴り続けて `playing`
+のまま (`track` は失敗した曲) になりうる。その前の曲が終わると TUI は次の曲へ進む (その開始で
+`playback_error` は消える)。`replace` と止まっているときの開始は先に止めるので `stopped` になる。
+daemon (`--daemon`) も同じ意味で返す (開始の失敗と yt-dlp のシークの失敗)。
+
+GUI は文言を短い日本語にまとめ (`protocol.describe_playback_error`)、再生バーの副題 (琥珀色)・
+フルスクリーン・ミニプレーヤーに出し、全文はツールチップに出す。新しい失敗 (曲と文言の組) ごとに
+1 度だけトーストを出す。
 
 ## コマンド
 

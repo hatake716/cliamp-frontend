@@ -4,7 +4,8 @@
 1. シャッフル・前へ・再生/一時停止・次へ・リピート (1 曲のときは「1」の印の記号)
 2. アートワーク 36px (角 5)。押すとメニュー「ミニプレーヤー」「フルスクリーンプレーヤー」
 3. 曲名 (13px/600) と「アーティスト — アルバム」(12px)。ラジオは ICY の曲名と局名、
-   読み込み中は副題が「読み込み中…」(Status.display_title / display_subtitle)
+   読み込み中は副題が「読み込み中…」(Status.display_title / display_subtitle)。
+   再生できなかった曲は副題が理由の短文 (琥珀色、丸の中の ! 付き。全文はツールチップ)
 4. 2 と 3 の下に細い再生位置の線 (3px、ホバーで 5px とつまみ、経過と残りの時間)。
    ドラッグ・クリックで seek_to。ライブ配信では線を出さず「ライブ」の印
 5. 「…」: 再生速度 ▸ / イコライザ… / 再生中のリストを表示 / リンクをコピー / ブラウザで開く
@@ -33,7 +34,13 @@ gi.require_version("Graphene", "1.0")
 from gi.repository import Adw, Gdk, Gio, GLib, GObject, Graphene, Gsk, Gtk, Pango  # noqa: E402
 
 from .pages import Bindings  # noqa: E402
-from .protocol import VOLUME_MIN_DB, format_time, fraction_to_volume, volume_fraction  # noqa: E402
+from .protocol import (  # noqa: E402
+    VOLUME_MIN_DB,
+    format_time,
+    fraction_to_volume,
+    playback_error_tooltip,
+    volume_fraction,
+)
 from .widgets import Artwork, CircleButton, ToggleCircle  # noqa: E402
 
 SPEEDS = ("0.5", "0.75", "1.0", "1.25", "1.5", "2.0")
@@ -424,8 +431,18 @@ class PlayerBar(Adw.BreakpointBin):
         self.sub_stack.set_transition_duration(140)
         self.sub_stack.set_hhomogeneous(False)
         self.sub_stack.set_vhomogeneous(True)
+        # 副題。再生できなかった曲では理由の短文を丸の中の ! と並べる
+        self.subtitle_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        self.problem_icon = Gtk.Image.new_from_icon_name("music-warning-symbolic")
+        self.problem_icon.set_pixel_size(11)
+        self.problem_icon.add_css_class("music-bar-problem-icon")
+        self.problem_icon.set_valign(Gtk.Align.CENTER)
+        self.problem_icon.set_visible(False)
+        self.subtitle_row.append(self.problem_icon)
         self.subtitle_label = _label("", "music-bar-subtitle")
-        self.sub_stack.add_named(self.subtitle_label, "subtitle")
+        self.subtitle_label.set_hexpand(True)
+        self.subtitle_row.append(self.subtitle_label)
+        self.sub_stack.add_named(self.subtitle_row, "subtitle")
         times = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         self.elapsed_label = _label("0:00", ("music-bar-time", "music-numeric"), ellipsize=False)
         self.elapsed_label.set_hexpand(True)
@@ -852,12 +869,21 @@ class PlayerBar(Adw.BreakpointBin):
         track = st.track
         title = st.display_title if track is not None else ""
         subtitle = st.display_subtitle if track is not None else ""
+        problem = st.playback_problem if track is not None else None
         if self.title_label.get_text() != title:
             self.title_label.set_text(title)
             self.title_label.set_tooltip_text(title or None)
-        if self.subtitle_label.get_text() != subtitle:
+        # 再生できなかった曲は、ツールチップに cliamp の誤りの全文を出す
+        tip = playback_error_tooltip(*problem) if problem is not None else subtitle
+        if self.subtitle_label.get_text() != subtitle or self.subtitle_row.get_tooltip_text() != (tip or None):
             self.subtitle_label.set_text(subtitle)
-            self.subtitle_label.set_tooltip_text(subtitle or None)
+            self.subtitle_row.set_tooltip_text(tip or None)
+        if (problem is not None) != self.subtitle_label.has_css_class("problem"):
+            if problem is not None:
+                self.subtitle_label.add_css_class("problem")
+            else:
+                self.subtitle_label.remove_css_class("problem")
+            self.problem_icon.set_visible(problem is not None)
         if st.buffering != self.subtitle_label.has_css_class("loading"):
             if st.buffering:
                 self.subtitle_label.add_css_class("loading")

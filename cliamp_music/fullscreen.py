@@ -40,6 +40,7 @@ from .protocol import (  # noqa: E402
     Track,
     format_time,
     fraction_to_volume,
+    playback_error_tooltip,
     track_key,
     volume_fraction,
 )
@@ -112,6 +113,34 @@ def _set_text(label: Gtk.Label, text: str) -> None:
     text = text or ""
     if label.get_text() != text:
         label.set_text(text)
+
+
+def _set_tooltip(widget: Gtk.Widget, text: str | None) -> None:
+    # 状態は 1 秒に何度も届くので、変わったときだけ触る (出ているツールチップを揺らさない)
+    if widget.get_tooltip_text() != (text or None):
+        widget.set_tooltip_text(text or None)
+
+
+def _show_problem(label: Gtk.Label, problem: tuple[str, str] | None, wrap: bool = True) -> None:
+    """副題に再生できなかった理由を出しているときの見た目: 琥珀色 (.problem)、2 行まで折り返し
+    (手当ての括弧書きまで読めるように)、ツールチップに短文と cliamp の誤りの全文。"""
+    on = problem is not None
+    _toggle_class(label, "problem", on)
+    _set_tooltip(label, playback_error_tooltip(*problem) if on else None)
+    wrap = wrap and on
+    if label.get_wrap() != wrap:
+        label.set_wrap(wrap)
+        # WORD_CHAR: 知らない誤りの短文は URL など空白の無い長い語になりうる。WORD だと
+        # その語の幅がラベルの最小幅になり、列 (フルスクリーン・ミニプレーヤー) を押し広げる。
+        # 語の途中で折るときに "-" を足さない (URL やパスの一部に見える)
+        label.set_wrap_mode(Pango.WrapMode.WORD_CHAR if wrap else Pango.WrapMode.WORD)
+        label.set_lines(2 if wrap else -1)
+        if wrap:
+            attrs = Pango.AttrList()
+            attrs.insert(Pango.attr_insert_hyphens_new(False))
+            label.set_attributes(attrs)
+        else:
+            label.set_attributes(None)
 
 
 def _animations_enabled(widget: Gtk.Widget) -> bool:
@@ -1897,6 +1926,8 @@ class FullscreenPlayer(Gtk.Box):
         _set_text(self.title_label, title)
         _set_text(self.subtitle_label, subtitle)
         self.title_label.set_tooltip_text(title or None)
+        # 再生できなかった曲: 副題が理由の短文 (琥珀色)、ツールチップに全文
+        _show_problem(self.subtitle_label, status.playback_problem if status.state != "offline" else None)
         self.more.set_sensitive(track is not None)
         self.transport.update(status)
         self.volume.update(status)

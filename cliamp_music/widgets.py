@@ -39,7 +39,7 @@ __all__ = [
     "CircleButton", "CapsuleButton", "GlassCapsule", "ToggleCircle",
     "PageTitle", "SectionHeader", "Shelf",
     "MediaCard", "TallCard", "CategoryTile", "StationTile",
-    "TrackRow", "TrackList", "EmptyState", "LoadingState", "Chip",
+    "TrackRow", "TrackList", "EmptyState", "LoadingState", "Chip", "PathLabel", "path_wrap_attributes",
     "format_count", "format_total_duration", "color_pair_for", "invoke",
     "is_text_input", "inside_popover", "space_toggles", "install_space_toggle",
 ]
@@ -1772,6 +1772,56 @@ class TrackList(Gtk.ListBox):
             if getattr(row, "is_current", False):
                 return row
         return None
+
+
+# --------------------------------------------------------------------------
+# ファイルのパス
+
+
+def path_wrap_attributes(path: str) -> Pango.AttrList:
+    """パスを "/" の直後でだけ折り返す Pango の属性。
+
+    Pango は既定で語の途中でも折り返し、そこに "-" を足す ("cliamp.so-ck")。パスの
+    "-" や "." は名前の一部なので、そこでも折らない。各部分 (次の "/" まで) の中の
+    折り返しを禁じ、ハイフンの挿入も止める。"""
+    attrs = Pango.AttrList()
+    attrs.insert(Pango.attr_insert_hyphens_new(False))
+    data = (path or "").encode("utf-8")
+    start = 0
+    for end in [i + 1 for i, byte in enumerate(data) if byte == 0x2F] + [len(data)]:
+        if end - start > 1:
+            keep = Pango.attr_allow_breaks_new(False)
+            keep.start_index = start
+            keep.end_index = end
+            attrs.insert(keep)
+        start = end
+    return attrs
+
+
+class PathLabel(Gtk.Label):
+    """ファイルのパス (選んで写せる)。"/" の直後でだけ折り返し、3 行に収まらなければ
+    真ん中を省く (末尾のファイル名は残す)。全体はツールチップにも出す。"""
+
+    __gtype_name__ = "CliampMusicPathLabel"
+
+    def __init__(self, path: str = "", max_width_chars: int = 48):
+        super().__init__()
+        self.set_selectable(True)
+        self.set_wrap(True)
+        self.set_wrap_mode(Pango.WrapMode.WORD)
+        self.set_lines(3)
+        self.set_ellipsize(Pango.EllipsizeMode.MIDDLE)
+        self.set_justify(Gtk.Justification.CENTER)
+        self.set_max_width_chars(max_width_chars)
+        self.set_path(path)
+
+    def set_path(self, path: str) -> None:
+        path = path or ""
+        if self.get_text() == path and self.get_attributes() is not None:
+            return
+        self.set_text(path)
+        self.set_attributes(path_wrap_attributes(path))
+        self.set_tooltip_text(path or None)
 
 
 # --------------------------------------------------------------------------

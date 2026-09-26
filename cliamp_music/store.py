@@ -13,6 +13,12 @@ CliampClient に任せ、結果は main loop で受け取る。
 曲の切り替え中 (yt-dlp・流れの曲を読み込んでいる間) の cliamp は、新しい曲と
 buffering を返しつつ、位置と長さはまだ鳴っている前の曲のものを返す。その間は
 switching を立て、位置 0・長さは新しい曲の長さとして見せ、シークさせない (can_seek)。
+
+再生できなかった曲 (status の playback_error) は、新しい失敗ごとに 1 度だけ
+"playback-failed" を出す (同じ曲の同じ誤りを問い合わせのたびに出さない)。曲を始め直す
+操作 (止まっているときの再生、次へ・前へ、行を選ぶ、差し替え、すぐ再生) では楽観的に
+消し、やり直してもまた失敗すれば、それは新しい失敗として知らせる。その操作が断られた
+(stale など、何も始まっていない) ときは、また見える同じ失敗を知らせ直さない。
 """
 
 from __future__ import annotations
@@ -76,13 +82,15 @@ class PlayerStore(GObject.Object):
       "playlist-changed"   リストの写し (self.playlist) を取り直した
       "history-changed"    self.history を取り直した
       "connection-changed" 接続や api が変わった
+      "playback-failed"    いまの曲が再生できなかった (status.playback_problem)。新しい失敗ごとに
+                           1 度だけ。繋いだ直後の status に既にあった失敗では出さない
     """
 
     __gtype_name__ = "CliampMusicPlayerStore"
     __gsignals__ = {
         name: (GObject.SignalFlags.RUN_FIRST, None, ())
         for name in ("status-changed", "track-changed", "state-changed", "playlist-changed",
-                     "history-changed", "connection-changed")
+                     "history-changed", "connection-changed", "playback-failed")
     }
 
     # 曲が変わってから履歴を取り直すまで (ms)。cliamp は半分聞いた時点で記録するので急がない。
@@ -124,6 +132,8 @@ class PlayerStore(GObject.Object):
         self.switching = False
         # GUI で選んだ出力先 (cliamp の "* " は既定の sink で、切り替えても動かないため)
         self._chosen_device: str | None = None
+        # 最後に見た再生の失敗 (曲の path, 誤りの文言)。同じ失敗を何度も知らせない
+        self._failure_seen: tuple[str, str] | None = None
         client.connect("status", self._on_status)
         client.connect("connection-changed", self._on_connection)
         if client.connected:
@@ -212,6 +222,7 @@ class PlayerStore(GObject.Object):
             self.refresh_history()
             return
         self._overrides.clear()
+        self._failure_seen = None
         self.status = Status(state="offline", volume=old.volume, shuffle=old.shuffle,
                              repeat=old.repeat, speed=old.speed)
         self._base_time = time.monotonic()
@@ -237,6 +248,9 @@ class PlayerStore(GObject.Object):
         track_changed = sig != self._track_sig
         self._track_sig = sig
         state_changed = status.state != old.state
+        failure = (sig[0], status.playback_error) if status.playback_problem is not None else None
+        failed = failure is not None and failure != self._failure_seen and not first
+        self._failure_seen = failure
 
         if self.client.api >= 1 and self.supports("playlist"):
             # 次に来る曲 (up_next) は今の曲・シャッフル・リピートでも変わる。
@@ -260,6 +274,8 @@ class PlayerStore(GObject.Object):
         if state_changed:
             self.emit("state-changed")
         self.emit("status-changed")
+        if failed:
+            self.emit("playback-failed")
 
     def _apply_switching(self, status: Status, sig: tuple[str, int]) -> None:
         """曲の切り替え中 (読み込み中) なら、位置 0・長さは新しい曲のものにする。
@@ -338,6 +354,8 @@ class PlayerStore(GObject.Object):
             st.position = self.position_now()
             self._base_time = now
         sig = (st.track.path if st.track else "", st.index)
+        if "playback_error" in values:
+            self._failure_seen = None  # 始め直した: この後に届く失敗は新しい失敗として知らせる
         for name, value in values.items():
             ov = _Override(value=value, since=now, expires=now + self.OVERRIDE_TTL,
                            seek=seek and name == "position", sig=sig)
@@ -353,6 +371,7 @@ class PlayerStore(GObject.Object):
                  seek: bool = False, switch: bool = False, **fields) -> None:
         """seek: 楽観的な位置はシーク (着くまで保つ)。switch: 曲を替える操作 (next / prev /
         play_index)。受け付けられたら、その後の読み込み中を切り替え中とみなす。"""
+        failure_before = self._failure_seen
         made = self._optimistic(seek=seek, **optimistic) if optimistic and self.client.connected else {}
 
         def done(response: Response) -> None:
@@ -365,6 +384,10 @@ class PlayerStore(GObject.Object):
                     ov.acked_at = now
                 else:
                     del self._overrides[name]
+                    if name == "playback_error" and self._failure_seen is None:
+                        # 断られた (stale など): 始め直していないので、また見える同じ失敗を
+                        # 新しい失敗として知らせ直さない
+                        self._failure_seen = failure_before
             if switch and response.ok:
                 self._switch_pending = True
             if not response.ok and response.kind not in ("offline",):
@@ -414,12 +437,18 @@ class PlayerStore(GObject.Object):
 
     # --- 再生の操作 -------------------------------------------------------------------
 
+    # 曲を始め直す操作で、再生の失敗 (playback_error) を楽観的に消す値。cliamp も次の開始で
+    # 消すので、やり直しが失敗すれば応答の後の status でまた届く (新しい失敗として知らせる)。
+    _RESTART = {"playback_error": ""}
+
     def toggle(self) -> None:
         st = self.status
         if st.state == "playing":
             self._command("toggle", optimistic={"state": "paused"})
-        elif st.state == "paused" or (st.state == "stopped" and st.total > 0):
+        elif st.state == "paused":
             self._command("toggle", optimistic={"state": "playing"})
+        elif st.state == "stopped" and st.total > 0:
+            self._command("toggle", optimistic={"state": "playing", **self._RESTART})
         else:
             self._command("toggle")
 
@@ -429,7 +458,7 @@ class PlayerStore(GObject.Object):
         if st.state == "paused":
             self._command("play", optimistic={"state": "playing"})
         elif st.state == "stopped":
-            self._command("toggle", optimistic={"state": "playing"} if st.total > 0 else None)
+            self._command("toggle", optimistic={"state": "playing", **self._RESTART} if st.total > 0 else None)
         elif st.state == "offline":
             self._command("toggle")
 
@@ -441,10 +470,10 @@ class PlayerStore(GObject.Object):
         self._command("stop", optimistic={"state": "stopped", "position": 0.0})
 
     def next(self) -> None:
-        self._command("next", optimistic={"position": 0.0}, switch=True)
+        self._command("next", optimistic={"position": 0.0, **self._RESTART}, switch=True)
 
     def prev(self) -> None:
-        self._command("prev", optimistic={"position": 0.0}, switch=True)
+        self._command("prev", optimistic={"position": 0.0, **self._RESTART}, switch=True)
 
     def seek_to(self, seconds: float) -> None:
         """絶対位置へ。相対の seek は yt-dlp の曲で TUI を止めるので使わない。
@@ -559,7 +588,7 @@ class PlayerStore(GObject.Object):
 
         path: その添字で見えていた曲の path。パッチ済みの cliamp は違えば "stale" で断る
         (TUI などでリストが動いた後に別の曲を鳴らさない)。古い cliamp は見ない。"""
-        self._command("play_index", optimistic={"position": 0.0}, switch=True, index=int(i),
+        self._command("play_index", optimistic={"position": 0.0, **self._RESTART}, switch=True, index=int(i),
                       path=path or None, callback=self._guarded(callback))
 
     def play_queued(self, index: int, callback: ResponseCallback = None) -> None:
@@ -590,7 +619,8 @@ class PlayerStore(GObject.Object):
                     self.queue_edit("remove", index=remaining[0], path=path_of(remaining[0]),
                                     callback=step(remaining[1:]))
                 else:
-                    self._command("next", optimistic={"position": 0.0}, switch=True, callback=callback)
+                    self._command("next", optimistic={"position": 0.0, **self._RESTART}, switch=True,
+                                  callback=callback)
 
             return done
 
@@ -605,12 +635,13 @@ class PlayerStore(GObject.Object):
         tracks = list(tracks)
         if isinstance(source, dict):
             source = Source.from_wire(source)
-        self._command("replace", optimistic={"position": 0.0}, tracks=tracks, index=int(index),
+        self._command("replace", optimistic={"position": 0.0, **self._RESTART}, tracks=tracks, index=int(index),
                       source=source if source else None, callback=callback)
 
     def enqueue(self, tracks: Iterable[Track], mode: str = "next", callback: ResponseCallback = None) -> None:
         """mode: "next" (次に再生) / "end" (最後に再生) / "now" (すぐ再生)。"""
-        self._command("enqueue", tracks=list(tracks), mode=mode, callback=callback)
+        self._command("enqueue", optimistic=dict(self._RESTART) if mode == "now" else None,
+                      tracks=list(tracks), mode=mode, callback=callback)
 
     def queue_edit(self, mode: str, index: int | None = None, to: int | None = None,
                    callback: ResponseCallback = None, path: str | None = None) -> None:
