@@ -46,6 +46,50 @@ PROTOCOL.md。
   時点で返す (daemon の Send は再生の準備が終わるまで戻らないため)。daemon の
   seek_to もすぐ答え、シークは 1 本ずつ、最後のシーク先へ行う。
 
+Spotify (external/spotify) には、Premium でないアカウントや自分で登録した
+Developer アプリでも GUI から使えるよう、次を足す。
+
+- librespot のセッションを作るときに Spotify が資格情報を拒んだら (login5 の
+  LoginError が INVALID_CREDENTIALS / UNKNOWN_IDENTIFIER、アクセスポイントの
+  AccesspointLoginError が BadCredentials / PremiumAccountRequired。errors.As で
+  型と符号を見る)、OAuth のトークンを残して Web API だけで繋ぐ
+  (external/spotify/webonly.go)。自分の client_id のトークンは login5 が
+  INVALID_CREDENTIALS で断るため、これまでは接続ごと失敗し、Web API は使える
+  のにプレイリストが空になっていた。ネットワークの誤りや login5 の
+  TRY_AGAIN_LATER などは従来どおりその誤りで失敗する。保存した librespot の
+  資格情報が断られたときも従来どおり (黙って Web API だけへ落とさない)。
+- Web API だけの接続は spotify_credentials.json に web_only・リフレッシュ
+  トークン・分かれば user_id を足して保存し、次からはブラウザを開かず
+  リフレッシュトークンで戻る。Spotify がリフレッシュトークンを替えたら書き戻す。
+  古いファイルもそのまま読め、Premium の接続の保存の形と動きは変えない。
+- 戻すときは読み込み・リフレッシュ・保存を 1 本の鍵の中で行い、そのときの
+  ファイルのリフレッシュトークンを使う (替えられたトークンは 1 度しか使えない
+  ため、並んだ 2 つ目が古いトークンで断られ、1 つ目が保存したばかりの資格情報を
+  消していた)。Spotify がリフレッシュを断ったら (invalid_grant に限らず
+  invalid_client などトークン窓口の 4xx。408・429・5xx・通信の失敗は一時的な
+  ものとして残す) 資格情報を消して sign-in required を返す。これまでは
+  invalid_grant 以外を一時的とみなし、Developer アプリを消したり client_id を
+  替えたりすると、起動のたびに生の誤りを返し続けてサインインを求めなかった。
+  起動後に断られたときも Web API の呼び出しは sign-in required になり、
+  Authenticate はその接続を置き換える (動いている接続では従来どおり何もしない)。
+- この接続では Tracks / SearchTracks の曲を "ytsearch1:<アーティスト> <曲名>"
+  の YouTube への橋渡しにする (external/spotify/bridge.go。曲名などは Spotify の
+  もの、検索結果の track_number も付ける。meta に spotify.id と spotify.bridge)。
+  Premium の検索結果は従来どおり track_number を付けない。プレイリストへの追加は meta の
+  spotify.id を使う。spotify:track: の曲は "spotify: streaming unavailable" で
+  断る (サインインは求めない)。IPC の ProviderInfo に、いまのセッションから
+  求める playback ("youtube"、無ければ省く) を足す。
+- Web API の 429 で Retry-After が 30 秒を越えたら、待たずに
+  "spotify: rate limited by Spotify; retry after 24h0m0s" で失敗する
+  (external/spotify/ratelimit.go)。共有の client_id には 86400 秒を求められ、
+  IPC の要求の goroutine が 1 日止まっていた。30 秒以下は従来どおり待って繰り返す。
+  秒数が time.Duration に収まらないほど大きくても (桁あふれで負や短い待ちに
+  化けて繰り返していた) 同じく失敗する。
+- 試験のため、librespot への接続・ブラウザでのサインイン・accounts と Web API の
+  宛先を差し替えられるようにする (external/spotify/backend.go。session.go の
+  sess と player は streamBackend 1 つにまとめた)。試験は httptest の偽物だけを
+  相手にし、HOME も一時ディレクトリにする。
+
 以下は上流にもある競合だが、GUI のクリックで日常的に起きるので直す。
 TUI のキー割り当ては変えない。
 
@@ -63,6 +107,12 @@ TUI のキー割り当ては変えない。
   goroutine が同じ Provider に書くと、曲の項目が混ざったり更新が失われたりしていた。
 - external/radio: IPC の playlists radio は TUI の局検索の状態に関わらず
   登録局とお気に入りを返す (BrowsePlaylists)。
+- external/spotify: 最初の呼び出しが同時に来ても (GUI のカタログは最大 4 本、
+  TUI とも同じ Provider を共有する)、保存した資格情報からの復元は 1 回だけ
+  行い、結果を皆で使う (ensureSession)。Authenticate も走っている復元を待つ。
+  これまでは同時に来たぶんだけ同じリフレッシュトークンを使い、負けた側が
+  sign-in required を返して資格情報を消し、次の起動でブラウザでのサインインが
+  要った (Premium の保存した資格情報でも同じ)。
 
 上の直し以外は、既存のコマンドと応答の形、`cliamp status` の平文の出力、CLI、TUI のキー操作は
 変えない。Open-Voice が平文の status と tmux 越しのキー入力で cliamp を操作して
@@ -71,19 +121,21 @@ TUI のキー割り当ては変えない。
 
 変更は新しいファイル (ipc/gui.go, ipc/shutdown.go, ipc/playerr.go, playlist/gui.go,
 ui/model/ipc_gui.go, ui/model/ipc_gui_stale.go, ui/model/ipc_gui_playerr.go,
-player/supersede.go, external/local/gui.go, external/radio/gui.go, catalog.go,
+player/supersede.go, external/local/gui.go, external/radio/gui.go,
+external/spotify/{backend,webonly,bridge,ratelimit}.go, catalog.go,
 daemon_gui.go と各試験) に寄せ、既存のファイルには型のフィールド、呼び出し、世代番号を
-増やす行など最小限だけを足している。
+増やす行など最小限だけを足している (external/spotify/session.go は librespot の
+組み立てを backend.go へ移したぶん大きく変わる)。
 上流のファイルが変わって当たらなくなったらビルドが落ちる (cliamp.nix は
 版が 1.50.0 でなければ評価の時点で止める)。go.mod は変えず、新しく import
 するのは既に vendor にあるパッケージだけなので、vendorHash はそのまま使える。
 
 diff --git a/catalog.go b/catalog.go
 new file mode 100644
-index 0000000..4e34ade
+index 0000000..1124d36
 --- /dev/null
 +++ b/catalog.go
-@@ -0,0 +1,299 @@
+@@ -0,0 +1,316 @@
 +package main
 +
 +// catalog.go — GUI 向け拡張 IPC のカタログ系コマンド (ipc.Catalog) の実装。
@@ -105,6 +157,7 @@ index 0000000..4e34ade
 +	"time"
 +
 +	"cliamp/external/local"
++	"cliamp/external/spotify"
 +	"cliamp/history"
 +	"cliamp/ipc"
 +	"cliamp/luaplugin"
@@ -182,9 +235,20 @@ index 0000000..4e34ade
 +	return false
 +}
 +
++// playbackReporter は、曲を自分ではなく別の所から鳴らすことのあるプロバイダー
++// (Spotify は Web API だけの接続のとき YouTube から鳴らす)。PlaybackVia は
++// いまのセッションの状態から答え、ふつうは "" を返す。
++type playbackReporter interface {
++	PlaybackVia() string
++}
++
++var _ playbackReporter = (*spotify.SpotifyProvider)(nil)
++
 +// Providers は登録されたプロバイダーと疑似プロバイダー youtube を返す。
 +// search は、そのキーで search を呼んで意味のある結果が返るものだけ立てる
 +// (radio などは YouTube 検索へ退避はするが、その局の検索ではないので立てない)。
++// playback は呼ばれるたびにプロバイダーのいまの状態から求める (Spotify は
++// セッションができるまで分からないので、playlists などの後で変わりうる)。
 +func (c *guiCatalog) Providers() []ipc.ProviderInfo {
 +	var out []ipc.ProviderInfo
 +	hasYouTube := false
@@ -193,11 +257,16 @@ index 0000000..4e34ade
 +			continue
 +		}
 +		_, searcher := e.Provider.(provider.Searcher)
++		var playback string
++		if r, ok := e.Provider.(playbackReporter); ok {
++			playback = r.PlaybackVia()
++		}
 +		out = append(out, ipc.ProviderInfo{
 +			Key:       e.Key,
 +			Name:      e.Name,
 +			Search:    searcher || ytSearchKey(e.Key) || e.Key == "soundcloud",
 +			Playlists: true,
++			Playback:  playback,
 +		})
 +		if e.Key == virtualYouTube {
 +			hasYouTube = true
@@ -570,14 +639,15 @@ index 0000000..253262f
 +}
 diff --git a/catalog_test.go b/catalog_test.go
 new file mode 100644
-index 0000000..027990d
+index 0000000..ba0cc86
 --- /dev/null
 +++ b/catalog_test.go
-@@ -0,0 +1,314 @@
+@@ -0,0 +1,363 @@
 +package main
 +
 +import (
 +	"context"
++	"encoding/json"
 +	"errors"
 +	"path/filepath"
 +	"slices"
@@ -659,6 +729,54 @@ index 0000000..027990d
 +	got = c.Providers()
 +	if len(got) != 1 || got[0].Virtual || !got[0].Search {
 +		t.Fatalf("Providers() with a registered youtube = %+v", got)
++	}
++}
++
++// catalogTestBridged は、曲を別の所から鳴らすことのあるプロバイダー (Spotify の
++// Web API だけの接続) の偽物。playback は試験の途中で変える。
++type catalogTestBridged struct {
++	catalogTestSearcher
++	playback string
++}
++
++func (b *catalogTestBridged) PlaybackVia() string { return b.playback }
++
++// playback は呼ばれるたびにプロバイダーのいまの状態から求め、無ければ JSON で省く。
++func TestCatalogProvidersPlayback(t *testing.T) {
++	spotify := &catalogTestBridged{catalogTestSearcher: catalogTestSearcher{catalogTestProvider: catalogTestProvider{name: "Spotify"}}}
++	c, _ := newTestCatalog(
++		model.ProviderEntry{Key: "radio", Name: "Radio", Provider: &catalogTestProvider{name: "Radio"}},
++		model.ProviderEntry{Key: "spotify", Name: "Spotify", Provider: spotify},
++	)
++	tests := []struct {
++		name     string
++		playback string
++		want     []ipc.ProviderInfo
++		wantJSON string
++	}{
++		{"セッションができる前 (または Premium)", "", []ipc.ProviderInfo{
++			{Key: "radio", Name: "Radio", Playlists: true},
++			{Key: "spotify", Name: "Spotify", Search: true, Playlists: true},
++			{Key: "youtube", Name: "YouTube", Search: true, Virtual: true},
++		}, `[{"key":"radio","name":"Radio","search":false,"playlists":true,"virtual":false},{"key":"spotify","name":"Spotify","search":true,"playlists":true,"virtual":false},{"key":"youtube","name":"YouTube","search":true,"playlists":false,"virtual":true}]`},
++		{"Web API だけの接続", "youtube", []ipc.ProviderInfo{
++			{Key: "radio", Name: "Radio", Playlists: true},
++			{Key: "spotify", Name: "Spotify", Search: true, Playlists: true, Playback: "youtube"},
++			{Key: "youtube", Name: "YouTube", Search: true, Virtual: true},
++		}, `[{"key":"radio","name":"Radio","search":false,"playlists":true,"virtual":false},{"key":"spotify","name":"Spotify","search":true,"playlists":true,"virtual":false,"playback":"youtube"},{"key":"youtube","name":"YouTube","search":true,"playlists":false,"virtual":true}]`},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			spotify.playback = tt.playback
++			got := c.Providers()
++			if !slices.Equal(got, tt.want) {
++				t.Fatalf("Providers() =\n %+v\nwant\n %+v", got, tt.want)
++			}
++			b, err := json.Marshal(got)
++			if err != nil || string(b) != tt.wantJSON {
++				t.Fatalf("JSON =\n %s\nwant\n %s", b, tt.wantJSON)
++			}
++		})
 +	}
 +}
 +
@@ -2311,6 +2429,2898 @@ index 6ceca72..408550f 100644
  }
  
  // catalogEntry builds a PlaylistInfo for a CatalogStation, marking favorites with ★.
+diff --git a/external/spotify/backend.go b/external/spotify/backend.go
+new file mode 100644
+index 0000000..afd6016
+--- /dev/null
++++ b/external/spotify/backend.go
+@@ -0,0 +1,88 @@
++//go:build !windows
++
++package spotify
++
++import (
++	"context"
++	"fmt"
++	"net/http"
++	"os"
++
++	librespot "github.com/devgianlu/go-librespot"
++	librespotPlayer "github.com/devgianlu/go-librespot/player"
++	devicespb "github.com/devgianlu/go-librespot/proto/spotify/connectstate/devices"
++	"github.com/devgianlu/go-librespot/session"
++)
++
++// streamBackend is the librespot half of a Session: the access point/login5
++// session and the player built on it. A web-only Session has none.
++type streamBackend interface {
++	Username() string
++	StoredCredentials() []byte
++	NewStream(ctx context.Context, spotID librespot.SpotifyId, bitrate int) (*librespotPlayer.Stream, error)
++	Close()
++}
++
++// openStreamBackend connects to Spotify with go-librespot. creds is one of
++// the session.*Credentials types. Tests replace it so that no test reaches
++// Spotify.
++var openStreamBackend = openLibrespot
++
++// librespotBackend is the real streamBackend.
++type librespotBackend struct {
++	sess   *session.Session
++	player *librespotPlayer.Player
++}
++
++func openLibrespot(ctx context.Context, devID string, creds any) (streamBackend, error) {
++	sess, err := session.NewSessionFromOptions(ctx, &session.Options{
++		Log:         &librespot.NullLogger{},
++		DeviceType:  devicespb.DeviceType_COMPUTER,
++		DeviceId:    devID,
++		Credentials: creds,
++	})
++	if err != nil {
++		return nil, err
++	}
++	player, err := newLibrespotPlayer(sess)
++	if err != nil {
++		sess.Close()
++		return nil, err
++	}
++	return &librespotBackend{sess: sess, player: player}, nil
++}
++
++// newLibrespotPlayer creates the go-librespot player. We only use NewStream()
++// for decoded AudioSources — audio output is routed through cliamp's Beep
++// pipeline, not go-librespot's output backend.
++func newLibrespotPlayer(sess *session.Session) (*librespotPlayer.Player, error) {
++	// go-librespot uses this for media restriction checks but Premium
++	// accounts can play all tracks regardless.
++	countryCode := "US"
++	p, err := librespotPlayer.NewPlayer(&librespotPlayer.Options{
++		Spclient:             sess.Spclient(),
++		AudioKey:             sess.AudioKey(),
++		Events:               sess.Events(),
++		Log:                  &librespot.NullLogger{},
++		CountryCode:          &countryCode,
++		NormalisationEnabled: true,
++		AudioBackend:         "pipe",
++		AudioOutputPipe:      os.DevNull,
++	})
++	if err != nil {
++		return nil, fmt.Errorf("spotify: player init: %w", err)
++	}
++	return p, nil
++}
++
++func (b *librespotBackend) Username() string          { return b.sess.Username() }
++func (b *librespotBackend) StoredCredentials() []byte { return b.sess.StoredCredentials() }
++
++func (b *librespotBackend) NewStream(ctx context.Context, spotID librespot.SpotifyId, bitrate int) (*librespotPlayer.Stream, error) {
++	return b.player.NewStream(ctx, http.DefaultClient, spotID, bitrate, 0)
++}
++
++func (b *librespotBackend) Close() {
++	b.player.Close()
++	b.sess.Close()
++}
+diff --git a/external/spotify/bridge.go b/external/spotify/bridge.go
+new file mode 100644
+index 0000000..36b100c
+--- /dev/null
++++ b/external/spotify/bridge.go
+@@ -0,0 +1,114 @@
++//go:build !windows
++
++package spotify
++
++// bridge.go — how a Spotify track becomes a playlist.Track, and the YouTube
++// bridge used by web-only sessions (webonly.go).
++
++import (
++	"fmt"
++	"strings"
++
++	"cliamp/playlist"
++)
++
++const (
++	spotifyTrackPrefix = "spotify:track:"
++
++	// metaID and metaBridge are the ProviderMeta keys of a bridged track.
++	metaID     = "spotify.id"
++	metaBridge = "spotify.bridge"
++)
++
++// spotifyTrack is a track as the Web API describes it, before it is turned
++// into a playlist.Track for the session's playback mode. The provider caches
++// these, so a cached playlist follows a change of mode.
++type spotifyTrack struct {
++	id           string
++	title        string
++	artists      []string
++	album        string
++	year         int
++	durationSecs int
++	trackNumber  int
++	unplayable   bool
++
++	// fromSearch marks a /v1/search hit. Its track number is kept only when
++	// bridged: Premium search results stay as upstream builds them (without).
++	fromSearch bool
++}
++
++// track returns t as cliamp plays it: a spotify:track: URI streamed by
++// librespot, or, when webOnly, a YouTube-bridged track.
++func (t spotifyTrack) track(webOnly bool) playlist.Track {
++	if webOnly {
++		return t.bridged()
++	}
++	trackNumber := t.trackNumber
++	if t.fromSearch {
++		trackNumber = 0
++	}
++	return playlist.Track{
++		Path:         spotifyTrackPrefix + t.id,
++		Title:        t.title,
++		Artist:       strings.Join(t.artists, ", "),
++		Album:        t.album,
++		Year:         t.year,
++		Stream:       false, // must be false: true causes togglePlayPause to stop+restart instead of pause/resume
++		DurationSecs: t.durationSecs,
++		TrackNumber:  trackNumber,
++		Unplayable:   t.unplayable,
++	}
++}
++
++// bridged returns t as a yt-dlp search for "<artists> <title>" (the first
++// YouTube hit is played), keeping Spotify's metadata. Spotify's playability
++// does not apply to YouTube, so the track is never marked unplayable.
++func (t spotifyTrack) bridged() playlist.Track {
++	return playlist.Track{
++		Path:         bridgeQuery(t.artists, t.title),
++		Title:        t.title,
++		Artist:       strings.Join(t.artists, ", "),
++		Album:        t.album,
++		Year:         t.year,
++		DurationSecs: t.durationSecs,
++		TrackNumber:  t.trackNumber,
++		ProviderMeta: map[string]string{metaID: t.id, metaBridge: PlaybackYouTube},
++	}
++}
++
++// bridgeQuery builds "ytsearch1:<artists joined by space> <title>". Runs of
++// whitespace (including newlines and tabs) collapse to one space so the path
++// stays a single line; empty artist names are skipped.
++func bridgeQuery(artists []string, title string) string {
++	words := make([]string, 0, len(artists)+1)
++	for _, s := range append(artists[:len(artists):len(artists)], title) {
++		words = append(words, strings.Fields(s)...)
++	}
++	return "ytsearch1:" + strings.Join(words, " ")
++}
++
++// spotifyTrackURI returns the spotify:track: URI of t: its path, or for a
++// bridged track the id kept in ProviderMeta. Other paths are returned as is.
++func spotifyTrackURI(t playlist.Track) string {
++	if strings.HasPrefix(t.Path, spotifyTrackPrefix) {
++		return t.Path
++	}
++	if id := t.Meta(metaID); id != "" {
++		return fmt.Sprintf("%s%s", spotifyTrackPrefix, id)
++	}
++	return t.Path
++}
++
++// presentTracks converts cached Spotify tracks for the current session mode.
++func (p *SpotifyProvider) presentTracks(ts []spotifyTrack) []playlist.Track {
++	if len(ts) == 0 {
++		return nil
++	}
++	webOnly := p.webOnly()
++	out := make([]playlist.Track, len(ts))
++	for i, t := range ts {
++		out[i] = t.track(webOnly)
++	}
++	return out
++}
+diff --git a/external/spotify/bridge_test.go b/external/spotify/bridge_test.go
+new file mode 100644
+index 0000000..510a2d9
+--- /dev/null
++++ b/external/spotify/bridge_test.go
+@@ -0,0 +1,301 @@
++//go:build !windows
++
++package spotify
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"net/http"
++	"reflect"
++	"slices"
++	"testing"
++
++	"cliamp/playlist"
++)
++
++func TestBridgedTrack(t *testing.T) {
++	tests := []struct {
++		name       string
++		in         spotifyTrack
++		wantPath   string
++		wantArtist string
++	}{
++		{"single artist",
++			spotifyTrack{id: "id1", title: "Lemon", artists: []string{"米津玄師"}},
++			"ytsearch1:米津玄師 Lemon", "米津玄師"},
++		{"multiple artists are joined by spaces",
++			spotifyTrack{id: "id2", title: "Under Pressure", artists: []string{"Queen", "David Bowie"}},
++			"ytsearch1:Queen David Bowie Under Pressure", "Queen, David Bowie"},
++		{"artist names with commas stay whole",
++			spotifyTrack{id: "id3", title: "September", artists: []string{"Earth, Wind & Fire"}},
++			"ytsearch1:Earth, Wind & Fire September", "Earth, Wind & Fire"},
++		{"no artists",
++			spotifyTrack{id: "id4", title: "Untitled"},
++			"ytsearch1:Untitled", ""},
++		{"empty artist name is skipped",
++			spotifyTrack{id: "id5", title: "Song", artists: []string{"", "B"}},
++			"ytsearch1:B Song", ", B"},
++		{"special characters are kept (yt-dlp gets one argument, no shell)",
++			spotifyTrack{id: "id6", title: `Don't Stop Me Now? #1 / "Live" & 100% :)`, artists: []string{"AC/DC", "Beyoncé"}},
++			`ytsearch1:AC/DC Beyoncé Don't Stop Me Now? #1 / "Live" & 100% :)`, "AC/DC, Beyoncé"},
++		{"newlines, tabs and runs of spaces collapse",
++			spotifyTrack{id: "id7", title: "  Two\nLines\tTab  ", artists: []string{" Spaced  Out "}},
++			"ytsearch1:Spaced Out Two Lines Tab", " Spaced  Out "},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			in := tt.in
++			in.album, in.year, in.durationSecs, in.trackNumber, in.unplayable = "Album", 2018, 254, 3, true
++			got := in.track(true)
++			want := playlist.Track{
++				Path:         tt.wantPath,
++				Title:        in.title,
++				Artist:       tt.wantArtist,
++				Album:        "Album",
++				Year:         2018,
++				DurationSecs: 254,
++				TrackNumber:  3,
++				Unplayable:   false, // Spotify's restriction says nothing about YouTube
++				ProviderMeta: map[string]string{"spotify.id": in.id, "spotify.bridge": "youtube"},
++			}
++			if !reflect.DeepEqual(got, want) {
++				t.Fatalf("bridged =\n %#v\nwant\n %#v", got, want)
++			}
++			if !playlist.IsYTSearch(got.Path) || !playlist.IsYTDL(got.Path) {
++				t.Fatalf("path %q is not played through yt-dlp", got.Path)
++			}
++			if playlist.IsM3U(got.Path) || playlist.IsPLS(got.Path) {
++				t.Fatalf("path %q would be expanded as a playlist wrapper", got.Path)
++			}
++			// The artists slice of the cached track must not be modified.
++			if len(tt.in.artists) > 0 && !slices.Equal(in.artists, tt.in.artists) {
++				t.Fatalf("artists modified: %q", in.artists)
++			}
++		})
++	}
++}
++
++// The premium shape is exactly what Tracks() produced before.
++func TestPremiumTrackShape(t *testing.T) {
++	in := spotifyTrack{id: "abc", title: "T", artists: []string{"A", "B"}, album: "Al", year: 1999, durationSecs: 61, trackNumber: 4, unplayable: true}
++	want := playlist.Track{Path: "spotify:track:abc", Title: "T", Artist: "A, B", Album: "Al", Year: 1999, DurationSecs: 61, TrackNumber: 4, Unplayable: true}
++	if got := in.track(false); !reflect.DeepEqual(got, want) {
++		t.Fatalf("premium track =\n %#v\nwant\n %#v", got, want)
++	}
++}
++
++func TestSpotifyTrackURI(t *testing.T) {
++	tests := []struct {
++		name  string
++		track playlist.Track
++		want  string
++	}{
++		{"spotify path", playlist.Track{Path: "spotify:track:abc"}, "spotify:track:abc"},
++		{"bridged track uses meta id", playlist.Track{Path: "ytsearch1:A T", ProviderMeta: map[string]string{"spotify.id": "abc", "spotify.bridge": "youtube"}}, "spotify:track:abc"},
++		{"path wins over meta", playlist.Track{Path: "spotify:track:abc", ProviderMeta: map[string]string{"spotify.id": "zzz"}}, "spotify:track:abc"},
++		{"other track unchanged", playlist.Track{Path: "https://example.com/a.mp3"}, "https://example.com/a.mp3"},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			if got := spotifyTrackURI(tt.track); got != tt.want {
++				t.Fatalf("spotifyTrackURI = %q, want %q", got, tt.want)
++			}
++		})
++	}
++}
++
++// fakeLibrary serves Your Music, one playlist, search and /v1/me.
++func fakeLibrary(f *fakeSpotify) {
++	track := func(id, name string, artists []string, playable bool) map[string]any {
++		as := make([]map[string]string, len(artists))
++		for i, a := range artists {
++			as[i] = map[string]string{"name": a}
++		}
++		return map[string]any{
++			"id": id, "name": name, "artists": as,
++			"album":       map[string]string{"name": "Album " + id, "release_date": "2020-01-02"},
++			"duration_ms": 200500, "track_number": 7, "is_playable": playable,
++		}
++	}
++	f.json("GET /v1/me", 200, map[string]string{"id": "u1"})
++	f.json("GET /v1/me/tracks", 200, map[string]any{
++		"total": 2,
++		"items": []any{
++			map[string]any{"track": track("liked1", "Liked One", []string{"Artist A", "Artist B"}, true)},
++			map[string]any{"track": track("liked2", "Liked Two", nil, false)},
++		},
++	})
++	f.json("GET /v1/me/playlists", 200, map[string]any{
++		"total": 1,
++		"items": []any{map[string]any{"id": "pl1", "name": "Mine", "snapshot_id": "s1", "owner": map[string]string{"id": "u1"}, "items": map[string]int{"total": 1}}},
++	})
++	f.json("GET /v1/playlists/pl1/items", 200, map[string]any{
++		"total": 1,
++		"items": []any{map[string]any{"item": track("pl1t1", "In Playlist", []string{"Solo"}, true)}},
++	})
++	f.json("GET /v1/search", 200, map[string]any{
++		"tracks": map[string]any{"items": []any{track("found1", "Found", []string{"X", "Y"}, true)}},
++	})
++}
++
++// Web-only providers list the library from the Web API and return bridged
++// tracks from Tracks and SearchTracks; Premium ones keep spotify:track:.
++func TestProviderTracksByMode(t *testing.T) {
++	tests := []struct {
++		name    string
++		webOnly bool
++	}{
++		{"web-only", true},
++		{"premium", false},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			f := isolate(t)
++			fakeLibrary(f)
++			var sess *Session
++			if tt.webOnly {
++				sess = webOnlyTestSession(t, "")
++			} else {
++				sess = premiumTestSession(t, &fakeBackend{})
++			}
++			p := New(sess, "cid", 320)
++			defer p.Close()
++
++			lists, err := p.Playlists()
++			if err != nil {
++				t.Fatalf("Playlists: %v", err)
++			}
++			if len(lists) != 2 || lists[0].ID != "YOUR MUSIC" || lists[0].TrackCount != 2 || lists[1].ID != "pl1" {
++				t.Fatalf("Playlists = %+v", lists)
++			}
++
++			liked, err := p.Tracks("YOUR MUSIC")
++			if err != nil {
++				t.Fatalf("Tracks(YOUR MUSIC): %v", err)
++			}
++			inList, err := p.Tracks("pl1")
++			if err != nil {
++				t.Fatalf("Tracks(pl1): %v", err)
++			}
++			found, err := p.SearchTracks(context.Background(), "q", 5)
++			if err != nil {
++				t.Fatalf("SearchTracks: %v", err)
++			}
++
++			var wantLiked, wantList, wantFound []playlist.Track
++			if tt.webOnly {
++				meta := func(id string) map[string]string {
++					return map[string]string{"spotify.id": id, "spotify.bridge": "youtube"}
++				}
++				wantLiked = []playlist.Track{
++					{Path: "ytsearch1:Artist A Artist B Liked One", Title: "Liked One", Artist: "Artist A, Artist B", Album: "Album liked1", Year: 2020, DurationSecs: 200, TrackNumber: 7, ProviderMeta: meta("liked1")},
++					{Path: "ytsearch1:Liked Two", Title: "Liked Two", Album: "Album liked2", Year: 2020, DurationSecs: 200, TrackNumber: 7, ProviderMeta: meta("liked2")},
++				}
++				wantList = []playlist.Track{
++					{Path: "ytsearch1:Solo In Playlist", Title: "In Playlist", Artist: "Solo", Album: "Album pl1t1", Year: 2020, DurationSecs: 200, TrackNumber: 7, ProviderMeta: meta("pl1t1")},
++				}
++				wantFound = []playlist.Track{
++					// Bridged search results keep Spotify's track_number too.
++					{Path: "ytsearch1:X Y Found", Title: "Found", Artist: "X, Y", Album: "Album found1", Year: 2020, DurationSecs: 200, TrackNumber: 7, ProviderMeta: meta("found1")},
++				}
++			} else {
++				wantLiked = []playlist.Track{
++					{Path: "spotify:track:liked1", Title: "Liked One", Artist: "Artist A, Artist B", Album: "Album liked1", Year: 2020, DurationSecs: 200, TrackNumber: 7},
++					{Path: "spotify:track:liked2", Title: "Liked Two", Album: "Album liked2", Year: 2020, DurationSecs: 200, TrackNumber: 7, Unplayable: true},
++				}
++				wantList = []playlist.Track{
++					{Path: "spotify:track:pl1t1", Title: "In Playlist", Artist: "Solo", Album: "Album pl1t1", Year: 2020, DurationSecs: 200, TrackNumber: 7},
++				}
++				wantFound = []playlist.Track{
++					// Premium search results are unchanged (no track number).
++					{Path: "spotify:track:found1", Title: "Found", Artist: "X, Y", Album: "Album found1", Year: 2020, DurationSecs: 200},
++				}
++			}
++			for _, c := range []struct {
++				name      string
++				got, want []playlist.Track
++			}{{"liked", liked, wantLiked}, {"playlist", inList, wantList}, {"search", found, wantFound}} {
++				if !reflect.DeepEqual(c.got, c.want) {
++					t.Errorf("%s tracks =\n %#v\nwant\n %#v", c.name, c.got, c.want)
++				}
++			}
++
++			// The cache serves the second call (and in the same shape).
++			again, _ := p.Tracks("pl1")
++			if f.count("GET /v1/playlists/pl1/items") != 1 || !reflect.DeepEqual(again, wantList) {
++				t.Fatalf("cached Tracks = %#v (fetches %d)", again, f.count("GET /v1/playlists/pl1/items"))
++			}
++		})
++	}
++}
++
++// Adding a bridged track to a Spotify playlist sends its Spotify id.
++func TestAddTrackToPlaylistBridged(t *testing.T) {
++	tests := []struct {
++		name  string
++		track playlist.Track
++		want  string
++	}{
++		{"bridged track", playlist.Track{Path: "ytsearch1:Queen David Bowie Under Pressure", ProviderMeta: map[string]string{"spotify.id": "2aoo2jlRnM3A0NyLQqMN2f", "spotify.bridge": "youtube"}}, "spotify:track:2aoo2jlRnM3A0NyLQqMN2f"},
++		{"spotify track", playlist.Track{Path: "spotify:track:2aoo2jlRnM3A0NyLQqMN2f"}, "spotify:track:2aoo2jlRnM3A0NyLQqMN2f"},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			f := isolate(t)
++			f.json("POST /v1/playlists/pl1/tracks", http.StatusCreated, map[string]string{"snapshot_id": "s2"})
++			p := New(webOnlyTestSession(t, ""), "cid", 320)
++			defer p.Close()
++			if err := p.AddTrackToPlaylist(context.Background(), "pl1", tt.track); err != nil {
++				t.Fatalf("AddTrackToPlaylist: %v", err)
++			}
++			bodies := f.body("POST /v1/playlists/pl1/tracks")
++			if len(bodies) != 1 {
++				t.Fatalf("requests = %d", len(bodies))
++			}
++			var got struct {
++				URIs []string `json:"uris"`
++			}
++			if err := json.Unmarshal([]byte(bodies[0]), &got); err != nil || !slices.Equal(got.URIs, []string{tt.want}) {
++				t.Fatalf("body = %s, want uris [%s]", bodies[0], tt.want)
++			}
++		})
++	}
++}
++
++// Creating a playlist and adding a bridged track works on a web-only session
++// (the TUI's "new playlist" flow), using the remembered user id.
++func TestCreatePlaylistWebOnly(t *testing.T) {
++	f := isolate(t)
++	f.json("POST /v1/users/u9/playlists", http.StatusCreated, map[string]string{"id": "newpl"})
++	f.json("POST /v1/playlists/newpl/tracks", http.StatusCreated, map[string]string{"snapshot_id": "s1"})
++	p := New(webOnlyTestSession(t, "u9"), "cid", 320)
++	defer p.Close()
++
++	id, err := p.CreatePlaylist(context.Background(), "From cliamp")
++	if err != nil || id != "newpl" {
++		t.Fatalf("CreatePlaylist = %q, %v", id, err)
++	}
++	if f.count("GET /v1/me") != 0 {
++		t.Fatal("CreatePlaylist asked /v1/me although the user id is known")
++	}
++	bridged := spotifyTrack{id: "tid", title: "T", artists: []string{"A"}}.track(true)
++	if err := p.AddTrackToPlaylist(context.Background(), id, bridged); err != nil {
++		t.Fatal(err)
++	}
++	if b := f.body("POST /v1/playlists/newpl/tracks"); len(b) != 1 || b[0] != `{"uris":["spotify:track:tid"]}` {
++		t.Fatalf("add body = %q", b)
++	}
++}
++
++// Without a session, the provider still asks for sign-in (unchanged).
++func TestProviderWithoutCredentialsNeedsAuth(t *testing.T) {
++	isolate(t)
++	p := New(nil, "cid", 320)
++	if _, err := p.Tracks("YOUR MUSIC"); !errors.Is(err, playlist.ErrNeedsAuth) {
++		t.Fatalf("Tracks err = %v, want ErrNeedsAuth", err)
++	}
++	if got := p.PlaybackVia(); got != "" {
++		t.Fatalf("PlaybackVia = %q", got)
++	}
++}
+diff --git a/external/spotify/fake_test.go b/external/spotify/fake_test.go
+new file mode 100644
+index 0000000..92a16cc
+--- /dev/null
++++ b/external/spotify/fake_test.go
+@@ -0,0 +1,298 @@
++//go:build !windows
++
++package spotify
++
++// fake_test.go — fakes for the librespot session, the browser sign-in, the
++// accounts service and the Web API. Nothing in these tests reaches Spotify:
++// init() points every seam at a guard that fails, and each test swaps in the
++// fakes it needs via isolate().
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"path/filepath"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++
++	librespot "github.com/devgianlu/go-librespot"
++	librespotPlayer "github.com/devgianlu/go-librespot/player"
++	"golang.org/x/oauth2"
++)
++
++var errTestGuard = errors.New("test reached a real Spotify endpoint")
++
++// TestMain runs the package's tests with HOME in a temporary directory, so no
++// test (even one that forgets isolate) can read or write the user's
++// ~/.config/cliamp/spotify_credentials.json.
++func TestMain(m *testing.M) {
++	home, err := os.MkdirTemp("", "cliamp-spotify-test-")
++	if err != nil {
++		panic(err)
++	}
++	os.Setenv("HOME", home)
++	code := m.Run()
++	os.RemoveAll(home)
++	os.Exit(code)
++}
++
++func init() {
++	openStreamBackend = func(context.Context, string, any) (streamBackend, error) {
++		return nil, errTestGuard
++	}
++	authorizeInteractive = func(context.Context, string) (*oauth2.Token, error) {
++		return nil, errTestGuard
++	}
++	// Port 1 on loopback refuses at once.
++	oauthEndpoint = oauth2.Endpoint{
++		AuthURL:   "http://127.0.0.1:1/authorize",
++		TokenURL:  "http://127.0.0.1:1/api/token",
++		AuthStyle: oauth2.AuthStyleInParams,
++	}
++	webAPIBase = "http://127.0.0.1:1"
++}
++
++// fakeBackend is a streamBackend that stands in for a working librespot
++// session (a Premium account).
++type fakeBackend struct {
++	username string
++	data     []byte
++	streamFn func(librespot.SpotifyId) error
++
++	mu     sync.Mutex
++	closed bool
++}
++
++func (b *fakeBackend) Username() string          { return b.username }
++func (b *fakeBackend) StoredCredentials() []byte { return b.data }
++func (b *fakeBackend) NewStream(_ context.Context, id librespot.SpotifyId, _ int) (*librespotPlayer.Stream, error) {
++	if b.streamFn != nil {
++		return nil, b.streamFn(id)
++	}
++	return nil, errors.New("fake stream")
++}
++func (b *fakeBackend) Close() {
++	b.mu.Lock()
++	b.closed = true
++	b.mu.Unlock()
++}
++
++// backendCall records one openStreamBackend call.
++type backendCall struct {
++	devID string
++	creds any
++}
++
++// fakeSpotify is an httptest server playing both accounts.spotify.com
++// (/api/token) and api.spotify.com (/v1/...).
++type fakeSpotify struct {
++	t   *testing.T
++	srv *httptest.Server
++
++	mu       sync.Mutex
++	requests []string // "METHOD /path"
++	bodies   map[string][]string
++	routes   map[string]http.HandlerFunc // "METHOD /path" → handler
++	token    http.HandlerFunc
++}
++
++func newFakeSpotify(t *testing.T) *fakeSpotify {
++	t.Helper()
++	f := &fakeSpotify{t: t, routes: map[string]http.HandlerFunc{}, bodies: map[string][]string{}}
++	f.srv = httptest.NewServer(http.HandlerFunc(f.serve))
++	t.Cleanup(f.srv.Close)
++	return f
++}
++
++func (f *fakeSpotify) serve(w http.ResponseWriter, r *http.Request) {
++	key := r.Method + " " + r.URL.Path
++	body, _ := io.ReadAll(r.Body)
++	f.mu.Lock()
++	f.requests = append(f.requests, key)
++	f.bodies[key] = append(f.bodies[key], string(body))
++	h := f.routes[key]
++	tok := f.token
++	f.mu.Unlock()
++	r.Body = io.NopCloser(strings.NewReader(string(body)))
++	if r.URL.Path == "/api/token" {
++		if tok == nil {
++			http.Error(w, `{"error":"server_error"}`, http.StatusInternalServerError)
++			return
++		}
++		tok(w, r)
++		return
++	}
++	if h == nil {
++		http.Error(w, `{"error":{"status":404,"message":"no fake route"}}`, http.StatusNotFound)
++		return
++	}
++	h(w, r)
++}
++
++// handle registers a handler for "METHOD /path".
++func (f *fakeSpotify) handle(key string, h http.HandlerFunc) {
++	f.mu.Lock()
++	f.routes[key] = h
++	f.mu.Unlock()
++}
++
++// json registers a handler answering status with v as JSON.
++func (f *fakeSpotify) json(key string, status int, v any) {
++	f.handle(key, func(w http.ResponseWriter, _ *http.Request) {
++		w.Header().Set("Content-Type", "application/json")
++		w.WriteHeader(status)
++		_ = json.NewEncoder(w).Encode(v)
++	})
++}
++
++// refreshes answers refresh_token grants: known refresh token → access token
++// and (possibly rotated) refresh token; anything else → invalid_grant.
++func (f *fakeSpotify) refreshes(grants map[string][2]string) {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	f.token = func(w http.ResponseWriter, r *http.Request) {
++		_ = r.ParseForm()
++		w.Header().Set("Content-Type", "application/json")
++		g, ok := grants[r.PostForm.Get("refresh_token")]
++		if r.PostForm.Get("grant_type") != "refresh_token" || !ok {
++			w.WriteHeader(http.StatusBadRequest)
++			_, _ = io.WriteString(w, `{"error":"invalid_grant","error_description":"Refresh token revoked"}`)
++			return
++		}
++		_ = json.NewEncoder(w).Encode(map[string]any{
++			"access_token": g[0], "token_type": "Bearer", "expires_in": 3600, "refresh_token": g[1],
++		})
++	}
++}
++
++func (f *fakeSpotify) count(key string) int {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	n := 0
++	for _, k := range f.requests {
++		if k == key {
++			n++
++		}
++	}
++	return n
++}
++
++func (f *fakeSpotify) body(key string) []string {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	return append([]string(nil), f.bodies[key]...)
++}
++
++// isolate gives the test its own HOME (so the credentials file is a temp
++// file), points the accounts service and the Web API at a fake, and restores
++// the guards afterwards. The librespot and browser seams stay guarded unless
++// the test replaces them with setBackend / setAuthorize.
++func isolate(t *testing.T) *fakeSpotify {
++	t.Helper()
++	t.Setenv("HOME", t.TempDir())
++	f := newFakeSpotify(t)
++	oldEndpoint, oldBase := oauthEndpoint, webAPIBase
++	oauthEndpoint = oauth2.Endpoint{
++		AuthURL:   f.srv.URL + "/authorize",
++		TokenURL:  f.srv.URL + "/api/token",
++		AuthStyle: oauth2.AuthStyleInParams,
++	}
++	webAPIBase = f.srv.URL
++	t.Cleanup(func() { oauthEndpoint, webAPIBase = oldEndpoint, oldBase })
++	return f
++}
++
++// setBackend replaces openStreamBackend for the test and records its calls.
++func setBackend(t *testing.T, fn func(creds any) (streamBackend, error)) *[]backendCall {
++	t.Helper()
++	var calls []backendCall
++	var mu sync.Mutex
++	old := openStreamBackend
++	openStreamBackend = func(_ context.Context, devID string, creds any) (streamBackend, error) {
++		mu.Lock()
++		calls = append(calls, backendCall{devID: devID, creds: creds})
++		mu.Unlock()
++		return fn(creds)
++	}
++	t.Cleanup(func() { openStreamBackend = old })
++	return &calls
++}
++
++// setAuthorize replaces the browser sign-in with one returning tok.
++func setAuthorize(t *testing.T, tok *oauth2.Token) *int {
++	t.Helper()
++	n := 0
++	old := authorizeInteractive
++	authorizeInteractive = func(context.Context, string) (*oauth2.Token, error) {
++		n++
++		return tok, nil
++	}
++	t.Cleanup(func() { authorizeInteractive = old })
++	return &n
++}
++
++// signInToken is what the fake browser sign-in returns.
++func signInToken() *oauth2.Token {
++	return &oauth2.Token{
++		AccessToken:  "at-signin",
++		TokenType:    "Bearer",
++		RefreshToken: "rt-signin",
++		Expiry:       time.Now().Add(time.Hour),
++	}
++}
++
++// readCredsFile returns the credentials file as raw JSON fields (nil if absent).
++func readCredsFile(t *testing.T) map[string]any {
++	t.Helper()
++	path, err := CredsPath()
++	if err != nil {
++		t.Fatal(err)
++	}
++	data, err := os.ReadFile(path)
++	if errors.Is(err, os.ErrNotExist) {
++		return nil
++	}
++	if err != nil {
++		t.Fatal(err)
++	}
++	var m map[string]any
++	if err := json.Unmarshal(data, &m); err != nil {
++		t.Fatalf("credentials file is not JSON: %v\n%s", err, data)
++	}
++	return m
++}
++
++// writeCredsFile writes raw JSON as the credentials file.
++func writeCredsFile(t *testing.T, raw string) {
++	t.Helper()
++	path, err := CredsPath()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
++		t.Fatal(err)
++	}
++}
++
++// webOnlyTestSession builds a web-only session on the fake (token valid for
++// an hour, so no refresh unless the test asks for one).
++func webOnlyTestSession(t *testing.T, userID string) *Session {
++	t.Helper()
++	return newWebOnlySession("cid", generateDeviceID(), signInToken(), userID, "test")
++}
++
++// premiumTestSession builds a librespot-backed session on the fake.
++func premiumTestSession(t *testing.T, b streamBackend) *Session {
++	t.Helper()
++	conf := spotifyOAuthConfig("cid")
++	return &Session{stream: b, devID: generateDeviceID(), clientID: "cid", tokenSource: conf.TokenSource(context.Background(), signInToken())}
++}
+diff --git a/external/spotify/provider.go b/external/spotify/provider.go
+index 3de77db..5ddaf65 100644
+--- a/external/spotify/provider.go
++++ b/external/spotify/provider.go
+@@ -79,7 +79,7 @@ func playlistAccessible(item spotifyPlaylistItem, userID string) bool {
+ // allowing us to skip re-fetching playlists that haven't changed.
+ type playlistCache struct {
+ 	snapshotID string
+-	tracks     []playlist.Track
++	tracks     []spotifyTrack // converted per session mode by presentTracks
+ }
+ 
+ type SpotifyProvider struct {
+@@ -91,6 +91,7 @@ type SpotifyProvider struct {
+ 	mu         sync.Mutex
+ 	trackCache map[string]*playlistCache // playlist ID → cache entry
+ 	authCancel context.CancelFunc        // cancels any in-progress OAuth flow
++	restoring  *sessionRestore           // silent restore in flight (ensureSession), nil if none
+ 
+ 	// Playlist list cache to avoid redundant API calls on provider switch.
+ 	listCache   []playlist.PlaylistInfo
+@@ -111,36 +112,79 @@ func New(session *Session, clientID string, bitrate int) *SpotifyProvider {
+ 	}
+ }
+ 
++// sessionRestore is one silent session restore, shared by every caller that
++// arrives while it runs.
++type sessionRestore struct {
++	done chan struct{}
++	err  error // valid once done is closed
++}
++
+ // ensureSession tries to create a session using stored credentials only
+ // (no browser). Returns playlist.ErrNeedsAuth if interactive sign-in is needed.
++//
++// Concurrent first calls (the GUI's catalog workers, the TUI) share one
++// restore: each restore refreshes the stored refresh token, and once Spotify
++// has rotated it a second refresh of the same token is refused, which used to
++// clear the credentials that the first restore had just saved.
+ func (p *SpotifyProvider) ensureSession() error {
+ 	p.mu.Lock()
+ 	if p.session != nil {
+ 		p.mu.Unlock()
+ 		return nil
+ 	}
++	if r := p.restoring; r != nil {
++		p.mu.Unlock()
++		<-r.done
++		return r.err
++	}
+ 	clientID := p.clientID
+-	p.mu.Unlock()
+-
+ 	if clientID == "" {
++		p.mu.Unlock()
+ 		return fmt.Errorf("spotify: no client ID available")
+ 	}
++	r := &sessionRestore{done: make(chan struct{})}
++	p.restoring = r
++	p.mu.Unlock()
++	return p.restore(r, clientID)
++}
++
++// restore runs the silent restore r and hands its result to its waiters.
++func (p *SpotifyProvider) restore(r *sessionRestore, clientID string) error {
++	var sess *Session
++	r.err = playlist.ErrNeedsAuth // unless NewSessionSilent succeeds (also on panic)
++	defer func() {
++		p.mu.Lock()
++		p.restoring = nil
++		if r.err == nil {
++			p.session = sess
++			p.resetSessionScopedStateLocked()
++		}
++		p.mu.Unlock()
++		close(r.done)
++	}()
+ 	sess, err := NewSessionSilent(context.Background(), clientID)
+-	if err != nil {
+-		return playlist.ErrNeedsAuth
++	if err == nil {
++		r.err = nil
+ 	}
+-	p.mu.Lock()
+-	p.session = sess
+-	p.resetSessionScopedStateLocked()
+-	p.mu.Unlock()
+-	return nil
++	return r.err
+ }
+ 
+ // Authenticate runs the interactive sign-in flow (opens browser, waits for callback).
+ // Any previous in-progress OAuth flow is cancelled first to free the callback port.
++//
++// It does nothing while a session is working. A web-only session whose
++// refresh token Spotify has refused for good is replaced.
+ func (p *SpotifyProvider) Authenticate() error {
+ 	p.mu.Lock()
+-	if p.session != nil {
++	// A silent restore in flight may still succeed, and it must not race a
++	// restore of the same stored token inside NewSession: wait for it.
++	for p.restoring != nil {
++		r := p.restoring
++		p.mu.Unlock()
++		<-r.done
++		p.mu.Lock()
++	}
++	if p.session != nil && !p.session.signInRequired() {
+ 		p.mu.Unlock()
+ 		return nil
+ 	}
+@@ -213,13 +257,24 @@ func (p *SpotifyProvider) currentUserID(ctx context.Context) string {
+ 		p.mu.Unlock()
+ 		return id
+ 	}
++	sess := p.session
+ 	p.mu.Unlock()
+ 
+ 	var me struct {
+ 		ID string `json:"id"`
+ 	}
+-	if resp, err := p.webAPI(ctx, "GET", "/v1/me", nil); err == nil {
+-		_ = decodeBody(resp, &me)
++	// A web-only session remembers the id across launches (saves a call
++	// while the Web API is rate limiting).
++	if sess != nil {
++		me.ID = sess.UserID()
++	}
++	if me.ID == "" {
++		if resp, err := p.webAPI(ctx, "GET", "/v1/me", nil); err == nil {
++			_ = decodeBody(resp, &me)
++		}
++		if sess != nil {
++			sess.rememberUserID(me.ID)
++		}
+ 	}
+ 
+ 	p.mu.Lock()
+@@ -361,7 +416,8 @@ func (p *SpotifyProvider) Playlists() ([]playlist.PlaylistInfo, error) {
+ }
+ 
+ // Tracks returns all tracks for the given Spotify playlist ID.
+-// Track.Path is set to a spotify:track:<id> URI for the player to resolve.
++// Track.Path is set to a spotify:track:<id> URI for the player to resolve,
++// or, for a web-only session, to a YouTube bridge (bridge.go).
+ // Results are cached by snapshot_id; unchanged playlists skip the API call.
+ func (p *SpotifyProvider) Tracks(playlistID string) ([]playlist.Track, error) {
+ 	if err := p.ensureSession(); err != nil {
+@@ -372,7 +428,7 @@ func (p *SpotifyProvider) Tracks(playlistID string) ([]playlist.Track, error) {
+ 	if cached, ok := p.trackCache[playlistID]; ok && cached.tracks != nil {
+ 		tracks := cached.tracks
+ 		p.mu.Unlock()
+-		return tracks, nil
++		return p.presentTracks(tracks), nil
+ 	}
+ 	p.mu.Unlock()
+ 
+@@ -397,7 +453,7 @@ func (p *SpotifyProvider) Tracks(playlistID string) ([]playlist.Track, error) {
+ 		} `json:"restrictions"`
+ 	}
+ 
+-	var all []playlist.Track
++	var all []spotifyTrack
+ 	offset := 0
+ 	limit := spotifyTrackPageSize
+ 
+@@ -462,16 +518,15 @@ func (p *SpotifyProvider) Tracks(playlistID string) ([]playlist.Track, error) {
+ 				}
+ 			}
+ 
+-			all = append(all, playlist.Track{
+-				Path:         fmt.Sprintf("spotify:track:%s", t.ID),
+-				Title:        t.Name,
+-				Artist:       strings.Join(artists, ", "),
+-				Album:        t.Album.Name,
+-				Year:         year,
+-				Stream:       false, // must be false: true causes togglePlayPause to stop+restart instead of pause/resume
+-				DurationSecs: t.DurationMs / 1000,
+-				TrackNumber:  t.TrackNumber,
+-				Unplayable:   (t.IsPlayable != nil && !*t.IsPlayable) || t.Restrictions.Reason != "",
++			all = append(all, spotifyTrack{
++				id:           t.ID,
++				title:        t.Name,
++				artists:      artists,
++				album:        t.Album.Name,
++				year:         year,
++				durationSecs: t.DurationMs / 1000,
++				trackNumber:  t.TrackNumber,
++				unplayable:   (t.IsPlayable != nil && !*t.IsPlayable) || t.Restrictions.Reason != "",
+ 			})
+ 		}
+ 
+@@ -490,7 +545,7 @@ func (p *SpotifyProvider) Tracks(playlistID string) ([]playlist.Track, error) {
+ 	}
+ 	p.mu.Unlock()
+ 
+-	return all, nil
++	return p.presentTracks(all), nil
+ }
+ 
+ // isAuthError returns true if the error is an authentication/session-related
+@@ -532,6 +587,11 @@ func (p *SpotifyProvider) NewStreamer(uri string) (beep.StreamSeekCloser, beep.F
+ 	if err := p.ensureSession(); err != nil {
+ 		return nil, beep.Format{}, 0, err
+ 	}
++	// Web-only: nothing to stream from (and not a sign-in problem, so no
++	// reconnect and no ErrNeedsAuth).
++	if p.webOnly() {
++		return nil, beep.Format{}, 0, ErrStreamingUnavailable
++	}
+ 	spotID, err := librespot.SpotifyIdFromUri(uri)
+ 	if err != nil {
+ 		return nil, beep.Format{}, 0, fmt.Errorf("spotify: invalid URI %q: %w", uri, err)
+@@ -588,7 +648,9 @@ func (p *SpotifyProvider) webAPI(ctx context.Context, method, path string, query
+ 
+ // webAPIWithBody is like webAPI but accepts an optional request body, content type,
+ // and a set of acceptable HTTP status codes (e.g. 200, 201). Retries 429 with
+-// exponential backoff (honoring Retry-After when present).
++// exponential backoff (honoring Retry-After when present), waiting at most
++// maxRateLimitWait each time; a longer Retry-After fails at once with a
++// *RateLimitError (ratelimit.go).
+ func (p *SpotifyProvider) webAPIWithBody(ctx context.Context, method, path string, query url.Values, body io.Reader, contentType string, acceptStatus ...int) (*http.Response, error) {
+ 	const maxRetries = 8
+ 
+@@ -614,19 +676,16 @@ func (p *SpotifyProvider) webAPIWithBody(ctx context.Context, method, path strin
+ 		}
+ 		if resp.StatusCode == http.StatusTooManyRequests {
+ 			resp.Body.Close()
+-			wait := time.Duration(1<<uint(attempt)) * time.Second
+-			if ra := resp.Header.Get("Retry-After"); ra != "" {
+-				if secs, err := strconv.Atoi(ra); err == nil && secs > 0 {
+-					wait = time.Duration(secs) * time.Second
+-				}
++			wait, err := rateLimitWait(resp.Header, attempt, time.Now())
++			if err != nil {
++				applog.UserWarn("spotify: web api rate-limited on %s; not retrying: %v", path, err)
++				return nil, err
+ 			}
+ 			applog.UserWarn("spotify: web api rate-limited on %s, retrying in %v (attempt %d/%d)", path, wait, attempt+1, maxRetries)
+-			select {
+-			case <-ctx.Done():
+-				return nil, ctx.Err()
+-			case <-time.After(wait):
+-				continue
++			if err := rateLimitSleep(ctx, wait); err != nil {
++				return nil, err
+ 			}
++			continue
+ 		}
+ 
+ 		ok := slices.Contains(acceptStatus, resp.StatusCode)
+@@ -697,7 +756,8 @@ func (p *SpotifyProvider) SearchTracks(ctx context.Context, query string, limit
+ 					Name        string `json:"name"`
+ 					ReleaseDate string `json:"release_date"`
+ 				} `json:"album"`
+-				DurationMs int `json:"duration_ms"`
++				DurationMs  int `json:"duration_ms"`
++				TrackNumber int `json:"track_number"`
+ 			} `json:"items"`
+ 		} `json:"tracks"`
+ 	}
+@@ -705,7 +765,7 @@ func (p *SpotifyProvider) SearchTracks(ctx context.Context, query string, limit
+ 		return nil, fmt.Errorf("spotify: parse search: %w", err)
+ 	}
+ 
+-	var tracks []playlist.Track
++	var tracks []spotifyTrack
+ 	for _, t := range result.Tracks.Items {
+ 		if t.ID == "" {
+ 			continue
+@@ -720,23 +780,26 @@ func (p *SpotifyProvider) SearchTracks(ctx context.Context, query string, limit
+ 				year = y
+ 			}
+ 		}
+-		tracks = append(tracks, playlist.Track{
+-			Path:         fmt.Sprintf("spotify:track:%s", t.ID),
+-			Title:        t.Name,
+-			Artist:       strings.Join(artists, ", "),
+-			Album:        t.Album.Name,
+-			Year:         year,
+-			DurationSecs: t.DurationMs / 1000,
++		tracks = append(tracks, spotifyTrack{
++			id:           t.ID,
++			title:        t.Name,
++			artists:      artists,
++			album:        t.Album.Name,
++			year:         year,
++			durationSecs: t.DurationMs / 1000,
++			trackNumber:  t.TrackNumber,
++			fromSearch:   true,
+ 		})
+ 	}
+-	return tracks, nil
++	return p.presentTracks(tracks), nil
+ }
+ 
+ // AddTrackToPlaylist adds a track to an existing Spotify playlist.
+-// The track's Path is used as the Spotify URI (e.g. "spotify:track:xxx").
++// The track's Path is used as the Spotify URI (e.g. "spotify:track:xxx"); a
++// YouTube-bridged track uses the id in its "spotify.id" meta instead.
+ // Implements provider.PlaylistWriter.
+ func (p *SpotifyProvider) AddTrackToPlaylist(ctx context.Context, playlistID string, track playlist.Track) error {
+-	trackURI := track.Path
++	trackURI := spotifyTrackURI(track)
+ 	if err := p.ensureSession(); err != nil {
+ 		return err
+ 	}
+diff --git a/external/spotify/ratelimit.go b/external/spotify/ratelimit.go
+new file mode 100644
+index 0000000..cccd64c
+--- /dev/null
++++ b/external/spotify/ratelimit.go
+@@ -0,0 +1,87 @@
++//go:build !windows
++
++package spotify
++
++// ratelimit.go — waiting on the Web API's 429 without parking for hours.
++//
++// Spotify answers 429 with Retry-After. For the shared client ID it has asked
++// for 86400 s; honouring that parked the caller (and the GUI's IPC request)
++// for a day. Short waits are still retried; anything longer than
++// maxRateLimitWait fails at once with a RateLimitError.
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"math"
++	"net/http"
++	"strconv"
++	"time"
++)
++
++// maxRateLimitWait caps one wait between retries of a rate-limited call.
++const maxRateLimitWait = 30 * time.Second
++
++// RateLimitError is returned when Spotify asks to wait longer than
++// maxRateLimitWait before retrying.
++type RateLimitError struct {
++	RetryAfter time.Duration
++}
++
++func (e *RateLimitError) Error() string {
++	return fmt.Sprintf("spotify: rate limited by Spotify; retry after %v", e.RetryAfter)
++}
++
++// rateLimitWait returns how long to wait before retrying after the attempt-th
++// (0-based) 429 with header h: Retry-After when given (seconds or an HTTP
++// date), else exponential backoff capped at maxRateLimitWait. It returns a
++// *RateLimitError instead when Retry-After exceeds maxRateLimitWait.
++func rateLimitWait(h http.Header, attempt int, now time.Time) (time.Duration, error) {
++	wait := min(time.Duration(1)<<min(attempt, 30)*time.Second, maxRateLimitWait)
++	ra := h.Get("Retry-After")
++	if ra == "" {
++		return wait, nil
++	}
++	var asked time.Duration
++	// A number too large for an int is still a request to wait (Atoi then
++	// returns the clamped value with ErrRange).
++	if secs, err := strconv.Atoi(ra); err == nil || errors.Is(err, strconv.ErrRange) {
++		if secs <= 0 {
++			return wait, nil
++		}
++		asked = secondsDuration(secs)
++	} else if at, err := http.ParseTime(ra); err == nil {
++		asked = at.Sub(now).Round(time.Second)
++		if asked <= 0 {
++			return wait, nil
++		}
++	} else {
++		return wait, nil
++	}
++	if asked > maxRateLimitWait {
++		return 0, &RateLimitError{RetryAfter: asked}
++	}
++	return asked, nil
++}
++
++// secondsDuration converts secs to a Duration, saturating at the largest
++// Duration instead of overflowing (Retry-After: 9223372037 would otherwise
++// turn negative and be retried at once).
++func secondsDuration(secs int) time.Duration {
++	if int64(secs) > math.MaxInt64/int64(time.Second) {
++		return time.Duration(math.MaxInt64)
++	}
++	return time.Duration(secs) * time.Second
++}
++
++// rateLimitSleep waits d or until ctx ends.
++func rateLimitSleep(ctx context.Context, d time.Duration) error {
++	timer := time.NewTimer(d)
++	defer timer.Stop()
++	select {
++	case <-ctx.Done():
++		return ctx.Err()
++	case <-timer.C:
++		return nil
++	}
++}
+diff --git a/external/spotify/ratelimit_test.go b/external/spotify/ratelimit_test.go
+new file mode 100644
+index 0000000..0b1504c
+--- /dev/null
++++ b/external/spotify/ratelimit_test.go
+@@ -0,0 +1,152 @@
++//go:build !windows
++
++package spotify
++
++import (
++	"context"
++	"errors"
++	"net/http"
++	"strings"
++	"sync/atomic"
++	"testing"
++	"time"
++)
++
++func TestRateLimitWait(t *testing.T) {
++	now := time.Date(2026, 9, 26, 12, 0, 0, 0, time.UTC)
++	tests := []struct {
++		name       string
++		retryAfter string
++		attempt    int
++		want       time.Duration
++		wantErr    string
++	}{
++		{"no header: backoff 1s", "", 0, time.Second, ""},
++		{"no header: backoff 16s", "", 4, 16 * time.Second, ""},
++		{"no header: backoff capped", "", 7, 30 * time.Second, ""},
++		{"no header: huge attempt capped", "", 62, 30 * time.Second, ""},
++		{"short Retry-After is honoured", "2", 0, 2 * time.Second, ""},
++		{"Retry-After at the cap", "30", 5, 30 * time.Second, ""},
++		{"Retry-After over the cap fails", "31", 0, 0, "spotify: rate limited by Spotify; retry after 31s"},
++		{"a day fails", "86400", 0, 0, "spotify: rate limited by Spotify; retry after 24h0m0s"},
++		{"HTTP date within the cap", now.Add(10 * time.Second).Format(http.TimeFormat), 0, 10 * time.Second, ""},
++		{"HTTP date an hour away fails", now.Add(time.Hour).Format(http.TimeFormat), 0, 0, "retry after 1h0m0s"},
++		{"zero falls back to backoff", "0", 1, 2 * time.Second, ""},
++		{"garbage falls back to backoff", "soon", 2, 4 * time.Second, ""},
++		// Seconds whose Duration would overflow int64 still fail at once
++		// (they used to wrap to a negative or tiny wait and be retried).
++		{"overflowing to negative fails", "9223372037", 0, 0, "retry after 2562047h47m16.854775807s"},
++		{"overflowing to a small wait fails", "18446744074", 0, 0, "retry after 2562047h47m16.854775807s"},
++		{"MaxInt64 seconds fails", "9223372036854775807", 0, 0, "retry after 2562047h47m16.854775807s"},
++		{"beyond int fails", "99999999999999999999", 0, 0, "retry after 2562047h47m16.854775807s"},
++		{"largest exact Duration", "9223372036", 0, 0, "retry after 2562047h47m16s"},
++		{"negative beyond int falls back to backoff", "-99999999999999999999", 3, 8 * time.Second, ""},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			h := http.Header{}
++			if tt.retryAfter != "" {
++				h.Set("Retry-After", tt.retryAfter)
++			}
++			got, err := rateLimitWait(h, tt.attempt, now)
++			if tt.wantErr != "" {
++				var rl *RateLimitError
++				if !errors.As(err, &rl) || !strings.Contains(err.Error(), tt.wantErr) {
++					t.Fatalf("err = %v, want RateLimitError %q", err, tt.wantErr)
++				}
++				return
++			}
++			if err != nil || got != tt.want {
++				t.Fatalf("rateLimitWait = %v, %v; want %v", got, err, tt.want)
++			}
++		})
++	}
++}
++
++// End to end through the provider, with real waits: a day-long Retry-After
++// fails at once; a 2-second one is waited out and retried.
++func TestWebAPIRateLimit(t *testing.T) {
++	tests := []struct {
++		name       string
++		retryAfter string
++		wantErr    string
++		wantCalls  int
++		maxElapsed time.Duration
++		minElapsed time.Duration
++	}{
++		{"Retry-After 86400 fails fast", "86400", "spotify: rate limited by Spotify; retry after 24h0m0s", 1, 2 * time.Second, 0},
++		{"Retry-After 2 is retried", "2", "", 2, 10 * time.Second, 2 * time.Second},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			f := isolate(t)
++			var calls atomic.Int32
++			f.handle("GET /v1/me/playlists", func(w http.ResponseWriter, _ *http.Request) {
++				if calls.Add(1) == 1 {
++					w.Header().Set("Retry-After", tt.retryAfter)
++					w.WriteHeader(http.StatusTooManyRequests)
++					return
++				}
++				w.Header().Set("Content-Type", "application/json")
++				_, _ = w.Write([]byte(`{"items":[],"total":0}`))
++			})
++			p := New(webOnlyTestSession(t, ""), "cid", 320)
++			defer p.Close()
++
++			// A broken cap would park here; the deadline turns that into a failure.
++			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
++			defer cancel()
++			start := time.Now()
++			resp, err := p.webAPI(ctx, "GET", "/v1/me/playlists", nil)
++			elapsed := time.Since(start)
++			if resp != nil {
++				resp.Body.Close()
++			}
++			if tt.wantErr != "" {
++				var rl *RateLimitError
++				if !errors.As(err, &rl) || err.Error() != tt.wantErr {
++					t.Fatalf("err = %v, want %q", err, tt.wantErr)
++				}
++				if rl.RetryAfter != 24*time.Hour {
++					t.Fatalf("RetryAfter = %v", rl.RetryAfter)
++				}
++			} else if err != nil {
++				t.Fatalf("webAPI: %v", err)
++			}
++			if n := int(calls.Load()); n != tt.wantCalls {
++				t.Fatalf("requests = %d, want %d", n, tt.wantCalls)
++			}
++			if elapsed > tt.maxElapsed || elapsed < tt.minElapsed {
++				t.Fatalf("took %v, want between %v and %v", elapsed, tt.minElapsed, tt.maxElapsed)
++			}
++		})
++	}
++}
++
++// The rate-limit error reaches the catalog's callers (Playlists) intact.
++func TestPlaylistsRateLimited(t *testing.T) {
++	f := isolate(t)
++	f.handle("GET /v1/me", func(w http.ResponseWriter, _ *http.Request) {
++		w.Header().Set("Retry-After", "86400")
++		w.WriteHeader(http.StatusTooManyRequests)
++	})
++	f.handle("GET /v1/me/tracks", func(w http.ResponseWriter, _ *http.Request) {
++		w.Header().Set("Retry-After", "86400")
++		w.WriteHeader(http.StatusTooManyRequests)
++	})
++	p := New(webOnlyTestSession(t, ""), "cid", 320)
++	defer p.Close()
++	done := make(chan error, 1)
++	go func() {
++		_, err := p.Playlists()
++		done <- err
++	}()
++	select {
++	case err := <-done:
++		if err == nil || !strings.Contains(err.Error(), "rate limited by Spotify; retry after 24h0m0s") {
++			t.Fatalf("Playlists err = %v", err)
++		}
++	case <-time.After(5 * time.Second):
++		t.Fatal("Playlists is still waiting on Retry-After: 86400")
++	}
++}
+diff --git a/external/spotify/restore_test.go b/external/spotify/restore_test.go
+new file mode 100644
+index 0000000..93ff178
+--- /dev/null
++++ b/external/spotify/restore_test.go
+@@ -0,0 +1,360 @@
++//go:build !windows
++
++package spotify
++
++// restore_test.go — restoring a stored session when several callers arrive at
++// once, and refresh tokens that Spotify refuses for good.
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"net/http"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++
++	login5pb "github.com/devgianlu/go-librespot/proto/spotify/login5/v3"
++	"golang.org/x/oauth2"
++
++	"cliamp/playlist"
++)
++
++// rotation is a fake accounts service whose refresh tokens are single use,
++// the premise savingTokenSource is built on: the current rt-N answers
++// at-(N+1) / rt-(N+1) once; a used or unknown token gets invalid_grant.
++//
++// The first refresh is held until a second one arrives (or hold passes), so a
++// duplicate refresh of the same stored token reliably overlaps with it.
++type rotation struct {
++	mu       sync.Mutex
++	current  string
++	n        int
++	requests int
++	second   chan struct{}
++}
++
++func (f *fakeSpotify) rotatingRefreshes(first string, hold time.Duration) *rotation {
++	r := &rotation{current: first, second: make(chan struct{})}
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	f.token = func(w http.ResponseWriter, req *http.Request) {
++		_ = req.ParseForm()
++		r.mu.Lock()
++		r.requests++
++		nth := r.requests
++		if nth == 2 {
++			close(r.second)
++		}
++		r.mu.Unlock()
++		if nth == 1 {
++			select {
++			case <-r.second:
++			case <-time.After(hold):
++			}
++		}
++		r.mu.Lock()
++		defer r.mu.Unlock()
++		w.Header().Set("Content-Type", "application/json")
++		if req.PostForm.Get("grant_type") != "refresh_token" || req.PostForm.Get("refresh_token") != r.current {
++			w.WriteHeader(http.StatusBadRequest)
++			_, _ = io.WriteString(w, `{"error":"invalid_grant","error_description":"Refresh token revoked"}`)
++			return
++		}
++		r.n++
++		r.current = fmt.Sprintf("rt-%d", r.n)
++		_ = json.NewEncoder(w).Encode(map[string]any{
++			"access_token": fmt.Sprintf("at-%d", r.n), "token_type": "Bearer", "expires_in": 3600, "refresh_token": r.current,
++		})
++	}
++	return r
++}
++
++func (r *rotation) state() (current string, requests int) {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	return r.current, r.requests
++}
++
++// firstUseConcurrently runs the GUI's catalog calls on a fresh provider at
++// once (the GUI has up to four workers) and returns their errors.
++func firstUseConcurrently(p *SpotifyProvider) []error {
++	calls := []func() error{
++		func() error { _, err := p.Playlists(); return err },
++		func() error { _, err := p.Tracks("YOUR MUSIC"); return err },
++		func() error { _, err := p.Tracks("pl1"); return err },
++		func() error { _, err := p.SearchTracks(context.Background(), "q", 5); return err },
++	}
++	errs := make([]error, len(calls))
++	var wg sync.WaitGroup
++	for i, call := range calls {
++		wg.Go(func() { errs[i] = call() })
++	}
++	wg.Wait()
++	return errs
++}
++
++// Concurrent first calls restore the stored session once: one refresh of the
++// stored token, nobody is asked to sign in, and the rotated token stays on
++// disk for the next launch.
++func TestConcurrentFirstUseRestoresOnce(t *testing.T) {
++	t.Run("web-only", func(t *testing.T) {
++		f := isolate(t)
++		fakeLibrary(f)
++		rot := f.rotatingRefreshes("rt-0", 300*time.Millisecond)
++		writeCredsFile(t, `{"refresh_token":"rt-0","web_only":true}`)
++
++		p := New(nil, "cid", 320)
++		defer p.Close()
++		for i, err := range firstUseConcurrently(p) {
++			if err != nil {
++				t.Errorf("call %d: %v", i, err)
++			}
++		}
++		current, requests := rot.state()
++		if requests != 1 {
++			t.Errorf("refreshes of the stored token = %d, want 1", requests)
++		}
++		if got := readCredsFile(t); got["refresh_token"] != current || got["web_only"] != true {
++			t.Fatalf("stored credentials = %v, want refresh_token %s", got, current)
++		}
++		if p.PlaybackVia() != PlaybackYouTube {
++			t.Fatal("provider is not web-only")
++		}
++	})
++	t.Run("premium", func(t *testing.T) {
++		f := isolate(t)
++		fakeLibrary(f)
++		rot := f.rotatingRefreshes("rt-0", 300*time.Millisecond)
++		backend := &fakeBackend{username: "u", data: []byte("blob")}
++		calls := setBackend(t, func(any) (streamBackend, error) { return backend, nil })
++		writeCredsFile(t, `{"username":"u","data":"YmxvYg==","device_id":"00112233445566778899aabbccddeeff00112233","refresh_token":"rt-0"}`)
++
++		p := New(nil, "cid", 320)
++		defer p.Close()
++		for i, err := range firstUseConcurrently(p) {
++			if err != nil {
++				t.Errorf("call %d: %v", i, err)
++			}
++		}
++		current, requests := rot.state()
++		if requests != 1 || len(*calls) != 1 {
++			t.Errorf("refreshes = %d, librespot sessions = %d, want 1 and 1", requests, len(*calls))
++		}
++		if got := readCredsFile(t); got["refresh_token"] != current || got["username"] != "u" {
++			t.Fatalf("stored credentials = %v, want refresh_token %s", got, current)
++		}
++	})
++}
++
++// Two restores that bypass the provider (a sign-in racing a silent restore)
++// take turns on the file: the second refreshes the token the first stored
++// instead of the one it read before, and nothing is deleted.
++func TestWebOnlyRestoresTakeTurns(t *testing.T) {
++	f := isolate(t)
++	rot := f.rotatingRefreshes("rt-0", 300*time.Millisecond)
++	writeCredsFile(t, `{"refresh_token":"rt-0","web_only":true,"user_id":"u1"}`)
++
++	sessions := make([]*Session, 2)
++	errs := make([]error, 2)
++	var wg sync.WaitGroup
++	for i := range 2 {
++		wg.Go(func() { sessions[i], errs[i] = NewSessionSilent(context.Background(), "cid") })
++	}
++	wg.Wait()
++	for i, err := range errs {
++		if err != nil {
++			t.Fatalf("restore %d: %v", i, err)
++		}
++		if !sessions[i].WebOnly() || sessions[i].UserID() != "u1" {
++			t.Fatalf("restore %d: webOnly=%v userID=%q", i, sessions[i].WebOnly(), sessions[i].UserID())
++		}
++	}
++	current, requests := rot.state()
++	if requests != 2 || current != "rt-2" {
++		t.Fatalf("refreshes = %d, current token %s; want 2 and rt-2", requests, current)
++	}
++	if got := readCredsFile(t); got["refresh_token"] != "rt-2" || got["user_id"] != "u1" {
++		t.Fatalf("stored credentials = %v", got)
++	}
++}
++
++// A restore handed credentials that another restore has since rotated uses
++// the file's newer token, and a refusal of an outdated token never deletes
++// the newer one.
++func TestWebOnlyRestoreUsesStoredToken(t *testing.T) {
++	f := isolate(t)
++	f.refreshes(map[string][2]string{"rt-new": {"at-1", "rt-newer"}}) // rt-old: invalid_grant
++	writeCredsFile(t, `{"refresh_token":"rt-new","web_only":true}`)
++
++	s, err := newWebOnlyFromStored("cid", &storedCreds{RefreshToken: "rt-old", WebOnly: true})
++	if err != nil {
++		t.Fatalf("newWebOnlyFromStored: %v", err)
++	}
++	if tok, err := s.tokenSource.Token(); err != nil || tok.AccessToken != "at-1" {
++		t.Fatalf("token = %v, %v", tok, err)
++	}
++	if got := readCredsFile(t)["refresh_token"]; got != "rt-newer" {
++		t.Fatalf("stored refresh token = %v, want rt-newer", got)
++	}
++}
++
++// refreshFailure answers every refresh with status and body.
++func refreshFailure(f *fakeSpotify, status int, body string, header map[string]string) {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	f.token = func(w http.ResponseWriter, _ *http.Request) {
++		w.Header().Set("Content-Type", "application/json")
++		for k, v := range header {
++			w.Header().Set(k, v)
++		}
++		w.WriteHeader(status)
++		_, _ = io.WriteString(w, body)
++	}
++}
++
++// Refresh failures at restore: Spotify refusing the token or the client for
++// good clears the web-only credentials and asks for sign-in; outages and rate
++// limits keep them and retry on the next Web API call.
++func TestWebOnlyRestoreRefreshFailures(t *testing.T) {
++	tests := []struct {
++		name      string
++		status    int
++		body      string
++		header    map[string]string
++		permanent bool
++	}{
++		{"invalid_grant", 400, `{"error":"invalid_grant","error_description":"Refresh token revoked"}`, nil, true},
++		{"invalid_client (app deleted or client_id changed)", 400, `{"error":"invalid_client","error_description":"Invalid client"}`, nil, true},
++		{"invalid_client as 401", 401, `{"error":"invalid_client","error_description":"Invalid client secret"}`, nil, true},
++		{"unauthorized_client", 400, `{"error":"unauthorized_client"}`, nil, true},
++		{"invalid_request", 400, `{"error":"invalid_request","error_description":"code_verifier required"}`, nil, true},
++		{"403 without a JSON error", 403, `forbidden`, nil, true},
++		{"server error", 500, `{"error":"server_error"}`, nil, false},
++		{"service unavailable", 503, `<html>down</html>`, nil, false},
++		{"rate limited", 429, `{"error":"rate_limited"}`, map[string]string{"Retry-After": "30"}, false},
++		{"request timeout", 408, ``, nil, false},
++		{"temporarily_unavailable as 400", 400, `{"error":"temporarily_unavailable"}`, nil, false},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			f := isolate(t)
++			refreshFailure(f, tt.status, tt.body, tt.header)
++			writeCredsFile(t, `{"refresh_token":"rt-1","web_only":true,"user_id":"u1"}`)
++
++			s, err := NewSessionSilent(context.Background(), "cid")
++			if tt.permanent {
++				if !errors.Is(err, playlist.ErrNeedsAuth) {
++					t.Fatalf("err = %v, want ErrNeedsAuth", err)
++				}
++				if got := readCredsFile(t); got != nil {
++					t.Fatalf("credentials not cleared: %v", got)
++				}
++				// The provider asks for sign-in and is not web-only.
++				writeCredsFile(t, `{"refresh_token":"rt-1","web_only":true,"user_id":"u1"}`)
++				p := New(nil, "cid", 320)
++				if _, err := p.Playlists(); !errors.Is(err, playlist.ErrNeedsAuth) {
++					t.Fatalf("Playlists err = %v, want ErrNeedsAuth", err)
++				}
++				if p.PlaybackVia() != "" {
++					t.Fatal("PlaybackVia reports youtube without a session")
++				}
++				return
++			}
++			if err != nil {
++				t.Fatalf("NewSessionSilent: %v", err)
++			}
++			defer s.Close()
++			if !s.WebOnly() {
++				t.Fatal("not web-only")
++			}
++			if got := readCredsFile(t); got["refresh_token"] != "rt-1" || got["web_only"] != true {
++				t.Fatalf("stored credentials = %v", got)
++			}
++		})
++	}
++	t.Run("network error", func(t *testing.T) {
++		isolate(t)
++		oldEndpoint := oauthEndpoint
++		oauthEndpoint.TokenURL = "http://127.0.0.1:1/api/token" // refused at once
++		t.Cleanup(func() { oauthEndpoint = oldEndpoint })
++		writeCredsFile(t, `{"refresh_token":"rt-1","web_only":true}`)
++		s, err := NewSessionSilent(context.Background(), "cid")
++		if err != nil {
++			t.Fatalf("NewSessionSilent: %v", err)
++		}
++		defer s.Close()
++		if got := readCredsFile(t); got["refresh_token"] != "rt-1" {
++			t.Fatalf("stored credentials = %v", got)
++		}
++	})
++}
++
++// A web-only session whose refresh Spotify refuses for good later in the run
++// (e.g. it was restored during an outage, then the app turned out deleted)
++// asks for sign-in, and signing in replaces it. Premium sessions keep
++// returning the refresh error as before.
++func TestWebOnlyRefreshRefusedMidSession(t *testing.T) {
++	expired := &oauth2.Token{AccessToken: "at-old", TokenType: "Bearer", RefreshToken: "rt-1", Expiry: time.Now().Add(-time.Hour)}
++
++	t.Run("web-only", func(t *testing.T) {
++		f := isolate(t)
++		fakeLibrary(f)
++		refreshFailure(f, 400, `{"error":"invalid_client","error_description":"Invalid client"}`, nil)
++		p := New(newWebOnlySession("cid", generateDeviceID(), expired, "u1", "test"), "cid", 320)
++		defer p.Close()
++
++		_, err := p.Playlists()
++		if !errors.Is(err, playlist.ErrNeedsAuth) || !strings.Contains(err.Error(), "invalid_client") {
++			t.Fatalf("Playlists err = %v, want ErrNeedsAuth mentioning invalid_client", err)
++		}
++
++		// Signing in (the TUI's overlay) now runs instead of returning at once.
++		signIns := setAuthorize(t, signInToken())
++		setBackend(t, func(any) (streamBackend, error) { return nil, login5Err(login5pb.LoginError_INVALID_CREDENTIALS) })
++		if err := p.Authenticate(); err != nil {
++			t.Fatalf("Authenticate: %v", err)
++		}
++		if *signIns != 1 {
++			t.Fatalf("sign-ins = %d, want 1", *signIns)
++		}
++		if lists, err := p.Playlists(); err != nil || len(lists) != 2 {
++			t.Fatalf("Playlists after sign-in = %v, %v", lists, err)
++		}
++		if got := readCredsFile(t); got["refresh_token"] != "rt-signin" || got["web_only"] != true {
++			t.Fatalf("stored credentials = %v", got)
++		}
++		// A healthy session is not replaced by another sign-in.
++		if err := p.Authenticate(); err != nil || *signIns != 1 {
++			t.Fatalf("second Authenticate: %v, sign-ins = %d", err, *signIns)
++		}
++	})
++	t.Run("transient failure is not a sign-in prompt", func(t *testing.T) {
++		f := isolate(t)
++		refreshFailure(f, 503, `down`, nil)
++		s := newWebOnlySession("cid", generateDeviceID(), expired, "u1", "test")
++		_, err := s.webApiWithBody(context.Background(), "GET", "/v1/me", nil, nil, "")
++		if err == nil || errors.Is(err, playlist.ErrNeedsAuth) {
++			t.Fatalf("err = %v", err)
++		}
++		if s.signInRequired() {
++			t.Fatal("a 503 marked the session as needing sign-in")
++		}
++	})
++	t.Run("premium unchanged", func(t *testing.T) {
++		f := isolate(t)
++		refreshFailure(f, 400, `{"error":"invalid_client"}`, nil)
++		s := &Session{stream: &fakeBackend{}, devID: generateDeviceID(), clientID: "cid",
++			tokenSource: spotifyOAuthConfig("cid").TokenSource(context.Background(), expired)}
++		_, err := s.webApiWithBody(context.Background(), "GET", "/v1/me", nil, nil, "")
++		if err == nil || errors.Is(err, playlist.ErrNeedsAuth) || !strings.HasPrefix(err.Error(), "refresh access token: ") {
++			t.Fatalf("err = %v", err)
++		}
++		if s.signInRequired() {
++			t.Fatal("premium session marked as needing sign-in")
++		}
++	})
++}
+diff --git a/external/spotify/session.go b/external/spotify/session.go
+index fc33ba5..6d7e42f 100644
+--- a/external/spotify/session.go
++++ b/external/spotify/session.go
+@@ -24,7 +24,6 @@ import (
+ 
+ 	librespot "github.com/devgianlu/go-librespot"
+ 	librespotPlayer "github.com/devgianlu/go-librespot/player"
+-	devicespb "github.com/devgianlu/go-librespot/proto/spotify/connectstate/devices"
+ 	"github.com/devgianlu/go-librespot/session"
+ 	"golang.org/x/oauth2"
+ 	spotifyoauth2 "golang.org/x/oauth2/spotify"
+@@ -36,6 +35,12 @@ type storedCreds struct {
+ 	Data         []byte `json:"data"`
+ 	DeviceID     string `json:"device_id"`
+ 	RefreshToken string `json:"refresh_token,omitempty"` // OAuth2 refresh token for silent re-auth
++
++	// WebOnly marks credentials of a web-only session (see webonly.go):
++	// Spotify refused the librespot login, so only RefreshToken is kept and
++	// Username/Data stay empty. UserID is the Spotify user id once known.
++	WebOnly bool   `json:"web_only,omitempty"`
++	UserID  string `json:"user_id,omitempty"`
+ }
+ 
+ // CallbackPort is the fixed port for the OAuth2 callback server.
+@@ -67,11 +72,14 @@ func notifyAuthURL(u string) {
+ // Session manages a go-librespot session and player for Spotify integration.
+ type Session struct {
+ 	mu          sync.RWMutex
+-	sess        *session.Session
+-	player      *librespotPlayer.Player
++	stream      streamBackend // librespot session + player; nil when web-only or closed
+ 	devID       string
+ 	clientID    string             // Spotify Developer app client ID
+ 	tokenSource oauth2.TokenSource // auto-refreshing OAuth2 token source
++
++	webOnly bool   // Spotify refused librespot; Web API only (webonly.go)
++	userID  string // Spotify user id, when known (web-only sessions)
++	refused bool   // web-only: Spotify refused the refresh token for good; sign-in replaces the session
+ }
+ 
+ // NewSession creates a go-librespot session, using stored credentials if
+@@ -85,6 +93,12 @@ func NewSession(ctx context.Context, clientID string) (*Session, error) {
+ 			return s, nil
+ 		}
+ 		// Stored credentials failed (expired/revoked), fall through to interactive.
++	} else if err == nil && creds.webOnlyRestorable() {
++		s, err := newWebOnlyFromStored(clientID, creds)
++		if err == nil {
++			return s, nil
++		}
++		// Refresh token revoked, fall through to interactive.
+ 	}
+ 	return newInteractiveSession(ctx, clientID)
+ }
+@@ -93,6 +107,9 @@ func NewSession(ctx context.Context, clientID string) (*Session, error) {
+ // Returns an error if interactive auth is required.
+ func NewSessionSilent(ctx context.Context, clientID string) (*Session, error) {
+ 	creds, err := loadCreds()
++	if err == nil && (creds.Username == "" || len(creds.Data) == 0) && creds.webOnlyRestorable() {
++		return newWebOnlyFromStored(clientID, creds)
++	}
+ 	if err != nil || creds.Username == "" || len(creds.Data) == 0 {
+ 		return nil, fmt.Errorf("no stored credentials")
+ 	}
+@@ -108,14 +125,9 @@ func newSessionFromStored(ctx context.Context, clientID string, creds *storedCre
+ 		devID = generateDeviceID()
+ 	}
+ 
+-	sess, err := session.NewSessionFromOptions(ctx, &session.Options{
+-		Log:        &librespot.NullLogger{},
+-		DeviceType: devicespb.DeviceType_COMPUTER,
+-		DeviceId:   devID,
+-		Credentials: session.StoredCredentials{
+-			Username: creds.Username,
+-			Data:     creds.Data,
+-		},
++	sess, err := openStreamBackend(ctx, devID, session.StoredCredentials{
++		Username: creds.Username,
++		Data:     creds.Data,
+ 	})
+ 	if err != nil {
+ 		return nil, fmt.Errorf("spotify: stored auth: %w", err)
+@@ -149,7 +161,7 @@ func newSessionFromStored(ctx context.Context, clientID string, creds *storedCre
+ 			// Continue without a token source — already-loaded tracks still stream
+ 			// via spclient; new Web API calls will return ErrNeedsAuth.
+ 			applog.UserError("spotify: stored auth no longer valid; run 'cliamp spotify reset' or sign in again to fix")
+-			s := &Session{sess: sess, devID: devID, clientID: clientID}
++			s := &Session{stream: sess, devID: devID, clientID: clientID}
+ 			if err := saveCreds(&storedCreds{
+ 				Username:     sess.Username(),
+ 				Data:         sess.StoredCredentials(),
+@@ -158,10 +170,6 @@ func newSessionFromStored(ctx context.Context, clientID string, creds *storedCre
+ 			}); err != nil {
+ 				applog.UserError("spotify: failed to save credentials: %v", err)
+ 			}
+-			if err := s.initPlayer(); err != nil {
+-				sess.Close()
+-				return nil, err
+-			}
+ 			return s, nil
+ 		}
+ 		token, err := doWebAPIAuth(ctx, clientID)
+@@ -176,7 +184,7 @@ func newSessionFromStored(ctx context.Context, clientID string, creds *storedCre
+ 	conf := spotifyOAuthConfig(clientID)
+ 	ts := conf.TokenSource(context.Background(), oauthToken)
+ 
+-	s := &Session{sess: sess, devID: devID, clientID: clientID, tokenSource: ts}
++	s := &Session{stream: sess, devID: devID, clientID: clientID, tokenSource: ts}
+ 
+ 	// Re-save credentials (including refresh token for next launch).
+ 	if err := saveCreds(&storedCreds{
+@@ -187,11 +195,6 @@ func newSessionFromStored(ctx context.Context, clientID string, creds *storedCre
+ 	}); err != nil {
+ 		applog.UserError("spotify: failed to save credentials: %v", err)
+ 	}
+-
+-	if err := s.initPlayer(); err != nil {
+-		sess.Close()
+-		return nil, err
+-	}
+ 	return s, nil
+ }
+ 
+@@ -229,10 +232,13 @@ func spotifyOAuthConfig(clientID string) *oauth2.Config {
+ 		ClientID:    clientID,
+ 		RedirectURL: fmt.Sprintf("http://127.0.0.1:%d/login", CallbackPort),
+ 		Scopes:      oauthScopes,
+-		Endpoint:    spotifyoauth2.Endpoint,
++		Endpoint:    oauthEndpoint,
+ 	}
+ }
+ 
++// oauthEndpoint is Spotify's accounts service. Tests point it at a fake.
++var oauthEndpoint = spotifyoauth2.Endpoint
++
+ // silentTokenRefresh uses a stored refresh token to get a new access token
+ // without opening a browser.
+ func silentTokenRefresh(clientID, refreshToken string) (*oauth2.Token, error) {
+@@ -309,10 +315,14 @@ func performOAuth2PKCE(ctx context.Context, clientID string) (*oauth2.Token, err
+ 	return token, nil
+ }
+ 
++// authorizeInteractive runs the browser sign-in. Tests replace it so that no
++// test opens a browser or listens on CallbackPort.
++var authorizeInteractive = performOAuth2PKCE
++
+ // doWebAPIAuth performs an OAuth2 PKCE flow to get a fresh Web API access token.
+ // Opens a browser for user consent, returns the full token (including refresh token).
+ func doWebAPIAuth(ctx context.Context, clientID string) (*oauth2.Token, error) {
+-	token, err := performOAuth2PKCE(ctx, clientID)
++	token, err := authorizeInteractive(ctx, clientID)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -323,7 +333,7 @@ func doWebAPIAuth(ctx context.Context, clientID string) (*oauth2.Token, error) {
+ func newInteractiveSession(ctx context.Context, clientID string) (*Session, error) {
+ 	devID := generateDeviceID()
+ 
+-	token, err := performOAuth2PKCE(ctx, clientID)
++	token, err := authorizeInteractive(ctx, clientID)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("spotify: %w", err)
+ 	}
+@@ -332,16 +342,17 @@ func newInteractiveSession(ctx context.Context, clientID string) (*Session, erro
+ 	accessToken := token.AccessToken
+ 
+ 	// Create go-librespot session using the OAuth2 token.
+-	sess, err := session.NewSessionFromOptions(ctx, &session.Options{
+-		Log:        &librespot.NullLogger{},
+-		DeviceType: devicespb.DeviceType_COMPUTER,
+-		DeviceId:   devID,
+-		Credentials: session.SpotifyTokenCredentials{
+-			Username: username,
+-			Token:    accessToken,
+-		},
++	sess, err := openStreamBackend(ctx, devID, session.SpotifyTokenCredentials{
++		Username: username,
++		Token:    accessToken,
+ 	})
+ 	if err != nil {
++		// Spotify refused this token for streaming (Free account, or a
++		// client_id login5 does not accept): keep the token for the Web API.
++		if reason, ok := streamingRejected(err); ok {
++			applog.Status("spotify: streaming refused for this account; tracks play through YouTube")
++			return newWebOnlySession(clientID, devID, token, "", reason), nil
++		}
+ 		return nil, fmt.Errorf("spotify: session from token: %w", err)
+ 	}
+ 
+@@ -359,39 +370,12 @@ func newInteractiveSession(ctx context.Context, clientID string) (*Session, erro
+ 	conf := spotifyOAuthConfig(clientID)
+ 	ts := conf.TokenSource(context.Background(), token)
+ 
+-	s := &Session{sess: sess, devID: devID, clientID: clientID, tokenSource: ts}
+-	if err := s.initPlayer(); err != nil {
+-		sess.Close()
+-		return nil, err
+-	}
++	s := &Session{stream: sess, devID: devID, clientID: clientID, tokenSource: ts}
+ 	return s, nil
+ }
+ 
+-// initPlayer creates the go-librespot player. We only use NewStream() for
+-// decoded AudioSources — audio output is routed through cliamp's Beep pipeline,
+-// not go-librespot's output backend.
+-func (s *Session) initPlayer() error {
+-	// go-librespot uses this for media restriction checks but Premium
+-	// accounts can play all tracks regardless.
+-	countryCode := "US"
+-	p, err := librespotPlayer.NewPlayer(&librespotPlayer.Options{
+-		Spclient:             s.sess.Spclient(),
+-		AudioKey:             s.sess.AudioKey(),
+-		Events:               s.sess.Events(),
+-		Log:                  &librespot.NullLogger{},
+-		CountryCode:          &countryCode,
+-		NormalisationEnabled: true,
+-		AudioBackend:         "pipe",
+-		AudioOutputPipe:      os.DevNull,
+-	})
+-	if err != nil {
+-		return fmt.Errorf("spotify: player init: %w", err)
+-	}
+-	s.player = p
+-	return nil
+-}
+-
+ // NewStream creates a decoded audio stream for the given Spotify track ID.
++// A web-only session has no player and fails with ErrStreamingUnavailable.
+ //
+ // Holds s.mu.RLock() across the librespot network call. Multiple concurrent
+ // NewStream / webApi callers can run in parallel (RLock is shared), so rapid
+@@ -402,10 +386,13 @@ func (s *Session) initPlayer() error {
+ func (s *Session) NewStream(ctx context.Context, spotID librespot.SpotifyId, bitrate int) (*librespotPlayer.Stream, error) {
+ 	s.mu.RLock()
+ 	defer s.mu.RUnlock()
+-	if s.player == nil {
++	if s.stream == nil {
++		if s.webOnly {
++			return nil, ErrStreamingUnavailable
++		}
+ 		return nil, fmt.Errorf("spotify: session closed")
+ 	}
+-	return s.player.NewStream(ctx, http.DefaultClient, spotID, bitrate, 0)
++	return s.stream.NewStream(ctx, spotID, bitrate)
+ }
+ 
+ // webApiWithBody calls the Spotify Web API using the OAuth2 access token.
+@@ -417,7 +404,7 @@ func (s *Session) NewStream(ctx context.Context, spotID librespot.SpotifyId, bit
+ // rather than attempting the call with the wrong token.
+ func (s *Session) webApiWithBody(ctx context.Context, method, path string, query url.Values, body io.Reader, contentType string) (*http.Response, error) {
+ 	s.mu.RLock()
+-	ts := s.tokenSource
++	ts, webOnly := s.tokenSource, s.webOnly
+ 	s.mu.RUnlock()
+ 
+ 	if ts == nil {
+@@ -425,11 +412,20 @@ func (s *Session) webApiWithBody(ctx context.Context, method, path string, query
+ 	}
+ 	tok, err := ts.Token()
+ 	if err != nil {
++		// A web-only session has nothing else to fall back on: when Spotify
++		// refuses its refresh token for good, ask for sign-in (which then
++		// replaces this session; see SpotifyProvider.Authenticate).
++		if webOnly && refreshRefused(err) {
++			s.mu.Lock()
++			s.refused = true
++			s.mu.Unlock()
++			return nil, fmt.Errorf("refresh access token: Spotify refused the stored sign-in (%w), sign in again: %w", err, playlist.ErrNeedsAuth)
++		}
+ 		return nil, fmt.Errorf("refresh access token: %w", err)
+ 	}
+ 	token := tok.AccessToken
+ 
+-	u, _ := url.Parse("https://api.spotify.com")
++	u, _ := url.Parse(webAPIBase)
+ 	u = u.JoinPath(path)
+ 	if query != nil {
+ 		u.RawQuery = query.Encode()
+@@ -448,15 +444,16 @@ func (s *Session) webApiWithBody(ctx context.Context, method, path string, query
+ 	return http.DefaultClient.Do(req)
+ }
+ 
++// webAPIBase is the Spotify Web API origin. Tests point it at a fake.
++var webAPIBase = "https://api.spotify.com"
++
+ // Close releases all session and player resources.
+ func (s *Session) Close() {
+ 	s.mu.Lock()
+ 	defer s.mu.Unlock()
+-	if s.player != nil {
+-		s.player.Close()
+-	}
+-	if s.sess != nil {
+-		s.sess.Close()
++	if s.stream != nil {
++		s.stream.Close()
++		s.stream = nil
+ 	}
+ }
+ 
+@@ -475,12 +472,11 @@ func (s *Session) ReconnectInteractive(ctx context.Context) error {
+ 
+ // reconnect replaces the live session using the provided builder function.
+ // The new session is established before tearing down the old one to avoid a
+-// window where s.sess/s.player are nil (which would crash concurrent callers).
++// window where s.stream is nil (which would fail concurrent callers).
+ //
+ // The swap-and-teardown phase is done under s.mu (full Lock), which waits for
+ // any in-flight NewStream / webApi RLockers to drain. This guarantees that
+-// oldPlayer.Close() is never called while a NewStream is still using the
+-// old player pointer.
++// the old player is never closed while a NewStream is still using it.
+ func (s *Session) reconnect(ctx context.Context, build func(context.Context, string) (*Session, error)) error {
+ 	s.mu.RLock()
+ 	clientID := s.clientID
+@@ -492,29 +488,28 @@ func (s *Session) reconnect(ctx context.Context, build func(context.Context, str
+ 	}
+ 
+ 	// Swap and tear down the old session under a single write lock so
+-	// in-flight NewStream / webApi calls finish before oldPlayer.Close()
+-	// runs. The expensive build() above happened lock-free.
++	// in-flight NewStream / webApi calls finish before the old player is
++	// closed. The expensive build() above happened lock-free.
++	newSess.mu.Lock()
++	stream, devID, ts := newSess.stream, newSess.devID, newSess.tokenSource
++	webOnly, userID := newSess.webOnly, newSess.userID
++	// Prevent newSess.Close() from tearing down the resources we adopt.
++	newSess.stream = nil
++	newSess.mu.Unlock()
++
+ 	s.mu.Lock()
+-	oldPlayer := s.player
+-	oldSess := s.sess
+-	s.sess = newSess.sess
+-	s.player = newSess.player
+-	s.devID = newSess.devID
+-	s.tokenSource = newSess.tokenSource
+-	if oldPlayer != nil {
+-		oldPlayer.Close()
+-	}
+-	if oldSess != nil {
+-		oldSess.Close()
++	oldStream := s.stream
++	s.stream = stream
++	s.devID = devID
++	s.tokenSource = ts
++	s.webOnly = webOnly
++	s.userID = userID
++	s.refused = false
++	if oldStream != nil {
++		oldStream.Close()
+ 	}
+ 	s.mu.Unlock()
+ 
+-	// Prevent newSess.Close() from tearing down the resources we just adopted.
+-	newSess.mu.Lock()
+-	newSess.sess = nil
+-	newSess.player = nil
+-	newSess.mu.Unlock()
+-
+ 	const reauthMsg = "spotify: re-authenticated successfully"
+ 	applog.Info(reauthMsg)
+ 	applog.Status(reauthMsg)
+diff --git a/external/spotify/stub_windows.go b/external/spotify/stub_windows.go
+index 67da190..c32560c 100644
+--- a/external/spotify/stub_windows.go
++++ b/external/spotify/stub_windows.go
+@@ -67,5 +67,8 @@ func (p *SpotifyProvider) CreatePlaylist(_ context.Context, _ string) (string, e
+ 	return "", nil
+ }
+ 
++// PlaybackVia returns "" — Spotify is unavailable on Windows.
++func (p *SpotifyProvider) PlaybackVia() string { return "" }
++
+ // SetAuthURLObserver is a no-op on Windows.
+ func SetAuthURLObserver(_ func(string)) {}
+diff --git a/external/spotify/webonly.go b/external/spotify/webonly.go
+new file mode 100644
+index 0000000..9037962
+--- /dev/null
++++ b/external/spotify/webonly.go
+@@ -0,0 +1,286 @@
++//go:build !windows
++
++package spotify
++
++// webonly.go — Spotify without librespot ("web-only" sessions).
++//
++// cliamp builds a go-librespot session from the OAuth token for streaming.
++// Spotify refuses that login for Free accounts and for tokens of many
++// user-registered Developer apps (login5 answers INVALID_CREDENTIALS), while
++// the same token works for the Web API. Instead of failing the whole provider,
++// the session then keeps the token and runs web-only: playlists, liked songs
++// and search come from the Web API, and every track is handed to the player as
++// a YouTube search (bridge.go). Premium sessions are unchanged.
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"net/http"
++	"sync"
++
++	"github.com/devgianlu/go-librespot/ap"
++	"github.com/devgianlu/go-librespot/login5"
++	pb "github.com/devgianlu/go-librespot/proto/spotify"
++	login5pb "github.com/devgianlu/go-librespot/proto/spotify/login5/v3"
++	"golang.org/x/oauth2"
++
++	"cliamp/applog"
++	"cliamp/playlist"
++)
++
++// PlaybackYouTube is PlaybackVia's answer for a web-only session.
++const PlaybackYouTube = "youtube"
++
++// ErrStreamingUnavailable is returned for a spotify:track: URI when the
++// session has no librespot player (web-only).
++var ErrStreamingUnavailable = errors.New("spotify: streaming unavailable (this Spotify connection is Web API only; Spotify Premium is required to stream Spotify tracks)")
++
++// streamingRejected reports whether err from creating the librespot session
++// means Spotify refused these credentials or this account for streaming —
++// something retrying will not fix — and describes why. Only these count:
++//
++//   - login5 LoginError INVALID_CREDENTIALS or UNKNOWN_IDENTIFIER (the token
++//     or identity is not accepted; seen with user-registered client IDs).
++//   - access point APLoginFailed BadCredentials or PremiumAccountRequired.
++//
++// Everything else — network and TLS errors, context expiry, client token or
++// apresolve failures, login5 TIMEOUT / TRY_AGAIN_LATER / TOO_MANY_ATTEMPTS /
++// UNKNOWN_ERROR (also what an empty or garbled reply decodes to), access point
++// TryAnotherAP and the like — is not a rejection and keeps failing as before.
++func streamingRejected(err error) (string, bool) {
++	var le *login5.LoginError
++	if errors.As(err, &le) {
++		switch le.Code {
++		case login5pb.LoginError_INVALID_CREDENTIALS, login5pb.LoginError_UNKNOWN_IDENTIFIER:
++			return fmt.Sprintf("login5 refused the credentials (%s)", le.Code), true
++		}
++		return "", false
++	}
++	var ae *ap.AccesspointLoginError
++	if errors.As(err, &ae) {
++		// GetErrorCode is nil-safe (Message can be nil).
++		switch code := ae.Message.GetErrorCode(); code {
++		case pb.ErrorCode_BadCredentials, pb.ErrorCode_PremiumAccountRequired:
++			return fmt.Sprintf("the access point refused the login (%s)", code), true
++		}
++	}
++	return "", false
++}
++
++// webOnlyRestorable reports whether c describes a web-only session that can
++// be restored without a browser.
++func (c *storedCreds) webOnlyRestorable() bool {
++	return c.WebOnly && c.RefreshToken != ""
++}
++
++// newWebOnlySession builds a session that only talks to the Web API and
++// persists it as web-only, so later launches restore it silently.
++func newWebOnlySession(clientID, devID string, token *oauth2.Token, userID, reason string) *Session {
++	credsFileMu.Lock()
++	defer credsFileMu.Unlock()
++	return newWebOnlySessionLocked(clientID, devID, token, userID, reason)
++}
++
++// newWebOnlySessionLocked is newWebOnlySession for a caller holding credsFileMu.
++func newWebOnlySessionLocked(clientID, devID string, token *oauth2.Token, userID, reason string) *Session {
++	conf := spotifyOAuthConfig(clientID)
++	ts := &savingTokenSource{
++		src:  conf.TokenSource(context.Background(), token),
++		last: token.RefreshToken,
++	}
++	s := &Session{devID: devID, clientID: clientID, tokenSource: ts, webOnly: true, userID: userID}
++	if err := saveCreds(&storedCreds{
++		DeviceID:     devID,
++		RefreshToken: token.RefreshToken,
++		WebOnly:      true,
++		UserID:       userID,
++	}); err != nil {
++		applog.UserError("spotify: failed to save credentials: %v", err)
++	}
++	applog.Info("spotify: connected in web-only mode: %s; playlists and library come from the Web API and tracks play through YouTube (Spotify Premium is required to stream from Spotify)", reason)
++	return s
++}
++
++// newWebOnlyFromStored restores a web-only session from its refresh token.
++// It never opens a browser and does not try librespot again (run
++// 'cliamp spotify reset' after upgrading to Premium).
++//
++// A web-only session has nothing but its refresh token, and Spotify's rotated
++// refresh tokens are single use. So the read → refresh → save runs under
++// credsFileMu, and the token refreshed is the one on disk now rather than the
++// one creds was loaded with: a restore that ran meanwhile (a sign-in racing a
++// silent restore) has already used that one and stored its successor.
++func newWebOnlyFromStored(clientID string, creds *storedCreds) (*Session, error) {
++	credsFileMu.Lock()
++	defer credsFileMu.Unlock()
++	cur, err := loadCreds()
++	if err != nil || !cur.webOnlyRestorable() || (cur.Username != "" && len(cur.Data) > 0) {
++		// Cleared ('cliamp spotify reset', or a refused token) or replaced
++		// since it was read.
++		return nil, fmt.Errorf("spotify: stored web-only credentials are gone: %w", playlist.ErrNeedsAuth)
++	}
++	creds = cur
++	devID := creds.DeviceID
++	if devID == "" {
++		devID = generateDeviceID()
++	}
++	token, err := silentTokenRefresh(clientID, creds.RefreshToken)
++	if refreshRefused(err) {
++		// Only clear what was refused: another process may have stored a
++		// newer token in the meantime.
++		if now, lerr := loadCreds(); lerr == nil && now.RefreshToken != creds.RefreshToken {
++			applog.Warn("spotify: stored refresh token was refused (%v) but has since been replaced; keeping the new one", err)
++		} else {
++			applog.UserError("spotify: Spotify refused the stored sign-in (%v); clearing credentials, please sign in again", err)
++			if _, err := DeleteCreds(); err != nil {
++				applog.Warn("spotify: failed to clear stored credentials: %v", err)
++			}
++		}
++		return nil, fmt.Errorf("spotify: %w", playlist.ErrNeedsAuth)
++	}
++	if err != nil {
++		// Passing trouble (network, 5xx, 429): keep the refresh token; the
++		// token source refreshes again on the next Web API call.
++		applog.Warn("spotify: token refresh failed (%v); retrying on the next Web API call", err)
++		token = &oauth2.Token{RefreshToken: creds.RefreshToken}
++	}
++	return newWebOnlySessionLocked(clientID, devID, token, creds.UserID, "restored from stored web-only credentials"), nil
++}
++
++// refreshRefused reports whether a refresh-token grant failed because Spotify
++// refused it for good, so only a new sign-in helps: invalid_grant (revoked,
++// expired or already used) or any other 4xx answer of the token endpoint,
++// such as invalid_client (the Developer app was deleted or disabled, or the
++// client_id changed). Network errors, 5xx, 408, 429 and a 4xx that says
++// temporarily_unavailable or server_error are passing trouble.
++func refreshRefused(err error) bool {
++	var rerr *oauth2.RetrieveError
++	if !errors.As(err, &rerr) {
++		return false
++	}
++	switch rerr.ErrorCode {
++	case "invalid_grant":
++		return true
++	case "temporarily_unavailable", "server_error":
++		return false
++	}
++	if rerr.Response == nil {
++		return false
++	}
++	code := rerr.Response.StatusCode
++	return code >= 400 && code < 500 && code != http.StatusRequestTimeout && code != http.StatusTooManyRequests
++}
++
++// credsFileMu serialises read-modify-write updates of the credentials file.
++var credsFileMu sync.Mutex
++
++// updateWebOnlyCreds applies mutate to the stored credentials when they are
++// web-only, and saves them if mutate reports a change. Credentials of a
++// librespot session, or a missing file ('cliamp spotify reset'), are left alone.
++func updateWebOnlyCreds(mutate func(*storedCreds) bool) {
++	credsFileMu.Lock()
++	defer credsFileMu.Unlock()
++	creds, err := loadCreds()
++	if err != nil || !creds.WebOnly || !mutate(creds) {
++		return
++	}
++	if err := saveCreds(creds); err != nil {
++		applog.Warn("spotify: failed to update stored credentials: %v", err)
++	}
++}
++
++// savingTokenSource persists the refresh token of a web-only session when
++// Spotify rotates it, so the next launch still restores silently (a web-only
++// session has nothing else to fall back on).
++type savingTokenSource struct {
++	src  oauth2.TokenSource
++	mu   sync.Mutex
++	last string
++}
++
++func (t *savingTokenSource) Token() (*oauth2.Token, error) {
++	tok, err := t.src.Token()
++	if err != nil {
++		return nil, err
++	}
++	t.mu.Lock()
++	changed := tok.RefreshToken != "" && tok.RefreshToken != t.last
++	if changed {
++		t.last = tok.RefreshToken
++	}
++	t.mu.Unlock()
++	if changed {
++		updateWebOnlyCreds(func(c *storedCreds) bool {
++			c.RefreshToken = tok.RefreshToken
++			return true
++		})
++	}
++	return tok, nil
++}
++
++// signInRequired reports whether Spotify refused this web-only session's
++// refresh token for good during the run (see webApiWithBody), so only a new
++// sign-in can bring it back. Always false for a librespot session.
++func (s *Session) signInRequired() bool {
++	s.mu.RLock()
++	defer s.mu.RUnlock()
++	return s.refused
++}
++
++// WebOnly reports whether the session has no librespot player: Spotify refused
++// streaming, so tracks are bridged to YouTube.
++func (s *Session) WebOnly() bool {
++	s.mu.RLock()
++	defer s.mu.RUnlock()
++	return s.webOnly
++}
++
++// UserID returns the Spotify user id remembered by a web-only session ("" if
++// unknown or not web-only).
++func (s *Session) UserID() string {
++	s.mu.RLock()
++	defer s.mu.RUnlock()
++	return s.userID
++}
++
++// rememberUserID stores the user id of a web-only session (in memory and in
++// the credentials file) so later launches skip /v1/me. No-op otherwise.
++func (s *Session) rememberUserID(id string) {
++	if id == "" {
++		return
++	}
++	s.mu.Lock()
++	if !s.webOnly || s.userID == id {
++		s.mu.Unlock()
++		return
++	}
++	s.userID = id
++	s.mu.Unlock()
++	updateWebOnlyCreds(func(c *storedCreds) bool {
++		if c.UserID == id {
++			return false
++		}
++		c.UserID = id
++		return true
++	})
++}
++
++// webOnly reports whether the provider's current session is web-only.
++func (p *SpotifyProvider) webOnly() bool {
++	p.mu.Lock()
++	sess := p.session
++	p.mu.Unlock()
++	return sess != nil && sess.WebOnly()
++}
++
++// PlaybackVia reports where this provider's tracks are played from when it is
++// not Spotify itself: PlaybackYouTube while the live session is web-only, ""
++// otherwise (Premium, or no session yet). The IPC catalog puts it in
++// ProviderInfo.playback.
++func (p *SpotifyProvider) PlaybackVia() string {
++	if p.webOnly() {
++		return PlaybackYouTube
++	}
++	return ""
++}
+diff --git a/external/spotify/webonly_test.go b/external/spotify/webonly_test.go
+new file mode 100644
+index 0000000..549fea2
+--- /dev/null
++++ b/external/spotify/webonly_test.go
+@@ -0,0 +1,468 @@
++//go:build !windows
++
++package spotify
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"net"
++	"net/url"
++	"os"
++	"slices"
++	"strings"
++	"testing"
++
++	librespot "github.com/devgianlu/go-librespot"
++	"github.com/devgianlu/go-librespot/ap"
++	"github.com/devgianlu/go-librespot/login5"
++	pb "github.com/devgianlu/go-librespot/proto/spotify"
++	login5pb "github.com/devgianlu/go-librespot/proto/spotify/login5/v3"
++	"github.com/devgianlu/go-librespot/session"
++	"golang.org/x/oauth2"
++
++	"cliamp/playlist"
++)
++
++// librespot's errors as session.NewSessionFromOptions wraps them.
++func login5Err(code login5pb.LoginError) error {
++	return fmt.Errorf("failed authenticating with login5: %w", &login5.LoginError{Code: code})
++}
++
++func apErr(code pb.ErrorCode) error {
++	inner := fmt.Errorf("failed authenticating: %w", &ap.AccesspointLoginError{Message: &pb.APLoginFailed{ErrorCode: code.Enum()}})
++	return fmt.Errorf("failed authenticating accesspoint with username and spotify token: %w", inner)
++}
++
++func networkErr() error {
++	return fmt.Errorf("failed getting accesspoint from resolver: %w",
++		&url.Error{Op: "Get", URL: "https://apresolve.spotify.com/", Err: &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connect: network is unreachable")}})
++}
++
++func TestStreamingRejected(t *testing.T) {
++	tests := []struct {
++		name       string
++		err        error
++		want       bool
++		wantReason string
++	}{
++		{"nil", nil, false, ""},
++		{"login5 INVALID_CREDENTIALS (user's own client_id)", login5Err(login5pb.LoginError_INVALID_CREDENTIALS), true, "INVALID_CREDENTIALS"},
++		{"login5 UNKNOWN_IDENTIFIER", login5Err(login5pb.LoginError_UNKNOWN_IDENTIFIER), true, "UNKNOWN_IDENTIFIER"},
++		{"login5 bare error", &login5.LoginError{Code: login5pb.LoginError_INVALID_CREDENTIALS}, true, "INVALID_CREDENTIALS"},
++		{"access point PremiumAccountRequired", apErr(pb.ErrorCode_PremiumAccountRequired), true, "PremiumAccountRequired"},
++		{"access point BadCredentials", apErr(pb.ErrorCode_BadCredentials), true, "BadCredentials"},
++		{"login5 TRY_AGAIN_LATER", login5Err(login5pb.LoginError_TRY_AGAIN_LATER), false, ""},
++		{"login5 TOO_MANY_ATTEMPTS", login5Err(login5pb.LoginError_TOO_MANY_ATTEMPTS), false, ""},
++		{"login5 TIMEOUT", login5Err(login5pb.LoginError_TIMEOUT), false, ""},
++		{"login5 UNKNOWN_ERROR (empty reply)", login5Err(login5pb.LoginError_UNKNOWN_ERROR), false, ""},
++		{"access point TryAnotherAP", apErr(pb.ErrorCode_TryAnotherAP), false, ""},
++		{"access point error without message", &ap.AccesspointLoginError{}, false, ""},
++		{"network unreachable", networkErr(), false, ""},
++		{"client token failure", errors.New("failed obtaining client token: invalid status code from clienttoken: 503"), false, ""},
++		{"context deadline", fmt.Errorf("failed requesting login5 endpoint: %w", context.DeadlineExceeded), false, ""},
++		{"text mentioning INVALID_CREDENTIALS only", errors.New("proxy said INVALID_CREDENTIALS"), false, ""},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			reason, got := streamingRejected(tt.err)
++			if got != tt.want {
++				t.Fatalf("streamingRejected(%v) = %v, want %v", tt.err, got, tt.want)
++			}
++			if !strings.Contains(reason, tt.wantReason) {
++				t.Errorf("reason = %q, want it to mention %q", reason, tt.wantReason)
++			}
++		})
++	}
++}
++
++// Spotify refuses librespot for the signed-in account: the session falls back
++// to web-only and persists that.
++func TestInteractiveSessionFallsBackToWebOnly(t *testing.T) {
++	tests := []struct {
++		name string
++		err  error
++	}{
++		{"login5 INVALID_CREDENTIALS", login5Err(login5pb.LoginError_INVALID_CREDENTIALS)},
++		{"access point PremiumAccountRequired", apErr(pb.ErrorCode_PremiumAccountRequired)},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			isolate(t)
++			signIns := setAuthorize(t, signInToken())
++			calls := setBackend(t, func(any) (streamBackend, error) { return nil, tt.err })
++
++			s, err := NewSession(context.Background(), "cid")
++			if err != nil {
++				t.Fatalf("NewSession: %v", err)
++			}
++			defer s.Close()
++			if !s.WebOnly() {
++				t.Fatal("session is not web-only")
++			}
++			if *signIns != 1 || len(*calls) != 1 {
++				t.Fatalf("sign-ins = %d, librespot attempts = %d, want 1 and 1", *signIns, len(*calls))
++			}
++			if c, ok := (*calls)[0].creds.(session.SpotifyTokenCredentials); !ok || c.Token != "at-signin" {
++				t.Fatalf("librespot was given %#v, want the sign-in token", (*calls)[0].creds)
++			}
++
++			// The token is kept for the Web API.
++			tok, err := s.tokenSource.Token()
++			if err != nil || tok.AccessToken != "at-signin" {
++				t.Fatalf("token = %v, %v", tok, err)
++			}
++
++			got := readCredsFile(t)
++			if got["web_only"] != true || got["refresh_token"] != "rt-signin" || got["username"] != "" || got["data"] != nil {
++				t.Fatalf("stored credentials = %v", got)
++			}
++			if id, _ := got["device_id"].(string); id != (*calls)[0].devID || len(id) != 40 {
++				t.Fatalf("device_id = %q, want the one librespot was given (%q)", id, (*calls)[0].devID)
++			}
++
++			// Streaming is unavailable, with the documented text.
++			_, err = s.NewStream(context.Background(), librespot.SpotifyId{}, 320)
++			if !errors.Is(err, ErrStreamingUnavailable) || !strings.Contains(err.Error(), "spotify: streaming unavailable") {
++				t.Fatalf("NewStream err = %v", err)
++			}
++		})
++	}
++}
++
++// Anything that is not a rejection fails exactly as before: no fallback and
++// nothing saved.
++func TestInteractiveSessionNoFallbackOnTransientErrors(t *testing.T) {
++	tests := []struct {
++		name string
++		err  error
++	}{
++		{"network unreachable", networkErr()},
++		{"context deadline", fmt.Errorf("failed requesting login5 endpoint: %w", context.DeadlineExceeded)},
++		{"login5 TRY_AGAIN_LATER", login5Err(login5pb.LoginError_TRY_AGAIN_LATER)},
++		{"access point TryAnotherAP", apErr(pb.ErrorCode_TryAnotherAP)},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			isolate(t)
++			setAuthorize(t, signInToken())
++			setBackend(t, func(any) (streamBackend, error) { return nil, tt.err })
++
++			s, err := NewSession(context.Background(), "cid")
++			if err == nil {
++				s.Close()
++				t.Fatal("NewSession succeeded, want the librespot error")
++			}
++			if !errors.Is(err, errors.Unwrap(tt.err)) && !strings.Contains(err.Error(), tt.err.Error()) {
++				t.Fatalf("err = %v, want it to wrap %v", err, tt.err)
++			}
++			if !strings.HasPrefix(err.Error(), "spotify: session from token: ") {
++				t.Fatalf("err = %q, want the existing 'spotify: session from token:' error", err)
++			}
++			if got := readCredsFile(t); got != nil {
++				t.Fatalf("credentials were saved: %v", got)
++			}
++		})
++	}
++}
++
++// A Premium account keeps today's behaviour and file format.
++func TestPremiumInteractiveSessionUnchanged(t *testing.T) {
++	isolate(t)
++	setAuthorize(t, signInToken())
++	backend := &fakeBackend{username: "premiumuser", data: []byte("blob")}
++	setBackend(t, func(any) (streamBackend, error) { return backend, nil })
++
++	s, err := NewSession(context.Background(), "cid")
++	if err != nil {
++		t.Fatalf("NewSession: %v", err)
++	}
++	if s.WebOnly() || s.UserID() != "" {
++		t.Fatalf("premium session: webOnly=%v userID=%q", s.WebOnly(), s.UserID())
++	}
++	got := readCredsFile(t)
++	keys := make([]string, 0, len(got))
++	for k := range got {
++		keys = append(keys, k)
++	}
++	slices.Sort(keys)
++	if want := []string{"data", "device_id", "refresh_token", "username"}; !slices.Equal(keys, want) {
++		t.Fatalf("stored keys = %v, want %v (no web-only fields)", keys, want)
++	}
++	if got["username"] != "premiumuser" || got["data"] != "YmxvYg==" || got["refresh_token"] != "rt-signin" {
++		t.Fatalf("stored credentials = %v", got)
++	}
++
++	// Streams go to librespot.
++	sentinel := errors.New("librespot stream")
++	backend.streamFn = func(librespot.SpotifyId) error { return sentinel }
++	if _, err := s.NewStream(context.Background(), librespot.SpotifyId{}, 320); !errors.Is(err, sentinel) {
++		t.Fatalf("NewStream err = %v, want the backend's", err)
++	}
++	s.Close()
++	if !backend.closed {
++		t.Fatal("Close did not close the librespot backend")
++	}
++	if _, err := s.NewStream(context.Background(), librespot.SpotifyId{}, 320); err == nil || errors.Is(err, ErrStreamingUnavailable) {
++		t.Fatalf("NewStream after Close = %v, want 'session closed'", err)
++	}
++}
++
++// Stored web-only credentials come back without a browser and without
++// librespot, in both NewSessionSilent and NewSession.
++func TestWebOnlyRestoredSilently(t *testing.T) {
++	for _, build := range []struct {
++		name string
++		fn   func(context.Context, string) (*Session, error)
++	}{
++		{"NewSessionSilent", NewSessionSilent},
++		{"NewSession", NewSession},
++	} {
++		t.Run(build.name, func(t *testing.T) {
++			f := isolate(t)
++			f.refreshes(map[string][2]string{"rt-old": {"at-new", "rt-rotated"}})
++			writeCredsFile(t, `{"username":"","data":null,"device_id":"00112233445566778899aabbccddeeff00112233","refresh_token":"rt-old","web_only":true,"user_id":"u1"}`)
++
++			s, err := build.fn(context.Background(), "cid")
++			if err != nil {
++				t.Fatalf("%s: %v", build.name, err)
++			}
++			defer s.Close()
++			if !s.WebOnly() || s.UserID() != "u1" {
++				t.Fatalf("restored session: webOnly=%v userID=%q", s.WebOnly(), s.UserID())
++			}
++			tok, err := s.tokenSource.Token()
++			if err != nil || tok.AccessToken != "at-new" {
++				t.Fatalf("token = %v, %v", tok, err)
++			}
++			got := readCredsFile(t)
++			if got["web_only"] != true || got["refresh_token"] != "rt-rotated" || got["user_id"] != "u1" ||
++				got["device_id"] != "00112233445566778899aabbccddeeff00112233" {
++				t.Fatalf("stored credentials = %v", got)
++			}
++		})
++	}
++}
++
++// A refresh token Spotify rotates later in the session is written back, so
++// the next launch still restores silently.
++func TestWebOnlyPersistsRotatedRefreshToken(t *testing.T) {
++	f := isolate(t)
++	f.refreshes(map[string][2]string{"rt-1": {"at-1", "rt-2"}, "rt-2": {"at-2", "rt-3"}})
++	writeCredsFile(t, `{"refresh_token":"rt-1","web_only":true}`)
++
++	s, err := NewSessionSilent(context.Background(), "cid")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer s.Close()
++	if got := readCredsFile(t)["refresh_token"]; got != "rt-2" {
++		t.Fatalf("refresh token after restore = %v, want rt-2", got)
++	}
++	// Force the token source to refresh (as it does when the hour is up).
++	ts := s.tokenSource.(*savingTokenSource)
++	ts.src = spotifyOAuthConfig("cid").TokenSource(context.Background(), &oauth2.Token{RefreshToken: "rt-2"})
++	if tok, err := s.tokenSource.Token(); err != nil || tok.AccessToken != "at-2" {
++		t.Fatalf("token = %v, %v", tok, err)
++	}
++	if got := readCredsFile(t)["refresh_token"]; got != "rt-3" {
++		t.Fatalf("refresh token after rotation = %v, want rt-3", got)
++	}
++}
++
++func TestWebOnlyRestoreFailures(t *testing.T) {
++	t.Run("revoked refresh token clears credentials and needs sign-in", func(t *testing.T) {
++		f := isolate(t)
++		f.refreshes(map[string][2]string{}) // everything is invalid_grant
++		writeCredsFile(t, `{"refresh_token":"rt-dead","web_only":true}`)
++		_, err := NewSessionSilent(context.Background(), "cid")
++		if !errors.Is(err, playlist.ErrNeedsAuth) {
++			t.Fatalf("err = %v, want ErrNeedsAuth", err)
++		}
++		if got := readCredsFile(t); got != nil {
++			t.Fatalf("credentials not cleared: %v", got)
++		}
++	})
++	t.Run("transient refresh failure keeps the session and the token", func(t *testing.T) {
++		isolate(t) // token endpoint answers 500
++		writeCredsFile(t, `{"refresh_token":"rt-1","web_only":true,"user_id":"u1"}`)
++		s, err := NewSessionSilent(context.Background(), "cid")
++		if err != nil {
++			t.Fatalf("NewSessionSilent: %v", err)
++		}
++		defer s.Close()
++		if !s.WebOnly() {
++			t.Fatal("not web-only")
++		}
++		if got := readCredsFile(t); got["refresh_token"] != "rt-1" || got["web_only"] != true {
++			t.Fatalf("stored credentials = %v", got)
++		}
++		// The next Web API call retries the refresh (and fails as a normal
++		// error, not as a sign-in prompt).
++		_, err = s.webApiWithBody(context.Background(), "GET", "/v1/me", nil, nil, "")
++		if err == nil || errors.Is(err, playlist.ErrNeedsAuth) {
++			t.Fatalf("web api err = %v", err)
++		}
++	})
++}
++
++// Which stored file takes which path. Old files (no web_only) keep loading.
++func TestStoredCredentialFormats(t *testing.T) {
++	tests := []struct {
++		name        string
++		file        string
++		wantErr     string // substring; "" = success
++		wantBackend bool   // librespot was tried with the stored blob
++		wantWebOnly bool
++	}{
++		{"old premium file", `{"username":"u","data":"YmxvYg==","device_id":"00112233445566778899aabbccddeeff00112233","refresh_token":"rt-1"}`, "", true, false},
++		{"old premium file without refresh token", `{"username":"u","data":"YmxvYg==","device_id":"00112233445566778899aabbccddeeff00112233"}`, "", true, false},
++		{"old file without blob", `{"username":"u","data":null,"refresh_token":"rt-1"}`, "no stored credentials", false, false},
++		{"web-only file", `{"username":"","data":null,"refresh_token":"rt-1","web_only":true}`, "", false, true},
++		{"web-only file without refresh token", `{"web_only":true,"user_id":"u1"}`, "no stored credentials", false, false},
++		{"unknown future field is ignored", `{"username":"u","data":"YmxvYg==","refresh_token":"rt-1","something_new":1}`, "", true, false},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			f := isolate(t)
++			f.refreshes(map[string][2]string{"rt-1": {"at-1", "rt-1"}})
++			backend := &fakeBackend{username: "u", data: []byte("blob")}
++			calls := setBackend(t, func(any) (streamBackend, error) { return backend, nil })
++			writeCredsFile(t, tt.file)
++
++			s, err := NewSessionSilent(context.Background(), "cid")
++			if tt.wantErr != "" {
++				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
++					t.Fatalf("err = %v, want %q", err, tt.wantErr)
++				}
++			} else if err != nil {
++				t.Fatalf("NewSessionSilent: %v", err)
++			} else {
++				defer s.Close()
++				if s.WebOnly() != tt.wantWebOnly {
++					t.Fatalf("webOnly = %v, want %v", s.WebOnly(), tt.wantWebOnly)
++				}
++			}
++			if got := len(*calls) > 0; got != tt.wantBackend {
++				t.Fatalf("librespot tried = %v, want %v", got, tt.wantBackend)
++			}
++			if tt.wantBackend {
++				c, ok := (*calls)[0].creds.(session.StoredCredentials)
++				if !ok || c.Username != "u" || string(c.Data) != "blob" {
++					t.Fatalf("librespot creds = %#v", (*calls)[0].creds)
++				}
++				if got := readCredsFile(t); got["web_only"] != nil || got["user_id"] != nil {
++					t.Fatalf("premium file gained web-only fields: %v", got)
++				}
++			}
++		})
++	}
++}
++
++// Stored librespot credentials that Spotify now refuses keep today's
++// behaviour: silent → sign-in needed (no silent downgrade to YouTube).
++func TestStoredPremiumRejectionDoesNotSilentlyGoWebOnly(t *testing.T) {
++	f := isolate(t)
++	f.refreshes(map[string][2]string{"rt-1": {"at-1", "rt-1"}})
++	setBackend(t, func(any) (streamBackend, error) { return nil, apErr(pb.ErrorCode_BadCredentials) })
++	writeCredsFile(t, `{"username":"u","data":"YmxvYg==","refresh_token":"rt-1"}`)
++	if s, err := NewSessionSilent(context.Background(), "cid"); err == nil {
++		s.Close()
++		t.Fatal("NewSessionSilent succeeded, want the stored-auth error")
++	}
++	p := New(nil, "cid", 320)
++	if err := p.ensureSession(); !errors.Is(err, playlist.ErrNeedsAuth) {
++		t.Fatalf("ensureSession = %v, want ErrNeedsAuth", err)
++	}
++	if got := readCredsFile(t); got["web_only"] != nil {
++		t.Fatalf("stored credentials became web-only: %v", got)
++	}
++}
++
++func TestProviderPlaybackVia(t *testing.T) {
++	isolate(t)
++	tests := []struct {
++		name string
++		sess func() *Session
++		want string
++	}{
++		{"no session yet", func() *Session { return nil }, ""},
++		{"web-only", func() *Session { return webOnlyTestSession(t, "") }, "youtube"},
++		{"premium", func() *Session { return premiumTestSession(t, &fakeBackend{}) }, ""},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			p := New(tt.sess(), "cid", 320)
++			defer p.Close()
++			if got := p.PlaybackVia(); got != tt.want {
++				t.Fatalf("PlaybackVia() = %q, want %q", got, tt.want)
++			}
++		})
++	}
++}
++
++// A spotify:track: path on a web-only session fails with the documented text,
++// not with a sign-in prompt, and without trying to reconnect.
++func TestNewStreamerWebOnly(t *testing.T) {
++	isolate(t)
++	calls := setBackend(t, func(any) (streamBackend, error) { return nil, errTestGuard })
++	p := New(webOnlyTestSession(t, ""), "cid", 320)
++	defer p.Close()
++
++	_, _, _, err := p.NewStreamer("spotify:track:4uLU6hMCjMI75M1A2tKUQC")
++	if err == nil || !strings.Contains(err.Error(), "spotify: streaming unavailable") {
++		t.Fatalf("NewStreamer err = %v", err)
++	}
++	if errors.Is(err, playlist.ErrNeedsAuth) {
++		t.Fatal("streaming unavailable must not ask for sign-in")
++	}
++	if len(*calls) != 0 {
++		t.Fatal("NewStreamer tried librespot")
++	}
++}
++
++// The user id of a web-only session is learnt once and kept in the file.
++func TestWebOnlyRemembersUserID(t *testing.T) {
++	f := isolate(t)
++	f.json("GET /v1/me", 200, map[string]string{"id": "u42"})
++	p := New(webOnlyTestSession(t, ""), "cid", 320)
++	defer p.Close()
++	if id := p.currentUserID(context.Background()); id != "u42" {
++		t.Fatalf("currentUserID = %q", id)
++	}
++	if got := readCredsFile(t)["user_id"]; got != "u42" {
++		t.Fatalf("stored user_id = %v", got)
++	}
++
++	// A new provider on a restored session does not ask /v1/me again.
++	f.refreshes(map[string][2]string{"rt-signin": {"at-2", "rt-signin"}})
++	s, err := NewSessionSilent(context.Background(), "cid")
++	if err != nil {
++		t.Fatal(err)
++	}
++	p2 := New(s, "cid", 320)
++	defer p2.Close()
++	if id := p2.currentUserID(context.Background()); id != "u42" || f.count("GET /v1/me") != 1 {
++		t.Fatalf("currentUserID = %q, /v1/me calls = %d", id, f.count("GET /v1/me"))
++	}
++
++	// Premium sessions never write web-only fields.
++	if err := os.Remove(mustCredsPath(t)); err != nil {
++		t.Fatal(err)
++	}
++	writeCredsFile(t, `{"username":"u","data":"YmxvYg=="}`)
++	premium := premiumTestSession(t, &fakeBackend{})
++	premium.rememberUserID("u42")
++	if got := readCredsFile(t); got["user_id"] != nil || premium.UserID() != "" {
++		t.Fatalf("premium session remembered a user id: %v", got)
++	}
++}
++
++func mustCredsPath(t *testing.T) string {
++	t.Helper()
++	p, err := CredsPath()
++	if err != nil {
++		t.Fatal(err)
++	}
++	return p
++}
 diff --git a/ipc/client.go b/ipc/client.go
 index f41c118..a8dec80 100644
 --- a/ipc/client.go
@@ -2362,10 +5372,10 @@ index 3fb4bb4..fdaefc7 100644
  		t.Run(r.Cmd, func(t *testing.T) {
 diff --git a/ipc/gui.go b/ipc/gui.go
 new file mode 100644
-index 0000000..6f5c15f
+index 0000000..b8eea85
 --- /dev/null
 +++ b/ipc/gui.go
-@@ -0,0 +1,680 @@
+@@ -0,0 +1,683 @@
 +package ipc
 +
 +// gui.go — GUI フロントエンド向けの拡張コマンド (api 1)。
@@ -2434,12 +5444,15 @@ index 0000000..6f5c15f
 +}
 +
 +// ProviderInfo は providers の応答の 1 件。真偽は false でも省かない。
++// Playback は、曲を別の所から鳴らしているときだけその名前 (Spotify の
++// Web API だけの接続なら "youtube")。ふつうは省く。
 +type ProviderInfo struct {
 +	Key       string `json:"key"`
 +	Name      string `json:"name"`
 +	Search    bool   `json:"search"`
 +	Playlists bool   `json:"playlists"`
 +	Virtual   bool   `json:"virtual"`
++	Playback  string `json:"playback,omitempty"`
 +}
 +
 +// PlaylistInfo は playlist.PlaylistInfo の JSON 形。

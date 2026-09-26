@@ -8,6 +8,7 @@ window.navigate(page_id, **params) と window.toast(text) があればよい
 
 from __future__ import annotations
 
+import weakref
 from collections import deque
 from typing import Any, Iterable
 
@@ -57,11 +58,16 @@ class AppContext(GObject.Object):
     (新規プレイリストを作った・曲を外したときなど。サイドバーと詳細ページの取り直しに使う)。
     cliamp は最後の曲を外したプレイリストをファイルごと消すので、外した後は一覧を
     取り直してから知らせる (消えたプレイリストのページは自分で閉じる)。
+    シグナル "providers-changed": 覚えているプロバイダーの鳴らし方 (ProviderInfo の playback) が
+    変わった。Spotify の Web API だけの接続は、cliamp がセッションを作った後の providers の答えに
+    しか playback が載らないので、カタログがカタログ系の初めての成功の後で取り直した答えで
+    変わる (すべてのプレイリストの Spotify の節の書き添えなどに使う)。
     """
 
     __gtype_name__ = "CliampMusicAppContext"
     __gsignals__ = {
         "local-playlists-changed": (GObject.SignalFlags.RUN_FIRST, None, ()),
+        "providers-changed": (GObject.SignalFlags.RUN_FIRST, None, ()),
     }
 
     def __init__(self, app: Any = None, *, window: Any = None, client: CliampClient | None = None,
@@ -80,6 +86,20 @@ class AppContext(GObject.Object):
         self._local_playlists: list[str] = []
         self._local_playlists_loaded = False
         self._playlist_menus: deque[Gio.Menu] = deque(maxlen=32)
+        # providers の答えから覚えた表示名と鳴らし方 (pages.home の provider_label・provider_playback)
+        self._provider_names: dict[str, str] = {}
+        self._provider_playback: dict[str, str] = {}
+        add_listener = getattr(self.catalog, "add_providers_listener", None)
+        if add_listener is not None:
+            # カタログは ctx が持つので、聞き手が ctx を強く持つと循環になる (弱く持つ)
+            ref = weakref.WeakMethod(self.remember_providers)
+
+            def on_providers(result, ref=ref) -> None:
+                remember = ref()
+                if remember is not None:
+                    remember(result)
+
+            add_listener(on_providers)
         self.store.connect("connection-changed", self._on_connection)
         self.store.connect("playback-failed", self._on_playback_failed)
         if self.store.connected:
@@ -156,6 +176,24 @@ class AppContext(GObject.Object):
         name = f"{track.artist or track.display_title} のステーション"
         self.toast(f"「{name}」を読み込んでいます…")
         self.load_provider("url", mix_url(video), 0, name)
+
+    # --- プロバイダー --------------------------------------------------------------------
+
+    def remember_providers(self, providers) -> None:
+        """providers の答えから表示名と鳴らし方 (playback) を覚える。鳴らし方が変われば
+        "providers-changed"。表示名は足していき、鳴らし方は届いた答えで置き換える (サインインの
+        具合で変わるので前の値を持ち越さない)。"""
+        try:
+            infos = list(providers)
+            names = {info.key: info.name for info in infos if info.name}
+            playback = {info.key: getattr(info, "playback", "") or "" for info in infos}
+        except (TypeError, AttributeError):
+            return
+        self._provider_names = {**self._provider_names, **names}
+        before = {key: value for key, value in (self._provider_playback or {}).items() if value}
+        self._provider_playback = playback
+        if {key: value for key, value in playback.items() if value} != before:
+            self.emit("providers-changed")
 
     # --- ローカルのプレイリスト --------------------------------------------------------
 

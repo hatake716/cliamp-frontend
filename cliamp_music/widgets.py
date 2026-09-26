@@ -1833,7 +1833,8 @@ class EmptyState(Gtk.Box):
 
     `EmptyState(icon_name, title, description=None, button_label=None, on_button=None)`
     ボタンは赤で塗ったカプセル (画面で 1 つだけの色付きの操作)。
-    `set_title(text)` / `set_description(text)` / `set_icon_name(name)`。属性 button。"""
+    `set_title(text)` / `set_description(text)` / `set_icon_name(name)` /
+    `set_button(label, on_button)` (後からボタンを出す・隠す)。属性 button。"""
 
     def __init__(self, icon_name: str, title: str, description: str | None = None,
                  button_label: str | None = None, on_button=None):
@@ -1884,6 +1885,23 @@ class EmptyState(Gtk.Box):
 
     def set_icon_name(self, icon_name: str) -> None:
         self.image.set_from_icon_name(icon_name)
+
+    def set_button(self, label: str | None, on_button=None) -> None:
+        """ボタンを出す (無ければ作る) か、label が空なら隠す。on_button は押したときの呼び出し。"""
+        self.on_button = on_button if label else None
+        if not label:
+            if self.button is not None:
+                self.button.set_visible(False)
+            return
+        if self.button is None:
+            self.button = CapsuleButton(label, accent_text=False, filled=True)
+            self.button.set_halign(Gtk.Align.CENTER)
+            self.button.set_margin_top(14)
+            self.button.connect("clicked", EmptyState._on_button_clicked)
+            self.append(self.button)
+        else:
+            self.button.set_label(label)
+        self.button.set_visible(True)
 
 
 class LoadingState(Gtk.Box):

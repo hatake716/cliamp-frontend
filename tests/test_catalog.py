@@ -16,7 +16,7 @@ from fake_cliamp import FakeCliamp, run_loop, temp_socket_path  # noqa: E402
 try:
     from cliamp_music.catalog import Catalog
     from cliamp_music.client import CliampClient
-    from cliamp_music.protocol import RECENTLY_PLAYED, Lyrics, Response, Track, mix_url
+    from cliamp_music.protocol import RECENTLY_PLAYED, Lyrics, Response, Track, is_youtube_bridge, mix_url
 
     HAVE_GI = True
 except ImportError:  # pragma: no cover
@@ -27,11 +27,12 @@ except ImportError:  # pragma: no cover
 class CatalogTest(unittest.TestCase):
     legacy = False
     spotify_needs_auth = False
+    spotify_web_only = False
 
     def setUp(self):
         self.path = temp_socket_path()
-        self.fake = FakeCliamp(self.path, legacy=self.legacy,
-                               spotify_needs_auth=self.spotify_needs_auth).start()
+        self.fake = FakeCliamp(self.path, legacy=self.legacy, spotify_needs_auth=self.spotify_needs_auth,
+                               spotify_web_only=self.spotify_web_only).start()
         self.catalog = Catalog(CliampClient(self.path))
 
     def tearDown(self):
@@ -232,6 +233,165 @@ class NeedsAuth(CatalogTest):
         self.assertIsInstance(result, Response)
         self.assertTrue(result.needs_auth)
         self.assertIn("サインイン", result.message)
+
+
+class WebOnlySpotify(CatalogTest):
+    """Spotify の接続が Web API だけの cliamp (曲は YouTube で探して鳴らす)。"""
+
+    spotify_web_only = True
+
+    def test_providers_report_playback_after_the_session(self):
+        """playback は cliamp が Spotify のセッションを作った後の答えにしか載らない (偽も本物と同じ)。
+        カタログは spotify のカタログ系が初めて成功した後で providers を 1 度だけ取り直し、
+        覚えている答えを置き換えて聞き手に渡す。"""
+        heard = []
+        self.catalog.add_providers_listener(heard.append)
+        first = {p.key: p for p in self.get(self.catalog.providers)}
+        self.assertEqual(first["spotify"].playback, "", "セッションの前の答えには載らない")
+        self.assertEqual(len(heard), 1)
+        self.get(self.catalog.playlists, "spotify")
+        self.assertTrue(run_loop(lambda: len(heard) == 2, timeout=5), "取り直しません")
+        fresh = {p.key: p for p in heard[-1]}
+        self.assertEqual(fresh["spotify"].playback, "youtube")
+        self.assertTrue(fresh["spotify"].plays_via_youtube)
+        self.assertEqual(fresh["local"].playback, "")
+        # 覚えている答えは取り直したもの (もう送らない)
+        cached = {p.key: p for p in self.get(self.catalog.providers)}
+        self.assertEqual(cached["spotify"].playback, "youtube")
+        self.assertEqual(self.count("providers"), 2)
+        # 2 度目からの成功では取り直さない
+        self.get(self.catalog.tracks, "spotify", "YOUR MUSIC")
+        run_loop(lambda: False, 0.2)
+        self.assertEqual(self.count("providers"), 2)
+        # 繋ぎ直した (再起動した) cliamp: 捨てた後はまた初めての成功の後に 1 度
+        self.fake._spotify_session = False
+        self.catalog.invalidate()
+        self.assertEqual(self.get(self.catalog.providers)[2].playback, "")
+        self.get(self.catalog.tracks, "spotify", "YOUR MUSIC")
+        self.assertTrue(run_loop(lambda: self.count("providers") == 4, timeout=5))
+        self.assertTrue(run_loop(lambda: len(heard) == 4, timeout=5))
+        self.assertEqual({p.key: p.playback for p in heard[-1]}["spotify"], "youtube")
+
+    def test_tracks_are_bridged(self):
+        tracks = self.get(self.catalog.tracks, "spotify", "YOUR MUSIC")
+        self.assertTrue(tracks)
+        for track in tracks:
+            self.assertTrue(is_youtube_bridge(track))
+            self.assertTrue(track.path.startswith("ytsearch1:"))
+            self.assertTrue(track.path.endswith(" " + track.title))
+            self.assertIsNotNone(track.spotify_id)
+            self.assertIsNone(track.youtube_id)
+            self.assertFalse(track.unplayable)
+
+    def test_search_is_explained_in_japanese(self):
+        result = self.get(self.catalog.search, "spotify", "夜")
+        self.assertIsInstance(result, Response)
+        self.assertIn("search blocked", result.error)
+        self.assertTrue(result.message.startswith("Spotify では検索できません"), result.message)
+        # 失敗は覚えない (次もまた頼む)
+        self.get(self.catalog.search, "spotify", "夜")
+        self.assertEqual(self.count("search"), 2)
+        # YouTube の検索はふつうに使える
+        self.assertTrue(self.get(self.catalog.search, "youtube", "夜"))
+
+    def test_rate_limit_is_explained_in_japanese(self):
+        self.fake.spotify_error = "spotify: rate limited by Spotify; retry after 24h0m0s"
+        want = "Spotify から回数の制限を受けています。24 時間ほど待ってから、もう一度試してください"
+        for method, args in ((self.catalog.playlists, ("spotify",)), (self.catalog.tracks, ("spotify", "YOUR MUSIC")),
+                             (self.catalog.search, ("spotify", "朝"))):
+            with self.subTest(method=method.__name__):
+                result = self.get(method, *args)
+                self.assertIsInstance(result, Response)
+                self.assertEqual(result.message, want)
+
+
+class _ManualClient:
+    """答えを試験が手で返す client (カタログの要求の重なりを決まった順で起こす)。"""
+
+    def __init__(self):
+        self.sent: list[tuple[str, dict, object]] = []
+
+    def request(self, cmd, callback=None, *, lane=None, **fields):
+        self.sent.append((cmd, fields, callback))
+
+    def answer(self, index: int, **data) -> None:
+        self.sent[index][2](Response(True, data, "", "ok"))
+
+    def count(self, cmd: str) -> int:
+        return sum(1 for sent in self.sent if sent[0] == cmd)
+
+
+def _providers(playback: str = "") -> list[dict]:
+    spotify = {"key": "spotify", "name": "Spotify", "search": True, "playlists": True, "virtual": False}
+    if playback:
+        spotify["playback"] = playback
+    return [{"key": "local", "name": "Local", "search": True, "playlists": True, "virtual": False}, spotify]
+
+
+@unittest.skipUnless(HAVE_GI, "PyGObject がありません")
+class ProvidersAfterSession(unittest.TestCase):
+    """spotify のカタログ系の初めての成功の後の providers の取り直し (要求の重なり)。"""
+
+    def setUp(self):
+        self.client = _ManualClient()
+        self.catalog = Catalog(self.client)
+        self.heard: list = []
+        self.catalog.add_providers_listener(self.heard.append)
+
+    def test_answer_sent_before_the_session_is_not_kept(self):
+        """詳細ページは providers と tracks を同時に頼む。tracks が先に成功したとき、まだ届いて
+        いない providers の答えはセッションの前のものかもしれないので覚えず、届いてから取り直す。"""
+        got = []
+        self.catalog.providers(got.append)
+        self.catalog.tracks("spotify", "YOUR MUSIC", lambda _r: None)
+        self.client.answer(1, tracks=[])
+        self.assertEqual(self.client.count("providers"), 1, "送ってある答えを待つ")
+        self.client.answer(0, providers=_providers())
+        self.assertEqual(len(got), 1, "頼んだ人には届いた答えを渡す")
+        self.assertEqual(self.heard, [], "古いかもしれない答えは聞き手に渡さない")
+        self.assertEqual(self.client.count("providers"), 2, "届いてから取り直す")
+        self.client.answer(2, providers=_providers("youtube"))
+        self.assertEqual(len(self.heard), 1)
+        self.assertEqual(self.heard[0][1].playback, "youtube")
+        cached = []
+        self.catalog.providers(cached.append)
+        self.assertTrue(run_loop(lambda: cached, timeout=2))
+        self.assertEqual(cached[0][1].playback, "youtube", "取り直した答えを覚える")
+        self.assertEqual(self.client.count("providers"), 2)
+
+    def test_premium_answer_is_checked_once(self):
+        """Premium (playback の無い答え) でも、初めての成功の後に 1 度だけ確かめる。"""
+        self.catalog.providers(lambda _r: None)
+        self.client.answer(0, providers=_providers())
+        self.catalog.playlists("spotify", lambda _r: None)
+        self.client.answer(1, playlists=[])
+        self.assertEqual(self.client.count("providers"), 2)
+        self.client.answer(2, providers=_providers())
+        self.catalog.search("spotify", "夜", lambda _r: None)
+        self.client.answer(3, tracks=[])
+        self.catalog.tracks("spotify", "x", lambda _r: None)
+        self.client.answer(4, tracks=[])
+        self.assertEqual(self.client.count("providers"), 2, "2 度目からの成功では取り直さない")
+
+    def test_known_playback_and_failures_do_not_refetch(self):
+        # もう playback の載った答えを覚えていれば取り直さない (GUI より前にセッションがあった)
+        self.catalog.providers(lambda _r: None)
+        self.client.answer(0, providers=_providers("youtube"))
+        self.catalog.playlists("spotify", lambda _r: None)
+        self.client.answer(1, playlists=[])
+        self.assertEqual(self.client.count("providers"), 1)
+        # 失敗 (サインインが要る) はセッションができた印ではない。ほかのプロバイダーも見ない
+        catalog = Catalog(_ManualClient())
+        catalog.playlists("spotify", lambda _r: None)
+        catalog.client.sent[0][2](Response(False, {"needs_auth": True}, "sign-in required", "error"))
+        catalog.playlists("navidrome", lambda _r: None)
+        catalog.client.answer(1, playlists=[])
+        catalog.playlists("local", lambda _r: None)
+        catalog.client.answer(2, playlists=[])
+        self.assertEqual(catalog.client.count("providers"), 0)
+        catalog.playlists("spotify", lambda _r: None, force=True)
+        catalog.client.answer(3, playlists=[])
+        self.assertEqual(catalog.client.count("providers"), 1, "サインインの後の初めての成功で取り直す")
 
 
 class LegacyCatalog(CatalogTest):

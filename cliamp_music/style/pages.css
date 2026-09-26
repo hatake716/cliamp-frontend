@@ -123,6 +123,11 @@ window.music .music-detail-info {
   font-feature-settings: "tnum";
 }
 
+/* 情報の行の下の書き添え (「曲は YouTube で探して再生します」)。情報の行より控えめに */
+window.music .music-detail-note {
+  font-weight: 500;
+}
+
 /* 「▶ 再生」は 34x120 (Apple 122x34) */
 window.music button.music-capsule.music-detail-play {
   min-width: 84px;

@@ -10,6 +10,11 @@
   その下に「すべての曲」。行のダブルクリック/Enter で結果全体を replace して
   その曲から再生 (出どころは Source(provider=範囲, name=「語」))。
 - 検索中はスピナー、失敗は理由を、該当なしは「結果がありません」を空状態で出す。
+  Spotify が開発モードのアプリ (自分の client_id) の検索を止めているとき (cliamp の
+  friendlySearchError "spotify: search blocked — …"、元の 400 "Invalid limit") は、英語の文の
+  代わりに「Spotify では検索できません」と使えるもの (プレイリスト・保存した曲) を言い、
+  「YouTube で検索」のボタン (範囲を YouTube に替えて探し直す) を出す。Spotify の範囲の
+  検索のときだけ (YouTube の検索の誤りは語を繰り返すので、語に同じ言葉があっても出さない)。
 - 範囲は GuiState.search_scope に保存する。
 """
 
@@ -21,7 +26,15 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 from gi.repository import Adw, GLib, Gtk  # noqa: E402
 
-from ..protocol import Response, Source, Track  # noqa: E402
+from ..protocol import (  # noqa: E402
+    SPOTIFY_SEARCH_BLOCKED,
+    SPOTIFY_SEARCH_BLOCKED_TITLE,
+    Response,
+    Source,
+    Track,
+    is_spotify_search_blocked,
+    spotify_rate_limit_wait,
+)
 from ..widgets import (  # noqa: E402
     Artwork,
     CategoryTile,
@@ -484,6 +497,16 @@ class SearchPage(PageBase):
                 label = provider_label(self.ctx, scope)
                 self.results.show_empty("music-search-symbolic", "サインインが必要です",
                                         f"{label} はサインインが必要です (cliamp の端末で設定)")
+            elif (scope == "spotify" and is_spotify_search_blocked(result.error)
+                  and spotify_rate_limit_wait(result.error) is None):
+                # 開発モードのアプリでは Spotify が検索を止めている。英語の長い文ではなく、
+                # 何が使えて何を使えばよいかを言い、YouTube の範囲へ移るボタンを出す
+                # (回数の制限は下の message が待ちの長さと一緒に言う)。Spotify の範囲の検索の
+                # ときだけ (YouTube の検索の誤りは語を繰り返すので、語に "search blocked" が
+                # 入っていても Spotify の断りではない。ボタンもいまの範囲へ移るだけになる)
+                self.results.show_empty("music-search-symbolic", SPOTIFY_SEARCH_BLOCKED_TITLE,
+                                        SPOTIFY_SEARCH_BLOCKED, button_label="YouTube で検索",
+                                        on_button=weak_call(self.set_scope, "youtube"))
             else:
                 self.results.show_empty("music-search-symbolic", "検索できませんでした", result.message)
             return

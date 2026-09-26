@@ -9,6 +9,12 @@ history / ローカルのプレイリスト編集) の窓口。
 
 callback は常に main loop で、呼び出しから戻った後に呼ばれる (キャッシュに
 あっても同期では呼ばない)。
+
+providers の答えの playback (曲を YouTube で探して鳴らすか) は、cliamp の Spotify のセッションが
+できてからしか付かない。セッションは spotify の playlists / tracks / search の初回に作られるので、
+それより前の答えには載らない。そこで、spotify のカタログ系が (この cliamp で) 初めて成功した後に
+providers を 1 度だけ取り直し、覚えている答えを置き換える (PROTOCOL.md の ProviderInfo)。
+providers の答えを受け取るたびに add_providers_listener の聞き手へ渡す (取り直しの答えも)。
 """
 
 from __future__ import annotations
@@ -49,6 +55,10 @@ CACHE_CAPS = {"search": 200, "lyrics": 300, "tracks": 100}
 # 期限切れをまとめて捨てる目安 (件数と間隔)
 SWEEP_ENTRIES = 256
 SWEEP_SECONDS = 60.0
+# カタログ系の初回にセッションを作り、その後で providers の playback が変わりうるプロバイダー
+LAZY_SESSION_PROVIDERS = frozenset({"spotify"})
+_SESSION_KINDS = frozenset({"playlists", "tracks", "search"})
+_PROVIDERS_KEY = ("providers",)
 
 
 def _call(callback: Callable[[Any], object], value: Any) -> bool:
@@ -74,6 +84,11 @@ class Catalog:
         self._waiting: dict[tuple, list[Callable]] = {}
         self._lane_latest: dict[str, tuple] = {}
         self._swept = 0.0
+        # カタログ系が成功した (= cliamp がセッションを作った) プロバイダー。繋ぎ直しで空にする
+        self._sessions: set[str] = set()
+        # 送った providers の答えがセッションより前のものかもしれない (届いたら取り直す)
+        self._providers_again = False
+        self._providers_listeners: list[Callable[[list[ProviderInfo]], object]] = []
 
     # --- 共通 -------------------------------------------------------------------
 
@@ -119,9 +134,11 @@ class Catalog:
                 self.client.request(cmd, done, lane=lane, **fields)
                 return
             callbacks = self._waiting.pop(key, [])
+            # セッションより前に送った providers の答え (覚えない。届いたら取り直す)
+            stale = key == _PROVIDERS_KEY and self._providers_again
             if response.ok:
                 value = parse(response.data)
-                if ttl > 0:
+                if ttl > 0 and not stale:
                     self._store(key, ttl, value)
             else:
                 value = response
@@ -132,13 +149,55 @@ class Catalog:
                         self._store(key, miss_ttl, value)
             for cb in callbacks:
                 _call(cb, _copy(value))
+            self._after(key, response.ok, value, stale)
 
         self.client.request(cmd, done, lane=lane, **fields)
 
+    def _after(self, key: tuple, ok: bool, value: Any, stale: bool) -> None:
+        """答えが届いた後の始末: providers の聞き手へ渡す・セッションができたら providers を取り直す。"""
+        if key == _PROVIDERS_KEY:
+            if stale:
+                self._providers_again = False
+                self._refresh_providers()
+            elif ok:
+                for listener in list(self._providers_listeners):
+                    _call(listener, _copy(value))
+        elif ok and key[0] in _SESSION_KINDS and len(key) > 1 and key[1] in LAZY_SESSION_PROVIDERS:
+            self._session_started(key[1])
+
+    def _session_started(self, provider: str) -> None:
+        """provider のカタログ系が初めて成功した (cliamp がセッションを作った)。覚えている providers の
+        答えがそれより前のもので、provider の鳴らし方が載っていなければ、1 度だけ取り直す。"""
+        if provider in self._sessions:
+            return
+        self._sessions.add(provider)
+        hit = self._cache.get(_PROVIDERS_KEY)
+        if (_PROVIDERS_KEY not in self._waiting and hit is not None
+                and any(info.key == provider and info.playback for info in hit[1])):
+            return  # もう載っている (セッションはこの答えより前からあった)
+        self._cache.pop(_PROVIDERS_KEY, None)  # 古い答えを配らない
+        self._refresh_providers()
+
+    def _refresh_providers(self) -> None:
+        if _PROVIDERS_KEY in self._waiting:
+            # 送ってある providers はセッションより前に答えたかもしれない。届いてから取り直す
+            self._providers_again = True
+            return
+        self.providers(lambda _result: None, force=True)
+
+    def add_providers_listener(self, listener: Callable[[list[ProviderInfo]], object]) -> None:
+        """providers の答え (成功したもの) が届くたびに listener(答え) を呼ぶ。カタログが自分で
+        取り直した答え (セッションができた後) もここに来る。キャッシュからの答えでは呼ばない。"""
+        self._providers_listeners.append(listener)
+
     def invalidate(self, provider: str | None = None) -> None:
-        """覚えている結果を捨てる (Ctrl+R など)。provider を指定すればそのプロバイダーの分だけ。"""
+        """覚えている結果を捨てる (Ctrl+R・繋ぎ直しなど)。provider を指定すればそのプロバイダーの分だけ。
+
+        全部を捨てるときは、どのプロバイダーのセッションができたかも忘れる (繋ぎ直した cliamp は
+        再起動したものかもしれない。次のカタログ系の成功の後でまた providers を取り直す)。"""
         if provider is None:
             self._cache.clear()
+            self._sessions.clear()
             return
         for key in [k for k in self._cache if len(k) > 1 and k[1] == provider]:
             del self._cache[key]

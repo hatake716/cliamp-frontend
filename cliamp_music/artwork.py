@@ -46,7 +46,7 @@ from gi.repository import Gdk, GdkPixbuf, GLib  # noqa: E402
 import cairo  # noqa: E402
 
 from . import VERSION, log  # noqa: E402
-from .protocol import Track, is_url, track_key  # noqa: E402
+from .protocol import Track, is_url, is_youtube_bridge, track_key  # noqa: E402
 
 MAX_CACHE_PX = 600
 TIMEOUT = 4.0  # 1 回の操作 (接続・読み取り) の待ち
@@ -90,6 +90,10 @@ def art_sources(track: Track, size: int = 0) -> list[str]:
     2. YouTube: 大きな表示 (>= 300px) では sddefault.jpg、次に hqdefault.jpg
     3. Spotify: oEmbed の URL (応答の JSON の thumbnail_url を取る)
     4. 手元のファイル: "embedded:<パス>" (埋め込みの絵) → 同じフォルダの cover/folder.(jpg|png)
+
+    YouTube で探して鳴らす Spotify の曲 (meta "spotify.bridge" が "youtube"、path は
+    "ytsearch1:…") は、meta "spotify.id" から Spotify のアルバムの絵を取る。検索式の path には
+    動画が無いので YouTube のサムネイルは探さない (path が動画の URL でも Spotify の絵を先に)。
     """
     out: list[str] = []
 
@@ -102,12 +106,14 @@ def art_sources(track: Track, size: int = 0) -> list[str]:
         add(art)
     elif art.startswith("/"):
         add(Path(art).as_uri())
+    spotify = track.spotify_id
+    if spotify and is_youtube_bridge(track):
+        add(f"{SPOTIFY_OEMBED}https://open.spotify.com/track/{spotify}")
     video = track.youtube_id
     if video:
         if size >= 300:
             add(f"https://i.ytimg.com/vi/{video}/sddefault.jpg")
         add(f"https://i.ytimg.com/vi/{video}/hqdefault.jpg")
-    spotify = track.spotify_id
     if spotify:
         add(f"{SPOTIFY_OEMBED}https://open.spotify.com/track/{spotify}")
     path = track.local_path

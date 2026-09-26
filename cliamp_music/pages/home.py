@@ -94,6 +94,10 @@ PROVIDER_LABELS = {
 
 RECENT_SOURCE_NAME = "最近再生した項目"
 
+# Spotify の接続が Web API だけのとき (ProviderInfo の playback が "youtube")、曲は YouTube で
+# 探して鳴らす。プレイリストの詳細の情報の行の下と、すべてのプレイリストの節に書き添える。
+WEB_ONLY_NOTE = "曲は YouTube で探して再生します"
+
 
 # --------------------------------------------------------------------------
 # 弱い呼び出し
@@ -141,12 +145,27 @@ def provider_label(ctx, key: str) -> str:
 
 
 def remember_provider_names(ctx, providers) -> None:
-    """providers の結果から表示名を覚えておく (provider_label が使う)。"""
+    """providers の結果から表示名と鳴らし方を覚えておく (provider_label・provider_playback が使う)。
+
+    AppContext なら ctx.remember_providers に任せる (鳴らし方が変われば "providers-changed")。"""
+    remember = getattr(ctx, "remember_providers", None)
+    if callable(remember):
+        remember(providers)
+        return
     try:
-        names = {info.key: info.name for info in providers if info.name}
-    except TypeError:
+        infos = list(providers)
+        names = {info.key: info.name for info in infos if info.name}
+        playback = {info.key: getattr(info, "playback", "") for info in infos}
+    except (TypeError, AttributeError):
         return
     ctx._provider_names = {**(getattr(ctx, "_provider_names", None) or {}), **names}
+    # 鳴らし方はサインインの具合で変わるので、届いた一覧で置き換える (前の値を持ち越さない)
+    ctx._provider_playback = playback
+
+
+def provider_playback(ctx, key: str) -> str:
+    """覚えているプロバイダーの鳴らし方 (ProviderInfo の playback。"youtube" か "")。"""
+    return (getattr(ctx, "_provider_playback", None) or {}).get(key, "")
 
 
 def keep_together(text: str) -> str:
@@ -719,7 +738,11 @@ class DetailHeader(Gtk.Box):
         self.subtitle_label = _label("", "music-detail-subtitle")
         self.info_label = _label("", ("music-info", "music-detail-info"))
         self.info_label.set_margin_top(6)
-        for label in (self.title_label, self.subtitle_label, self.info_label):
+        # 情報の行の下の書き添え (「曲は YouTube で探して再生します」など)。無ければ隠す
+        self.note_label = _label("", ("music-info", "music-detail-note"), wrap=True, lines=2)
+        self.note_label.set_margin_top(2)
+        self.note_label.set_visible(False)
+        for label in (self.title_label, self.subtitle_label, self.info_label, self.note_label):
             texts.append(label)
         column.append(texts)
 
@@ -772,6 +795,11 @@ class DetailHeader(Gtk.Box):
     def set_info(self, text: str) -> None:
         self.info_label.set_text(text or "")
         self.info_label.set_visible(bool(text))
+
+    def set_note(self, text: str) -> None:
+        """情報の行の下の控えめな書き添え (空なら隠す)。"""
+        self.note_label.set_text(text or "")
+        self.note_label.set_visible(bool(text))
 
     def set_actions_sensitive(self, sensitive: bool) -> None:
         self.shuffle_button.set_sensitive(sensitive)
@@ -1017,8 +1045,8 @@ class AdaptiveGrid(Gtk.FlowBox):
 class ContentStack(Gtk.Stack):
     """読み込み中 / 空・失敗 / 中身 を切り替える箱。
 
-    `show_loading(text=None)` / `show_empty(icon, title, description=None)` /
-    `show_content()`。中身は `content` (縦の箱) に積む。"""
+    `show_loading(text=None)` / `show_empty(icon, title, description=None, *, button_label=None,
+    on_button=None)` / `show_content()`。中身は `content` (縦の箱) に積む。"""
 
     def __init__(self, loading_text: str | None = None):
         super().__init__()
@@ -1041,10 +1069,13 @@ class ContentStack(Gtk.Stack):
             self.loading.set_label(text)
         self.set_visible_child_name("loading")
 
-    def show_empty(self, icon: str, title: str, description: str | None = None) -> None:
+    def show_empty(self, icon: str, title: str, description: str | None = None, *,
+                   button_label: str | None = None, on_button=None) -> None:
+        """空・失敗の表示。button_label があれば赤いカプセルのボタンも出す (押すと on_button)。"""
         self.empty.set_icon_name(icon)
         self.empty.set_title(title)
         self.empty.set_description(description)
+        self.empty.set_button(button_label, on_button)
         self.set_visible_child_name("empty")
 
     def show_content(self) -> None:

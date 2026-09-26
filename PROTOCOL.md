@@ -42,7 +42,7 @@ GUI が必要とするコマンドを **足す** パッチの仕様。パッチ�
 | `feed` | bool | Feed |
 | `unplayable` | bool | Unplayable |
 | `bookmark` | bool | Bookmark |
-| `meta` | {string: string} | ProviderMeta (例 `spotify.id`、`navidrome.id`) |
+| `meta` | {string: string} | ProviderMeta (例 `spotify.id`、`navidrome.id`。YouTube へ橋渡しした Spotify の曲は `spotify.id` と `spotify.bridge`。下の「Spotify の Web API だけの接続」) |
 | `queued` | int | `playlist` の応答だけ。「次に再生」の待ち行列での 1 始まりの位置 |
 | `played_at` | string (RFC3339) | `history` の応答だけ |
 | `path_raw` | string (base64) | Path が UTF-8 でないときだけ付く、Path の元のバイト列 |
@@ -83,6 +83,7 @@ GUI が `replace` / `load_provider` で渡したもの。TUI 側でプロバイ�
 ### ProviderInfo
 
 `{"key": "spotify", "name": "Spotify", "search": true, "playlists": true, "virtual": false}`
+(Web API だけの接続の Spotify は `..., "virtual": false, "playback": "youtube"}`)
 
 - `search`: そのキーで `search` を呼んで、そのプロバイダーの検索になるか
   (`provider.Searcher` を実装しているもの、`yt` / `youtube` / `ytmusic` / `soundcloud` の
@@ -90,7 +91,15 @@ GUI が `replace` / `load_provider` で渡したもの。TUI 側でプロバイ�
   (下) が、その局の検索ではないので false。
 - `playlists`: `playlists` / `tracks` が意味を持つか。
 - `virtual`: cliamp のプロバイダー一覧には無いが、IPC が用意する疑似プロバイダー。
-- ProviderInfo は omitempty を付けない (false の真偽も省かない)。local の名前は `Local`。
+- `playback` (string、省略可): そのプロバイダーの曲を別の所から鳴らしているときだけ、その名前。
+  いまは Spotify が Web API だけで繋がっているときの `"youtube"` だけ (下の「Spotify の Web API
+  だけの接続」)。Premium で librespot から鳴らしているとき、ほかのプロバイダー、疑似プロバイダーには
+  付かない。`providers` のたびにセッションのいまの状態から求めるので、Spotify のセッションが
+  まだ無いうち (起動後、spotify の `playlists` / `tracks` / `search` を 1 度も呼んでいないうち) は、
+  保存された資格情報が Web API だけのものでも付かない。GUI は spotify のカタログ系が初めて
+  成功した後に `providers` を取り直すこと。
+- ProviderInfo の真偽は omitempty を付けない (false の真偽も省かない)。`playback` だけは
+  無いときに省く。local の名前は `Local`。
 
 疑似プロバイダー:
 
@@ -202,6 +211,12 @@ omitempty で省かれる。`cliamp status` の平文の出力には出さない
   (`no episodes found in feed`)。
 - yt-dlp の曲のシーク (yt-dlp の起こし直し) の失敗 (`yt-dlp seek: …`)。音が止まったままになるため。
   このときだけは、後のシークが成功すれば (音が戻れば) 消える。
+- Web API だけで繋がった Spotify で `spotify:track:` の曲 (履歴、前に保存したローカルのプレイリスト、
+  Premium だったころの写しなど) を始めたとき。文言は
+  `custom streamer: spotify: streaming unavailable (this Spotify connection is Web API only; Spotify Premium is required to stream Spotify tracks)`。
+  受け手は `spotify: streaming unavailable` を含むかで見分け、「Spotify の曲を Spotify から鳴らすには
+  Premium が要る」と伝える (サインインの問題ではないので `needs_auth` にはならず、TUI もサインインの
+  画面を出さない)。
 
 消えるとき: 次の開始の時点 (同じ曲のやり直し、next / prev / play_index / replace / enqueue、止まった
 曲の toggle など。読み込み中は出ない)、gapless で次の曲へ進んだとき。**止めても (stop) 消えない**
@@ -281,6 +296,61 @@ URL へ展開する。
 `unknown provider: x`、`provider youtube has no playlists`、`invalid playlist name "a/b"`、
 `"Recently Played" is a virtual history playlist and cannot be modified`、
 `track index N out of range`。tests/test_conformance.py が偽と本物の両方で確かめる。
+Spotify の Web API が長い待ちを求めたとき (下) は `… spotify: rate limited by Spotify; retry after 24h0m0s`。
+
+### Spotify の Web API だけの接続 (`playback: "youtube"`)
+
+cliamp の Spotify は、サインインで得た OAuth のトークンから go-librespot のセッション
+(再生用) を作る。Spotify がこの資格情報を **拒んだ** とき、つまり
+
+- login5 の `INVALID_CREDENTIALS` / `UNKNOWN_IDENTIFIER` (自分で登録した Developer アプリの
+  client_id のトークンで起きる)、
+- アクセスポイントの `BadCredentials` / `PremiumAccountRequired` (Free のアカウントで返ることがある)
+
+のときは、トークンを捨てずに **Web API だけ** で繋ぐ (以前は接続ごと失敗し、`playlists` は
+何も返さなかった)。ネットワークの誤り、待ち時間切れ、login5 の `TRY_AGAIN_LATER` /
+`TOO_MANY_ATTEMPTS` / `TIMEOUT` / `UNKNOWN_ERROR` などは拒否ではないので、従来どおり
+その誤りで失敗する。Premium で librespot が繋がるときの動きと保存の形は変わらない。
+見るのはセッションを作る時点の拒否だけ: Free のアカウントでも librespot のセッションが
+作れてしまったとき (組み込みの共有 client_id で起きた) は Web API だけの接続にならず、曲は
+`spotify:track:` のまま、鳴らすときに従来どおり失敗する。
+
+- 保存: `~/.config/cliamp/spotify_credentials.json` に `web_only: true`、リフレッシュトークン、
+  `device_id`、分かれば `user_id` を書く (`username` は空、`data` は null)。次からの起動はブラウザを開かず
+  リフレッシュトークンで同じ接続に戻る (librespot は試し直さない。Premium にしたら
+  `cliamp spotify reset` してサインインし直す)。Spotify がリフレッシュトークンを断ったら
+  (`invalid_grant`、`invalid_client` などトークン窓口の 4xx。408・429・5xx・通信の失敗は一時的な
+  ものとして資格情報を残し、次の Web API 呼び出しで取り直す) 資格情報を消して `needs_auth`。
+  起動後に断られたときも以後の呼び出しは `needs_auth` になり、TUI のサインインがその接続を
+  置き換える。Spotify がリフレッシュトークンを替えたら書き戻す。最初の呼び出しが同時に
+  いくつ来ても、保存したリフレッシュトークンで戻すのは 1 回だけ。
+- `playlists` / `tracks` / `search` は Web API から取る (「Your Music」= お気に入りの曲、自分の・
+  共同編集のプレイリスト)。曲はすべて **YouTube への橋渡し** になる:
+
+  ```json
+  {"path": "ytsearch1:Queen David Bowie Under Pressure", "title": "Under Pressure",
+   "artist": "Queen, David Bowie", "album": "Hot Space", "year": 1982, "track_number": 11,
+   "duration": 248, "meta": {"spotify.id": "2aoo2jlRnM3A0NyLQqMN2f", "spotify.bridge": "youtube"}}
+  ```
+
+  `path` は `ytsearch1:` + アーティスト名を空白でつないだもの + 空白 + 曲名 (空白の連なり・
+  改行・タブは 1 つの空白にし、空のアーティスト名は飛ばす)。yt-dlp が YouTube の最初の候補を
+  鳴らす (ほかの `ytsearch` の曲と同じく `buffering`、yt-dlp のシーク、yt-dlp の誤り)。
+  `title` / `artist` (`, ` 区切り) / `album` / `year` / `track_number` / `duration` は Spotify の
+  もの (`search` の結果にも `track_number` が付く。Premium の `spotify:track:` の検索結果には
+  従来どおり付かない)。`unplayable` は付かない (Spotify の地域制限は YouTube には関係しない)。
+  `stream` も付かない。Spotify の曲の ID が要るときは
+  `meta` の `spotify.id` を使う (TUI の「Spotify のプレイリストへ追加」もそうする)。
+- 自分で登録した Development Mode のアプリでは `search` が Spotify 側で塞がれている
+  (`spotify: search blocked — …`)。GUI は YouTube の検索を勧めてよい。
+- `spotify:track:` の曲は鳴らせない (上の「再生の失敗」の `spotify: streaming unavailable`)。
+
+Web API の 429 (待ってほしい): `Retry-After` が 30 秒以下なら待って繰り返す (最大 8 回。
+`Retry-After` が無ければ 1, 2, 4 … 秒、30 秒で頭打ち)。30 秒を越える待ちを求められたら
+待たずに `spotify: rate limited by Spotify; retry after <長さ>` (Go の time.Duration の書き方、
+例 `24h0m0s`) で失敗する。`playlists` なら `spotify: your music: spotify: rate limited by Spotify;
+retry after 24h0m0s` のように前に文脈が付く。Premium の接続でも同じ (以前は 24 時間待ち続け、
+要求が 120 秒で切れるまで返らなかった)。
 
 ### 既存の `device` (出力先)
 

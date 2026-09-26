@@ -24,7 +24,8 @@ macOS 27 の「ミュージック」風に操作する GTK4 + libadwaita のア�
   リンクのコピー、歌詞と次に再生のパネル、出力先 (cliamp の `device`)、音量。
 - **ホーム**: 最近再生した YouTube の曲から作るステーション (YouTube のミックス)、
   最近再生した項目、プレイリスト、日本の人気のラジオ局。
-- **検索**: YouTube (cliamp の yt-dlp の検索)、Spotify (登録されていれば)、ライブラリ
+- **検索**: YouTube (cliamp の yt-dlp の検索)、Spotify (登録されていれば。自前の client_id では
+  Spotify が検索を止めているので [下](#spotify-無料プラン))、ライブラリ
   (ローカルのプレイリストと履歴)。トップの結果と曲の一覧、最近の検索、カテゴリーのタイル。
 - **ラジオ**: cliamp ラジオ (組み込みの局とお気に入り) と
   [Radio Browser](https://www.radio-browser.info/) の人気局・局の検索。
@@ -64,7 +65,8 @@ macOS 27 の「ミュージック」風に操作する GTK4 + libadwaita のア�
 - アプリは MPRIS の名前を取らない (GNOME のメディアの操作や Open-Voice からは、今まで
   どおり cliamp が 1 つのプレーヤーとして見える)。
 - アートワークは cliamp が持っていないので、アプリが曲から求める: YouTube の曲は
-  サムネイル (黒帯を除いて正方形に切り抜く)、Spotify は oEmbed、手元のファイルは埋め込みの
+  サムネイル (黒帯を除いて正方形に切り抜く)、Spotify は oEmbed (YouTube で探して鳴らす
+  Spotify の曲も、探した動画ではなく Spotify のアルバムの絵)、手元のファイルは埋め込みの
   絵か同じフォルダの cover.jpg、ラジオは局の favicon。取れなければ色の代わりの絵。
   `~/.cache/cliamp-music/` に 256 MiB まで置く。
 
@@ -164,6 +166,48 @@ macOS の Command は Ctrl に置き換えてある。
 | Ctrl+0 | メインの窓 |
 | Ctrl+W / Ctrl+Q | 窓を閉じる / 終了 (cliamp の再生は続く) |
 
+## Spotify (無料プラン)
+
+cliamp の Spotify は、曲そのものを librespot (Spotify の再生の仕組み) で受けて鳴らすので、
+Spotify から直接鳴らせるのは Premium の利用者だけ。無料プランでもプレイリストを使えるように、
+パッチは Spotify の接続を 2 つの形で扱う。
+
+- **Premium** (librespot のセッションが作れる): 今までどおり。曲は Spotify から直接鳴り、
+  `spotify_credentials.json` の形も変わらない。
+- **Web API だけ**: サインイン (OAuth) は済んだが、Spotify が librespot のセッションを断った
+  とき (自分で登録した client_id のトークンに `login5` が `INVALID_CREDENTIALS` を返す、
+  無料プランにアクセスポイントが Premium を求める、など。一時的なネットワークの失敗は含まない)。cliamp はトークンを捨てずに Web API だけを使い、
+  プレイリストと保存した曲 (Your Music) の一覧は Spotify から取る。曲は **YouTube で探して
+  鳴らす** (Spotify の曲名とアーティストで yt-dlp の `ytsearch1:` を引き、最初に見つかった動画を
+  鳴らす。ライブ版やカバーが当たることもある)。曲名・アルバム・長さ・アートワークは Spotify の
+  もので、「リンクをコピー」も Spotify の曲を指す。アプリのプレイリストの詳細とすべての
+  プレイリストの Spotify の節には「曲は YouTube で探して再生します」と出る。リフレッシュ
+  トークンは Web API だけの印と一緒に `spotify_credentials.json` に残るので、次からはブラウザを
+  開かずに繋がる (librespot は試し直さないので、Premium にしたら `cliamp spotify reset` して
+  サインインし直す)。
+
+無料プランでも、Spotify が librespot のセッションを断らなかったとき (組み込みの共有の
+client_id で起きた) は Web API だけの接続にならず、曲は Spotify から鳴らそうとして失敗する。
+無料プランでは下のとおり自分の client_id を使う。
+
+使い方: [cliamp の説明](https://github.com/bjarneo/cliamp/blob/main/docs/spotify.md) のとおり
+[Spotify for Developers](https://developer.spotify.com/dashboard) でアプリを作り (開発モードで
+よい。Redirect URI は `http://127.0.0.1:19872/login`)、その Client ID を
+`~/.config/cliamp/config.toml` の `[spotify]` の `client_id` に書く。サインインは端末の cliamp で
+行う (アプリからは始めない)。
+
+- **検索**: 開発モードのアプリからの `/v1/search` は Spotify が止めている (400 "Invalid limit")。
+  検索の「Spotify」の範囲では英語の誤りの代わりに「Spotify では検索できません」と出し、
+  「YouTube で検索」のボタンで YouTube の範囲に替えて探し直せる。プレイリストと保存した曲は
+  そのまま使える。`client_id` を書かないときの cliamp の組み込みの共有の client_id は、世界中で
+  共有されているため回数の制限 (1 日待てと言われることもある) にかかりやすい。
+- **回数の制限**: Spotify の Web API に待つよう言われたとき (429 の Retry-After)、cliamp は短い
+  待ち (30 秒まで) だけ待ってやり直し、それより長ければ待たずに失敗を返す (何時間も止まった
+  ままにならない)。アプリは「Spotify から回数の制限を受けています。24 時間ほど待ってから、
+  もう一度試してください」のように待つ長さを出す。
+- Web API だけの接続では、`spotify:track:` の曲 (前に Premium で作ったリストなど) は鳴らせず、
+  再生バーに「Spotify の曲の再生には Premium が必要です」と出る。
+
 ## 制限
 
 - 配色は暗色だけ (このアプリを作った環境が暗色で固定のため)。
@@ -202,7 +246,9 @@ nix build path:.#checks.x86_64-linux.ui   # 画面を使う試験を Xvfb の中
 `tests/fake_cliamp.py` は PROTOCOL.md を実装した偽の cliamp (本物の振る舞いに合わせて
 ある)。`tests/test_conformance.py` は同じ断言を偽と、環境変数
 `CLIAMP_MUSIC_REAL_SOCKET` で指した本物のパッチ済み cliamp の両方に当てる (本物は
-一時的な HOME で、音は ALSA の null などで鳴らさずに動かすこと)。
+一時的な HOME で、音は ALSA の null などで鳴らさずに動かすこと)。Spotify が Web API だけで
+繋がった cliamp の断言は、偽 (`--spotify-web-only`) にはいつも、本物には
+`CLIAMP_MUSIC_REAL_WEBONLY_SOCKET` があるときだけ当てる (本物の Spotify には繋がない)。
 
 ## ライセンス
 

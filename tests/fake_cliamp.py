@@ -31,11 +31,22 @@
   止まり、status の playback_error に本物の文言 (YouTube の曲は yt-dlp の年齢確認の誤り、
   それ以外は手元のファイルが無いときの誤り) が入る。本物と同じく次の開始で消え、止めても
   残り、いまの曲が失敗した曲でなければ出さない。
+- spotify_web_only=True (--spotify-web-only) は、Spotify の接続が Web API だけの cliamp
+  (無料プランや、librespot に断られた自前の client_id)。providers の spotify に
+  `playback: "youtube"` が付く。本物と同じく、付くのは Spotify のセッションができてから
+  (spotify の playlists / tracks / search か spotify:track: の曲の開始が、サインインの断りなしに
+  通った後) で、起動したばかりの providers には付かない。プレイリスト・保存した曲 (YOUR MUSIC) の
+  曲は YouTube で探して鳴らす形 (path `ytsearch1:<アーティストを空白で繋いだもの> <曲名>`、
+  曲名などは Spotify のまま、meta `{"spotify.id": …, "spotify.bridge": "youtube"}`、`stream` も
+  `unplayable` も無し) で返る。Spotify の検索は開発モードのアプリと同じく cliamp の
+  friendlySearchError の文言で断り、spotify:track: の曲を始めると本物と同じ
+  "custom streamer: spotify: streaming unavailable (…)" の誤りで止まる。
 
 試験の道具: `isolate_display()` (利用者の画面に繋がない)、`temp_socket_path()`、
 `temp_dir(prefix)` (どちらも試験の終わりに消える)、
 `run_loop(until, timeout)` (GLib の main loop を回す)。FakeCliamp の `requests` に
-受けた要求が残り、`delays` で応答を遅らせられる。`seek_delay` (秒) で seek_to を
+受けた要求が残り、`delays` で応答を遅らせられる。`spotify_error` に文言を入れると Spotify の
+playlists / tracks / search をその誤りで断る (回数の制限など)。`seek_delay` (秒) で seek_to を
 本物の HTTP の流れのように遅れて効かせ、`switch_keeps_old=True` で読み込み中の
 曲の切り替えを本物と同じく「前の曲の位置と長さのまま playing」にする。
 
@@ -194,6 +205,36 @@ UPLOADERS = ["Aurora Lane", "青い灯台", "Kite Theory", "真夜中ポスト",
 
 # path にこれを含む曲は鳴らせない (playback_error の試験と画面写真のため)。
 FAIL_MARK = "__fail__"
+
+# cliamp の external/spotify の friendlySearchError (開発モードのアプリで /v1/search が 400
+# "Invalid limit" になったときの言い直し)。本物の文言そのまま。
+SPOTIFY_SEARCH_BLOCKED = (
+    "spotify: search blocked — your client_id is too new. Spotify's Nov 27 2024 change blocks /v1/search "
+    "for apps in Development Mode (the rest of cliamp still works on your app). Remove client_id from "
+    "[spotify] in config.toml to use the built-in fallback for search, or apply for Extended Quota Mode")
+# Web API だけの接続で spotify:track: の曲を始めたときの誤り (librespot のセッションが無い)。
+# 本物の ErrStreamingUnavailable に player の "custom streamer: " が付いたもの。
+SPOTIFY_STREAMING_UNAVAILABLE = ("custom streamer: spotify: streaming unavailable (this Spotify connection is "
+                                 "Web API only; Spotify Premium is required to stream Spotify tracks)")
+
+
+def spotify_bridge(track: dict) -> dict:
+    """Spotify の曲 (path spotify:track:<id>) を YouTube で探して鳴らす形にする (Web API だけの接続)。
+
+    path は "ytsearch1:<アーティストを空白で繋いだもの> <曲名>"、曲名・アーティスト・アルバム・年・
+    曲番号・長さは Spotify のまま、unplayable も stream も立てない (本物の bridged() と同じ)。
+    meta は spotify.id と spotify.bridge (撮影の絵 art があれば残す)。"""
+    sid = str(track["path"]).removeprefix("spotify:track:")
+    artists = " ".join(a for a in str(track.get("artist") or "").split(", ") if a)
+    query = " ".join(part for part in (artists, str(track.get("title") or "")) if part)
+    bridged = {k: v for k, v in track.items() if k not in ("path", "unplayable", "stream", "meta")}
+    bridged["path"] = f"ytsearch1:{query}"
+    meta = {"spotify.id": sid, "spotify.bridge": "youtube"}
+    art = (track.get("meta") or {}).get("art")
+    if art:
+        meta["art"] = art
+    bridged["meta"] = meta
+    return bridged
 
 
 def playback_error_for(path: str) -> str:
@@ -675,10 +716,17 @@ class FakeCliamp:
                  spotify_needs_auth: bool = False, latency: float = 0.0, buffer_secs: float = 0.0,
                  initial_state: str = "playing", empty: bool = False, seed: int = 7,
                  radios_toml: bool = False, device_descriptions: bool = False,
-                 switch_keeps_old: bool = False):
+                 switch_keeps_old: bool = False, spotify_web_only: bool = False):
         self.socket_path = socket_path
         self.legacy = legacy
         self.spotify_needs_auth = spotify_needs_auth
+        # Spotify の接続が Web API だけ (曲は YouTube で探して鳴らし、検索は開発モードで断られる)
+        self.spotify_web_only = spotify_web_only
+        # Spotify のセッションができたか。本物の cliamp はカタログ系の初回 (ensureSession) に作り、
+        # providers の playback はセッションができてからしか付かない
+        self._spotify_session = False
+        # 空でなければ Spotify の playlists / tracks / search をこの誤りで断る (回数の制限など)
+        self.spotify_error = ""
         self.latency = latency
         self.buffer_secs = buffer_secs
         self.radios_toml = radios_toml
@@ -776,8 +824,9 @@ class FakeCliamp:
     def _spotify_track(self, i: int) -> dict:
         title, artist, album, secs, genre, year, _ = LIBRARY[i]
         sid = fake_spotify_id(f"spotify|{title}")
-        return self._with_art({"path": f"spotify:track:{sid}", "title": title, "artist": artist,
-                               "album": album, "year": year, "duration": secs, "track_number": 1}, title)
+        track = self._with_art({"path": f"spotify:track:{sid}", "title": title, "artist": artist,
+                                "album": album, "year": year, "duration": secs, "track_number": 1}, title)
+        return spotify_bridge(track) if self.spotify_web_only else track
 
     def _seed_history(self) -> None:
         now = datetime.now(timezone.utc)
@@ -972,7 +1021,7 @@ class FakeCliamp:
         self.playback_error = ""
         self._error_path = ""
         track, _ = self.pl.current()
-        self._failing = bool(track and FAIL_MARK in str(track.get("path") or ""))
+        self._failing = bool(track and self._cannot_play(str(track.get("path") or "")))
         if self.buffer_secs > 0:
             self._buffering_until = at + self.buffer_secs
             self._t_base = at + self.buffer_secs
@@ -981,6 +1030,10 @@ class FakeCliamp:
             self._t_base = at
             if self._failing:
                 self._fail(at)
+
+    def _cannot_play(self, path: str) -> bool:
+        """始めると失敗する曲か (__fail__ の印、Web API だけの接続での spotify:track: の曲)。"""
+        return FAIL_MARK in path or (self.spotify_web_only and path.startswith("spotify:track:"))
 
     def _fail(self, at: float) -> None:
         """いまの曲の開始が失敗した: 止まり、理由を playback_error に置く。"""
@@ -992,7 +1045,12 @@ class FakeCliamp:
         self._t_base = at
         self._buffering_until = 0.0
         self._old = None
-        self.playback_error = playback_error_for(path)
+        if self.spotify_web_only and path.startswith("spotify:track:") and FAIL_MARK not in path:
+            # 本物の NewStreamer も ensureSession を通るので、ここでセッションができる
+            self._spotify_session = self._spotify_session or not self.spotify_needs_auth
+            self.playback_error = SPOTIFY_STREAMING_UNAVAILABLE
+        else:
+            self.playback_error = playback_error_for(path)
         self._error_path = path
 
     def _freeze(self, now: float) -> None:
@@ -1493,10 +1551,15 @@ class FakeCliamp:
     def _cmd_providers(self, req, now):
         # radio は Searcher でない (search は YouTube へ退避するだけ) ので search は false。
         # ProviderInfo は omitempty の無い構造体なので、偽の真偽も省かない (omit の _OPAQUE_LISTS)
+        # playback (omitempty) は Web API だけの Spotify にだけ付く ("youtube")
+        spotify = {"key": "spotify", "name": "Spotify", "search": True, "playlists": True, "virtual": False}
+        if self.spotify_web_only and not self.spotify_needs_auth and self._spotify_session:
+            # 本物はセッションのいまの状態から求める (起動したばかりでまだ無ければ付かない)
+            spotify["playback"] = "youtube"
         return {"ok": True, "providers": [
             {"key": "radio", "name": "Radio", "search": False, "playlists": True, "virtual": False},
             {"key": "local", "name": "Local", "search": True, "playlists": True, "virtual": False},
-            {"key": "spotify", "name": "Spotify", "search": True, "playlists": True, "virtual": False},
+            spotify,
             {"key": "youtube", "name": "YouTube", "search": True, "playlists": False, "virtual": True},
         ]}
 
@@ -1521,6 +1584,17 @@ class FakeCliamp:
     @staticmethod
     def _needs_auth() -> dict:
         return {"ok": False, "error": "sign-in required", "needs_auth": True}
+
+    def _spotify_session_or_refusal(self) -> dict | None:
+        """Spotify のカタログ系の前置き (本物の ensureSession と、その後の Web API の断り)。
+        サインインが要れば needs_auth。そうでなければセッションができ (providers に playback が
+        載るようになる)、spotify_error があればその誤り。通れば None。"""
+        if self.spotify_needs_auth:
+            return self._needs_auth()
+        self._spotify_session = True
+        if self.spotify_error:
+            return {"ok": False, "error": self.spotify_error}
+        return None
 
     @staticmethod
     def _unknown_provider(provider: str) -> dict:
@@ -1553,8 +1627,9 @@ class FakeCliamp:
                               "duration": sum(int(t.get("duration") or 0) for t in tracks)})
             return {"ok": True, "playlists": lists}
         if provider == "spotify":
-            if self.spotify_needs_auth:
-                return self._needs_auth()
+            refused = self._spotify_session_or_refusal()
+            if refused is not None:
+                return refused
             return {"ok": True, "playlists": [
                 {"id": pid, "name": name, "section": section, "track_count": len(tracks),
                  "duration": sum(t["duration"] for t in tracks)}
@@ -1630,8 +1705,9 @@ class FakeCliamp:
                 return {"ok": False, "error": f"open {self._toml_path(pid)}: no such file or directory"}
             return {"ok": True, "tracks": tracks}
         if provider == "spotify":
-            if self.spotify_needs_auth:
-                return self._needs_auth()
+            refused = self._spotify_session_or_refusal()
+            if refused is not None:
+                return refused
             if pid not in self.spotify_lists:
                 return {"ok": False, "error": f"spotify: playlist {go_quote(pid)} not found"}
             return {"ok": True, "tracks": [dict(t) for t in self.spotify_lists[pid][2]]}
@@ -1666,7 +1742,9 @@ class FakeCliamp:
         if provider not in ("youtube", "radio", "soundcloud", "local", "spotify"):
             return self._unknown_provider(provider)
         if "__fail__" in query:
-            return {"ok": False, "error": "yt-dlp: exit status 1"}
+            # 本物の yt-dlp の検索の失敗 (resolve.go の "resolving yt-dlp %s: %w")。利用者の語をそのまま繰り返す
+            prefix = "scsearch" if provider == "soundcloud" else "ytsearch"
+            return {"ok": False, "error": f"resolving yt-dlp {prefix}{limit}:{query}: yt-dlp: exit status 1"}
         if "noresults" in query.lower() or "該当なし" in query:
             return {"ok": True}
         if provider == "local":
@@ -1680,8 +1758,12 @@ class FakeCliamp:
                         found.append(self._stand_in_art(dict(t)))
             return {"ok": True, "tracks": found[:limit]}
         if provider == "spotify":
-            if self.spotify_needs_auth:
-                return self._needs_auth()
+            refused = self._spotify_session_or_refusal()
+            if refused is not None:
+                return refused
+            if self.spotify_web_only:
+                # 自前の client_id (開発モード) の Web API は /v1/search を断られる
+                return {"ok": False, "error": SPOTIFY_SEARCH_BLOCKED}
             rng = random.Random("spotify|" + query)
             tracks = []
             for i in range(limit):
@@ -1814,13 +1896,15 @@ def main(argv: list[str] | None = None) -> int:
                         help="device list に説明付きの devices 配列も付ける")
     parser.add_argument("--switch-keeps-old", action="store_true",
                         help="読み込み中の曲の切り替えで前の曲の位置と長さを出す (本物の TUI)")
+    parser.add_argument("--spotify-web-only", action="store_true",
+                        help="Spotify を Web API だけの接続にする (曲は YouTube で探して鳴らし、検索は断られる)")
     args = parser.parse_args(argv)
 
     server = FakeCliamp(args.socket, legacy=args.legacy, art_dir=args.art_dir,
                         spotify_needs_auth=args.spotify_needs_auth, latency=args.latency,
                         buffer_secs=args.buffer, initial_state=args.state, empty=args.empty,
                         radios_toml=args.radios_toml, device_descriptions=args.device_descriptions,
-                        switch_keeps_old=args.switch_keeps_old)
+                        switch_keeps_old=args.switch_keeps_old, spotify_web_only=args.spotify_web_only)
     server.start()
     print(f"fake-cliamp: {args.socket} で待ち受けています (api {0 if args.legacy else 1})",
           file=sys.stderr, flush=True)

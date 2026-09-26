@@ -24,7 +24,13 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 sys.path.insert(0, str(HERE))
 
-from fake_cliamp import FakeCliamp, isolate_display, run_loop, temp_socket_path  # noqa: E402
+from fake_cliamp import (  # noqa: E402
+    SPOTIFY_SEARCH_BLOCKED,
+    FakeCliamp,
+    isolate_display,
+    run_loop,
+    temp_socket_path,
+)
 
 isolate_display()
 
@@ -49,13 +55,13 @@ if HAVE_DISPLAY:
     from cliamp_music.artwork import ArtworkLoader
     from cliamp_music.client import CliampClient, send_once
     from cliamp_music.context import AppContext
-    from cliamp_music.pages.home import HomePage, weak_call
+    from cliamp_music.pages.home import WEB_ONLY_NOTE, HomePage, provider_playback, weak_call
     from cliamp_music.pages.nowplaying import NowPlayingListPage
     from cliamp_music.pages.playlists import PlaylistDetailPage, PlaylistsPage
     from cliamp_music.pages.radio import RadioPage
     from cliamp_music.pages.recent import RecentPage
     from cliamp_music.pages.search import SearchPage
-    from cliamp_music.protocol import Track, parse_tracks
+    from cliamp_music.protocol import SPOTIFY_SEARCH_BLOCKED_TITLE, Response, Track, is_youtube_bridge, parse_tracks
     from cliamp_music.state import GuiState
 
 SKIP = "X の画面 (Xvfb の :10 以上の DISPLAY) がありません"
@@ -505,6 +511,11 @@ class PlaylistsTest(PageCase):
         self.wait(lambda: len(self.requests("tracks")) == 2, message="Ctrl+R で取り直しません")
         self.assertEqual(page.list.rows()[0].menu_context, "")
         self.assertTrue(page.header.more_button.get_sensitive())
+        # 自分で鳴らせる Spotify (Premium) には「YouTube で探して再生」の書き添えを出さない
+        self.wait(lambda: self.requests("providers"))
+        run_loop(lambda: False, 0.2)
+        self.assertFalse(page.plays_via_youtube)
+        self.assertFalse(page.header.note_label.get_visible())
 
     def test_detail_reloads_after_track_removed(self):
         page = self.show(PlaylistDetailPage(self.ctx, provider="local", id="ドライブ", name="ドライブ"))
@@ -567,6 +578,184 @@ class PlaylistsAuthTest(PageCase):
         self.wait(lambda: detail.state.state == "empty")
         self.assertEqual(detail.state.empty.title_label.get_text(), "サインインが必要です")
         self.assertFalse(detail.header.play_button.get_sensitive())
+
+
+class WebOnlySpotifyTest(PageCase):
+    """Spotify の接続が Web API だけの cliamp (曲は YouTube で探して鳴らし、検索は断られる)。"""
+
+    fake_options = {"spotify_web_only": True}
+
+    def test_playlist_detail_says_songs_play_via_youtube(self):
+        page = self.show(PlaylistDetailPage(self.ctx, provider="spotify", id="37i9dQZF1DXfake0001",
+                                            name="Chill Mix"))
+        self.wait(lambda: len(page.list.rows()) == 4)
+        self.wait(lambda: page.header.note_label.get_visible(), message="書き添えが出ません")
+        self.assertEqual(page.header.note_label.get_text(), WEB_ONLY_NOTE)
+        self.assertTrue(page.header.note_label.has_css_class("music-info"))
+        self.assertEqual(page.header.info_label.get_text().split(" · ")[0], "4 曲")
+        self.assertTrue(page.plays_via_youtube)
+        self.assertTrue(all(is_youtube_bridge(t) for t in page.tracks))
+        # 行から鳴らすと、YouTube で探す曲の形 (meta 付き) のまま送る
+        page.list.emit("row-activated", page.list.rows()[1])
+        self.wait(lambda: self.requests("replace"))
+        request = self.requests("replace")[-1]
+        self.assertEqual(request["index"], 1)
+        self.assertTrue(all(t["path"].startswith("ytsearch1:") for t in request["tracks"]))
+        self.assertEqual(request["tracks"][1]["meta"]["spotify.bridge"], "youtube")
+        # 「…」のリンクは Spotify の曲の頁
+        model, _group = self.ctx.track_menu(page.tracks[0], index=0)
+        self.assertEqual(page.tracks[0].web_url,
+                         f"https://open.spotify.com/track/{page.tracks[0].meta_get('spotify.id')}")
+        self.assertIsNotNone(model)
+
+    def test_note_follows_the_tracks_even_before_providers_arrive(self):
+        """プロバイダーの答えが古くても (覚えた一覧に playback が無い)、曲が YouTube で探す形なら書き添える。"""
+        self.ctx._provider_playback = {}
+        page = PlaylistDetailPage(self.ctx, provider="spotify", id="YOUR MUSIC", name="Your Music")
+        page.ctx.catalog.providers = lambda *a, **k: None  # 答えない
+        self.show(page)
+        self.wait(lambda: len(page.list.rows()) == 5)
+        self.assertEqual(page.header.note_label.get_text(), WEB_ONLY_NOTE)
+        self.assertTrue(page.header.note_label.get_visible())
+
+    def test_local_playlist_has_no_note(self):
+        page = self.show(PlaylistDetailPage(self.ctx, provider="local", id="Focus", name="Focus"))
+        self.wait(lambda: len(page.list.rows()) == 6)
+        run_loop(lambda: False, 0.2)
+        self.assertFalse(page.header.note_label.get_visible())
+
+    def test_playlists_page_notes_the_spotify_section(self):
+        page = self.show(PlaylistsPage(self.ctx))
+        self.wait(lambda: "spotify" in page.sections and page.sections["spotify"].keys)
+        self.wait(lambda: page.sections["spotify"].note.get_visible(), message="書き添えが出ません")
+        self.assertEqual(page.sections["spotify"].note.get_text(), WEB_ONLY_NOTE)
+        self.assertFalse(page.sections["local"].note.get_visible())
+        self.assertEqual(len(page.sections["spotify"].keys), 3)
+
+    def test_playlists_page_note_on_a_fresh_cliamp(self):
+        """起動したばかりの cliamp: Spotify のセッションは playlists の初回にでき、それまでの
+        providers には playback が付かない (本物と同じく偽も)。ページは providers → spotify の
+        playlists の順に頼むので、初めの答えだけでは書き添えを決められない。カタログが初めての
+        成功の後で providers を 1 度だけ取り直し、最初の表示のうちに書き添える。"""
+        self.assertFalse(self.fake._spotify_session)
+        page = self.show(PlaylistsPage(self.ctx))
+        self.wait(lambda: "spotify" in page.sections and page.sections["spotify"].keys)
+        self.wait(lambda: page.sections["spotify"].note.get_visible(),
+                  message="起動したばかりの cliamp で Spotify の節に書き添えが出ません")
+        self.assertEqual(page.sections["spotify"].note.get_text(), WEB_ONLY_NOTE)
+        self.assertEqual(len(self.requests("providers")), 2, "初めての成功の後に 1 度だけ取り直す")
+        # 覚えた答えは取り直したもの: 開き直し (force なし) でも書き添えは消えず、もう取り直さない
+        page.load(force=False)
+        run_loop(lambda: False, 0.3)
+        self.assertEqual(page.sections["spotify"].note.get_text(), WEB_ONLY_NOTE)
+        self.assertTrue(page.sections["spotify"].note.get_visible())
+        self.assertEqual(len(self.requests("providers")), 2)
+        # 失敗の注意書きは鳴らし方で上書きしない
+        self.assertFalse(page.sections["local"].note.get_visible())
+
+    def test_detail_page_on_a_fresh_cliamp_learns_the_playback(self):
+        """詳細ページは providers と tracks を同時に頼む。先の providers の答えが古くても、
+        tracks の成功の後で取り直した答えを覚える (曲の印と両方で書き添える)。"""
+        page = self.show(PlaylistDetailPage(self.ctx, provider="spotify", id="37i9dQZF1DXfake0001",
+                                            name="Chill Mix"))
+        self.wait(lambda: len(page.list.rows()) == 4)
+        self.wait(lambda: provider_playback(self.ctx, "spotify") == "youtube",
+                  message="取り直した providers の playback を覚えていません")
+        self.assertEqual(page.header.note_label.get_text(), WEB_ONLY_NOTE)
+        self.assertTrue(page.header.note_label.get_visible())
+
+    def test_spotify_search_restriction_is_explained(self):
+        page = self.show(SearchPage(self.ctx))
+        self.wait(lambda: page.scopes.get_n_toggles() == 3, message="Spotify の範囲が出ません")
+        page.set_scope("spotify")
+        page.set_query("海 & <波>")
+        self.wait(lambda: page.results.state == "empty")
+        empty = page.results.empty
+        self.assertEqual(empty.title_label.get_text(), SPOTIFY_SEARCH_BLOCKED_TITLE)
+        description = empty.description_label.get_text()
+        self.assertIn("YouTube", description)
+        self.assertNotIn("client_id is too new", description)
+        self.assertIsNotNone(empty.button)
+        self.assertTrue(empty.button.get_visible())
+        self.assertEqual(empty.button.label.get_text(), "YouTube で検索")
+        # ボタンで YouTube の範囲に替えて探し直す
+        empty.button.emit("clicked")
+        self.assertEqual(page.scope, "youtube")
+        self.assertEqual(self.ctx.state.search_scope, "youtube")
+        self.wait(lambda: page.results.state == "content")
+        self.assertEqual(self.requests("search")[-1]["provider"], "youtube")
+        self.assertEqual(self.requests("search")[-1]["query"], "海 & <波>")
+        # ほかの空状態ではボタンを出さない
+        page.set_query("該当なし")
+        self.wait(lambda: page.results.state == "empty")
+        self.assertEqual(empty.title_label.get_text(), "結果がありません")
+        self.assertFalse(empty.button.get_visible())
+
+    def test_youtube_failure_that_echoes_the_words_is_not_a_spotify_restriction(self):
+        """YouTube の検索の誤りは語を繰り返す ("resolving yt-dlp ytsearch20:<語>: …")。語に
+        "search blocked" や "Invalid limit" が入っていても、Spotify の断りの説明とボタンは出さない。"""
+        page = self.show(SearchPage(self.ctx))
+        self.wait(lambda: page.scopes.get_n_toggles() == 3)
+        page.set_scope("youtube")
+        for query in ("search blocked __fail__", "spotify: search blocked __fail__", "Invalid limit __fail__"):
+            with self.subTest(query=query):
+                page.set_query(query)
+                empty = page.results.empty
+                self.wait(lambda: page.results.state == "empty"
+                          and f":{query}:" in empty.description_label.get_text(),
+                          message="YouTube の検索の誤りが出ません")
+                self.assertEqual(empty.title_label.get_text(), "検索できませんでした")
+                self.assertFalse(empty.button is not None and empty.button.get_visible(),
+                                 "YouTube の範囲で「YouTube で検索」を出しました")
+                self.assertEqual(self.requests("search")[-1]["provider"], "youtube")
+        # Spotify の範囲でない検索の結果には、文言が Spotify の断りそのものでも出さない
+        # (ボタンはいまの範囲へ移るだけになる)
+        blocked = Response(False, {}, SPOTIFY_SEARCH_BLOCKED, "error")
+        page._show_results("x", "youtube", blocked)
+        self.assertEqual(page.results.empty.title_label.get_text(), "検索できませんでした")
+        self.assertFalse(page.results.empty.button is not None and page.results.empty.button.get_visible())
+        page._show_results("x", "spotify", blocked)
+        self.assertEqual(page.results.empty.title_label.get_text(), SPOTIFY_SEARCH_BLOCKED_TITLE)
+
+    def test_rate_limit_is_explained(self):
+        self.fake.spotify_error = "spotify: rate limited by Spotify; retry after 24h0m0s"
+        want = "Spotify から回数の制限を受けています。24 時間ほど待ってから、もう一度試してください"
+        search = self.show(SearchPage(self.ctx))
+        self.wait(lambda: search.scopes.get_n_toggles() == 3)
+        search.set_scope("spotify")
+        search.set_query("雨")
+        self.wait(lambda: search.results.state == "empty")
+        self.assertEqual(search.results.empty.title_label.get_text(), "検索できませんでした")
+        self.assertEqual(search.results.empty.description_label.get_text(), want)
+        self.assertFalse(search.results.empty.button is not None and search.results.empty.button.get_visible())
+        detail = self.show(PlaylistDetailPage(self.ctx, provider="spotify", id="37i9dQZF1DXfake0001",
+                                              name="Chill Mix"))
+        self.wait(lambda: detail.state.state == "empty")
+        self.assertEqual(detail.state.empty.title_label.get_text(), "プレイリストを読めませんでした")
+        self.assertEqual(detail.state.empty.description_label.get_text(), want)
+        self.assertFalse(detail.header.note_label.get_visible())
+        playlists = self.show(PlaylistsPage(self.ctx))
+        self.wait(lambda: "spotify" in playlists.sections and playlists.sections["spotify"].note.get_visible())
+        self.assertEqual(playlists.sections["spotify"].note.get_text(), f"読み込めませんでした: {want}")
+
+    def test_pages_are_released(self):
+        box = {"page": SearchPage(self.ctx)}
+        self.show(box["page"])
+        self.wait(lambda: box["page"].scopes.get_n_toggles() == 3)
+        box["page"].set_scope("spotify")
+        box["page"].set_query("星")
+        self.wait(lambda: box["page"].results.state == "empty")
+        detail = {"page": PlaylistDetailPage(self.ctx, provider="spotify", id="YOUR MUSIC", name="Your Music")}
+        refs = [weakref.ref(box["page"]), weakref.ref(detail["page"])]
+        self.show(detail["page"])
+        self.wait(lambda: detail["page"].header.note_label.get_visible())
+        self.nav.replace([Adw.NavigationPage(title="空", tag="blank", child=Gtk.Label())])
+        box.clear()
+        detail.clear()
+        for _ in range(5):
+            run_loop(lambda: False, 0.1)
+            gc.collect()
+        self.assertEqual([r() for r in refs], [None, None], "外したページが解放されません")
 
 
 class RadioAndRecentTest(PageCase):

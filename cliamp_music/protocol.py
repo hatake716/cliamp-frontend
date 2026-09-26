@@ -74,6 +74,9 @@ STALE = "stale"
 # 書き込めないので「プレイリストに追加」の候補からは外す。
 RECENTLY_PLAYED = "Recently Played"
 
+# ProviderInfo の playback: 曲を YouTube で探して鳴らす (Spotify の接続が Web API だけのとき)。
+PLAYBACK_YOUTUBE = "youtube"
+
 _YT_ID = re.compile(r"^[A-Za-z0-9_-]{11}$")
 _SPOTIFY_ID = re.compile(r"^[A-Za-z0-9]{22}$")
 _SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
@@ -305,11 +308,19 @@ class Track:
 
     @property
     def youtube_id(self) -> str | None:
+        """YouTube の動画 ID (path が YouTube の URL のときだけ)。yt-dlp の検索式
+        ("ytsearch1:…"。YouTube で探して鳴らす Spotify の曲など) は動画が決まっていないので None。"""
         return youtube_id_of(self.path)
 
     @property
     def spotify_id(self) -> str | None:
-        return spotify_id_of(self.path) or (self.meta_get("spotify.id") or None)
+        """Spotify の曲 ID。path (spotify:track: / open.spotify.com) か、meta の "spotify.id"
+        (YouTube で探して鳴らす Spotify の曲は path が "ytsearch1:…" で、ID は meta にだけある)。"""
+        sid = spotify_id_of(self.path)
+        if sid:
+            return sid
+        meta_id = self.meta_get("spotify.id").strip()
+        return meta_id if _SPOTIFY_ID.match(meta_id) else None
 
     @property
     def is_local_file(self) -> bool:
@@ -338,12 +349,15 @@ class Track:
 
     @property
     def web_url(self) -> str | None:
-        """「リンクをコピー」「ブラウザで開く」に使う URL。無ければ None。"""
-        if is_url(self.path):
-            return self.path
-        sid = spotify_id_of(self.path)
+        """「リンクをコピー」「ブラウザで開く」に使う URL。無ければ None。
+
+        Spotify の曲 ID があればその曲の頁 (YouTube で探して鳴らす曲も、探した動画ではなく
+        Spotify の曲を指す)。無ければ http(s) の path そのもの。"""
+        sid = self.spotify_id
         if sid:
             return f"https://open.spotify.com/track/{sid}"
+        if is_url(self.path):
+            return self.path
         return None
 
     # --- 往復 ---------------------------------------------------------------
@@ -394,6 +408,15 @@ class Track:
             played_at=_as_str(d.get("played_at")),
             path_raw=_as_str(d.get("path_raw")),
         )
+
+
+def is_youtube_bridge(track: Track | None) -> bool:
+    """YouTube で探して鳴らす Spotify の曲か (meta "spotify.bridge" が "youtube")。
+
+    Spotify の接続が Web API だけのとき (無料プランや、librespot に断られる自前の client_id)、
+    cliamp の Spotify は曲を path "ytsearch1:<アーティスト> <曲名>" で返し、曲名などは Spotify の
+    まま、曲 ID を meta "spotify.id" に入れる。"""
+    return track is not None and track.meta_get("spotify.bridge").strip().lower() == "youtube"
 
 
 @dataclass(frozen=True)
@@ -505,11 +528,21 @@ class PlaylistState:
 
 @dataclass(frozen=True)
 class ProviderInfo:
+    """PROTOCOL の ProviderInfo。playback は曲の鳴らし方 (省かれていれば "")。
+
+    playback が "youtube" なら、そのプロバイダーは自分では鳴らせず、曲を YouTube で探して
+    鳴らす (Spotify の接続が Web API だけのとき)。"""
+
     key: str
     name: str = ""
     search: bool = False
     playlists: bool = False
     virtual: bool = False
+    playback: str = ""
+
+    @property
+    def plays_via_youtube(self) -> bool:
+        return self.playback == PLAYBACK_YOUTUBE
 
 
 @dataclass(frozen=True)
@@ -587,7 +620,7 @@ class Response:
             return "見つかりません"
         if self.error == STALE:
             return "リストが変わっていたので、もう一度選んでください"
-        return self.error or "失敗しました"
+        return describe_catalog_error(self.error) or self.error or "失敗しました"
 
     @classmethod
     def offline(cls, detail: str = "") -> "Response":
@@ -700,6 +733,124 @@ def parse_status(d: Any) -> Status:
     )
 
 
+# --- Spotify の断り (検索の封鎖・回数の制限・鳴らせない曲) ---------------------------------
+
+# Spotify の曲を鳴らすには librespot のセッション (Premium) が要る。Web API だけの接続で
+# spotify:track: の曲を始めると、cliamp は "spotify: streaming unavailable…" で断る。
+SPOTIFY_STREAMING_UNAVAILABLE = "spotify: streaming unavailable"
+SPOTIFY_PREMIUM_REQUIRED = "Spotify の曲の再生には Premium が必要です"
+# 開発モードのアプリ (自分で登録した client_id) には Spotify が /v1/search を許さない
+# (400 "Invalid limit"。cliamp の friendlySearchError は "spotify: search blocked — …" に言い直す)。
+SPOTIFY_SEARCH_BLOCKED_TITLE = "Spotify では検索できません"
+SPOTIFY_SEARCH_BLOCKED = ("自分で登録した Spotify のアプリ (開発モードの client_id) からの検索は、Spotify が"
+                          "止めています。プレイリストと保存した曲はそのまま使えます。曲を探すときは YouTube で"
+                          "検索してください。")
+# パッチは Spotify の Web API の待ち (Retry-After) を 30 秒ほどで打ち切り、それより長く待てと
+# 言われたら "spotify: rate limited by Spotify; retry after 24h0m0s" で断る。cliamp 1.50.0 の
+# 素の文言 ("spotify: web api rate-limited on /v1/… after 8 retries") も同じ扱い (待ちは不明)。
+#
+# どれも cliamp の Spotify の文言そのもので決める: 語は文の先頭か、文脈の前置き
+# ("spotify: your music: "、"custom streamer: ") の ": " の直後にあるときだけ見る。YouTube の
+# 検索の誤りは利用者の語をそのまま繰り返す ("resolving yt-dlp ytsearch20:<語>: …") ので、語に
+# "search blocked" や "rate limited by Spotify" が入っていても Spotify の断りとは読まない。
+_SPOTIFY_AT = r"(?:^|:\s)"
+_SPOTIFY_RATE_LIMITED = re.compile(
+    _SPOTIFY_AT + r"spotify: rate limited by spotify(?:;\s*retry after\s+([0-9][0-9.a-zµμ]*))?"
+    r"|" + _SPOTIFY_AT + r"spotify: web api rate-limited\b", re.IGNORECASE | re.MULTILINE)
+_SPOTIFY_SEARCH_BLOCKED_RE = re.compile(_SPOTIFY_AT + r"spotify: search blocked\b",
+                                        re.IGNORECASE | re.MULTILINE)
+_SPOTIFY_SEARCH_FAILED_RE = re.compile(_SPOTIFY_AT + r"spotify: search:", re.IGNORECASE | re.MULTILINE)
+_SPOTIFY_STREAMING_RE = re.compile(_SPOTIFY_AT + re.escape(SPOTIFY_STREAMING_UNAVAILABLE) + r"\b",
+                                   re.IGNORECASE | re.MULTILINE)
+_GO_DURATION_PART = re.compile(r"([0-9]+(?:\.[0-9]*)?)(ns|us|µs|μs|ms|h|m|s)")
+_GO_DURATION_UNITS = {"h": 3600.0, "m": 60.0, "s": 1.0, "ms": 1e-3, "us": 1e-6, "µs": 1e-6, "μs": 1e-6,
+                      "ns": 1e-9}
+
+
+def parse_go_duration(text: str) -> float | None:
+    """Go の time.Duration.String() の形 ("24h0m0s"・"1m30.5s"・"250ms"・"0s") を秒に。
+    読めなければ None。"""
+    text = _as_str(text).strip()
+    total = 0.0
+    pos = 0
+    for match in _GO_DURATION_PART.finditer(text):
+        if match.start() != pos:
+            return None
+        total += float(match.group(1)) * _GO_DURATION_UNITS[match.group(2)]
+        pos = match.end()
+    if pos == 0 or pos != len(text) or not math.isfinite(total):
+        return None
+    return total
+
+
+def format_wait(seconds: float) -> str:
+    """待ち時間を「24 時間」「1 時間 30 分」「5 分」「30 秒」に (切り上げ)。0 以下・不明は空。"""
+    value = _as_float(seconds)
+    if value <= 0:
+        return ""
+    total = math.ceil(value)
+    if total < 60:
+        return f"{total} 秒"
+    minutes = math.ceil(total / 60)
+    hours, minutes = divmod(minutes, 60)
+    if not hours:
+        return f"{minutes} 分"
+    return f"{hours} 時間" + (f" {minutes} 分" if minutes else "")
+
+
+def spotify_rate_limit_wait(text: str) -> float | None:
+    """Spotify の回数の制限で断られた誤りなら、待つように言われた秒 (分からなければ 0)。
+    違えば None。cliamp の文言 ("spotify: rate limited by Spotify; …") が文の先頭か ": " の
+    後ろにあるときだけ (YouTube の検索の誤りが繰り返す語や、曲名・パスの中の語では決めない)。"""
+    match = _SPOTIFY_RATE_LIMITED.search(_as_str(text)[:_CLASSIFY_MAX])
+    if match is None:
+        return None
+    wait = parse_go_duration((match.group(1) or "").rstrip("."))
+    return wait if wait is not None else 0.0
+
+
+def spotify_rate_limit_message(wait: float) -> str:
+    """回数の制限の説明 (カタログ系の失敗の文)。"""
+    span = format_wait(wait)
+    return f"Spotify から回数の制限を受けています。{span + 'ほど' if span else 'しばらく'}待ってから、もう一度試してください"
+
+
+def _is_spotify_error(text: str) -> bool:
+    """cliamp の Spotify のプロバイダーの誤りか。カタログ系の誤りは IPC が包まないので、
+    Spotify のものは必ず "spotify: " で始まる (YouTube の検索の誤りは "resolving yt-dlp …" か
+    "yt-dlp: …")。"""
+    return _as_str(text).lstrip().lower().startswith("spotify:")
+
+
+def is_spotify_search_blocked(text: str) -> bool:
+    """開発モードのアプリで Spotify の検索が止められている誤りか (cliamp の friendlySearchError
+    "spotify: search blocked — …" か、その元の "spotify: search: http status 400 …Invalid limit…")。
+    どちらも cliamp の Spotify の誤り ("spotify: " で始まる) のときだけ。"""
+    text = _as_str(text)[:_CLASSIFY_MAX]
+    if not _is_spotify_error(text):
+        return False
+    if _SPOTIFY_SEARCH_BLOCKED_RE.search(text):
+        return True
+    return bool(_SPOTIFY_SEARCH_FAILED_RE.search(text)) and "invalid limit" in text.lower()
+
+
+def describe_catalog_error(text: str) -> str:
+    """カタログ系の失敗のうち日本語で言い直せるもの (Spotify の回数の制限・検索の封鎖・
+    鳴らせない曲)。cliamp の Spotify の誤り ("spotify: " で始まる) だけを言い直し、それ以外
+    (語を繰り返す YouTube の検索の誤りなど) は空。"""
+    text = _as_str(text)
+    if not text or not _is_spotify_error(text):
+        return ""
+    wait = spotify_rate_limit_wait(text)
+    if wait is not None:
+        return spotify_rate_limit_message(wait)
+    if is_spotify_search_blocked(text):
+        return f"{SPOTIFY_SEARCH_BLOCKED_TITLE}。{SPOTIFY_SEARCH_BLOCKED}"
+    if _SPOTIFY_STREAMING_RE.search(text[:_CLASSIFY_MAX]):
+        return SPOTIFY_PREMIUM_REQUIRED
+    return ""
+
+
 # --- 再生の失敗 (status の playback_error) ---------------------------------------------
 
 PLAYBACK_ERROR_SHORT_MAX = 80  # 知らない誤りを短文にするときの長さ (文字)
@@ -806,6 +957,16 @@ def _describe(text: str) -> tuple[str, str]:
     low, hosts = _classify_text(whole)
     service = _service_of(low, hosts)
 
+    # Spotify の Web API だけの接続では spotify:track: の曲を鳴らせない (librespot のセッションが無い)。
+    # 文言に "login5"・"credentials" などが続いてもサインインの誤りではないので先に見る。
+    # 回数の制限も含め、パス・URL・引用符を除いた文 (low) の cliamp の文言の位置だけで決める
+    # (フォルダ名 "Rate Limited By Spotify" の手元のファイルが無いのは「ファイルが見つかりません」)
+    if _SPOTIFY_STREAMING_RE.search(low):
+        return SPOTIFY_PREMIUM_REQUIRED, detail
+    wait = spotify_rate_limit_wait(low)
+    if wait is not None:
+        span = format_wait(wait)
+        return f"Spotify から回数の制限を受けています ({span + 'ほど' if span else 'しばらく'}待つ)", detail
     # サインイン (Spotify のセッション切れ、cliamp の ErrNeedsAuth "sign-in required")
     if service == "Spotify" and _any_in(low, ("sign-in required", "auth", "credential", "token", "login",
                                               "log in", "401", "cliamp spotify reset")):
@@ -926,6 +1087,7 @@ def parse_providers(d: Any) -> list[ProviderInfo]:
             search=_as_bool(item.get("search")),
             playlists=_as_bool(item.get("playlists")),
             virtual=_as_bool(item.get("virtual")),
+            playback=_as_str(item.get("playback")).strip().lower(),
         ))
     return out
 
@@ -1131,6 +1293,9 @@ def track_key(track: Track | str | None) -> str:
         return ""
     if isinstance(track, str):
         track = Track(path=track)
+    if is_youtube_bridge(track) and track.spotify_id:
+        # YouTube で探して鳴らす Spotify の曲は、探した動画ではなく Spotify の曲として数える
+        return f"spotify:{track.spotify_id}"
     yid = track.youtube_id
     if yid:
         return f"youtube:{yid}"

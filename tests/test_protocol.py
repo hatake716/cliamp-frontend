@@ -117,6 +117,58 @@ class TrackDerived(unittest.TestCase):
         self.assertIsNone(Track(path="ytsearch1:foo").web_url)
 
 
+# YouTube で探して鳴らす Spotify の曲 (Web API だけの接続の cliamp が返す形)。
+BRIDGE_SID = "4uLU6hMCjMI75M1A2tKUQC"
+BRIDGED = Track(path="ytsearch1:Aurora Lane Kite Theory 夜明けのバス停 & <demo>", title="夜明けのバス停 & <demo>",
+                artist="Aurora Lane, Kite Theory", album="港町", year=2021, track_number=4, duration=201,
+                meta={"spotify.id": BRIDGE_SID, "spotify.bridge": "youtube"})
+
+
+class YouTubeBridge(unittest.TestCase):
+    def test_bridged_track_is_a_spotify_track_played_by_search(self):
+        self.assertTrue(p.is_youtube_bridge(BRIDGED))
+        self.assertIsNone(BRIDGED.youtube_id, "検索式には動画 ID が無い")
+        self.assertEqual(BRIDGED.spotify_id, BRIDGE_SID)
+        self.assertFalse(BRIDGED.is_local_file)
+        self.assertEqual(BRIDGED.display_title, "夜明けのバス停 & <demo>")
+        # リンクは探した動画ではなく Spotify の曲の頁
+        self.assertEqual(BRIDGED.web_url, f"https://open.spotify.com/track/{BRIDGE_SID}")
+        self.assertEqual(p.track_key(BRIDGED), f"spotify:{BRIDGE_SID}")
+        # 往復で meta が失われない (replace で送り返しても Spotify の曲のまま)
+        self.assertEqual(Track.from_wire(json.loads(json.dumps(BRIDGED.to_wire()))), BRIDGED)
+
+    def test_search_paths_have_no_youtube_id(self):
+        for path in ("ytsearch1:米津玄師 Lemon", "ytsearch:lofi", "ytsearch10:a b", "scsearch1:x"):
+            with self.subTest(path=path):
+                self.assertIsNone(Track(path=path).youtube_id)
+                self.assertIsNone(p.youtube_id_of(path))
+
+    def test_bridge_prefers_spotify_even_when_path_is_a_video(self):
+        """cliamp が探した動画の URL を path に入れても、Spotify の曲として扱う。"""
+        track = Track(path="https://www.youtube.com/watch?v=BoW3OHT6g0s",
+                      meta={"spotify.id": BRIDGE_SID, "spotify.bridge": "youtube"})
+        self.assertEqual(track.web_url, f"https://open.spotify.com/track/{BRIDGE_SID}")
+        self.assertEqual(p.track_key(track), f"spotify:{BRIDGE_SID}")
+        # 印の無い YouTube の曲は今までどおり動画の URL と動画 ID
+        plain = Track(path="https://www.youtube.com/watch?v=BoW3OHT6g0s")
+        self.assertEqual(plain.web_url, plain.path)
+        self.assertEqual(p.track_key(plain), "youtube:BoW3OHT6g0s")
+
+    def test_not_a_bridge(self):
+        self.assertFalse(p.is_youtube_bridge(None))
+        self.assertFalse(p.is_youtube_bridge(Track(path=f"spotify:track:{BRIDGE_SID}")))
+        self.assertFalse(p.is_youtube_bridge(Track(path="ytsearch1:x", meta={"spotify.bridge": "soundcloud"})))
+        self.assertTrue(p.is_youtube_bridge(Track(path="ytsearch1:x", meta={"spotify.bridge": " YouTube "})))
+
+    def test_malformed_meta_id_is_not_used_in_urls(self):
+        for bad in ("x", "", "../../evil?a=1&b=2aaaaaaaaaa", BRIDGE_SID + "/x"):
+            with self.subTest(bad=bad):
+                track = Track(path="ytsearch1:foo", meta={"spotify.id": bad, "spotify.bridge": "youtube"})
+                self.assertIsNone(track.spotify_id)
+                self.assertIsNone(track.web_url)
+                self.assertEqual(p.track_key(track), "path:ytsearch1:foo")
+
+
 class RequestResponse(unittest.TestCase):
     def test_encode_drops_none_keeps_zero(self):
         """index=0 は有効値 (cliamp 側はポインタ) なので省かない。None だけ省く。"""
@@ -209,6 +261,14 @@ class ParseOthers(unittest.TestCase):
         provs = p.parse_providers({"providers": [{"key": "youtube", "name": "YouTube", "search": True,
                                                   "virtual": True}, {"name": "no key"}]})
         self.assertEqual(provs, [p.ProviderInfo("youtube", "YouTube", True, False, True)])
+        self.assertEqual(provs[0].playback, "", "playback は省かれていれば空 (自分で鳴らす)")
+        self.assertFalse(provs[0].plays_via_youtube)
+        web_only = p.parse_providers({"providers": [{"key": "spotify", "name": "Spotify", "search": True,
+                                                     "playlists": True, "virtual": False, "playback": "youtube"}]})
+        self.assertEqual(web_only[0].playback, "youtube")
+        self.assertTrue(web_only[0].plays_via_youtube)
+        self.assertEqual(p.parse_providers([{"key": "spotify", "playback": " YouTube "}])[0].playback, "youtube")
+        self.assertEqual(p.parse_providers([{"key": "spotify", "playback": 3}])[0].playback, "3")
         lists = p.parse_playlists({"playlists": [{"id": "l:0", "name": "cliamp radio"},
                                                  {"id": "x", "name": "X", "track_count": 3, "section": "Library"}]},
                                   "radio")
@@ -378,6 +438,102 @@ AGE_GATE = ("yt-dlp: ERROR: [youtube] x8VYWazR5mE: Sign in to confirm your age. 
             "youtube-cookies  for tips on effectively exporting YouTube cookies")
 
 
+SEARCH_BLOCKED = (
+    "spotify: search blocked \u2014 your client_id is too new. Spotify's Nov 27 2024 change blocks /v1/search "
+    "for apps in Development Mode (the rest of cliamp still works on your app). Remove client_id from "
+    "[spotify] in config.toml to use the built-in fallback for search, or apply for Extended Quota Mode")
+
+
+class SpotifyRefusals(unittest.TestCase):
+    """Spotify の Web API の断り (回数の制限・検索の封鎖・鳴らせない曲) の言い直し。"""
+
+    def test_parse_go_duration(self):
+        for text, want in (("24h0m0s", 86400.0), ("1h30m0s", 5400.0), ("45m0s", 2700.0), ("1m30.5s", 90.5),
+                           ("30s", 30.0), ("250ms", 0.25), ("0s", 0.0), ("2h", 7200.0), ("1.5h", 5400.0)):
+            with self.subTest(text=text):
+                self.assertAlmostEqual(p.parse_go_duration(text), want)
+        for text in ("", "abc", "24h0m0sx", "5", "h", "-1s", None, "1d"):
+            with self.subTest(text=text):
+                self.assertIsNone(p.parse_go_duration(text))
+
+    def test_format_wait(self):
+        for seconds, want in ((86400, "24 時間"), (5400, "1 時間 30 分"), (3599, "1 時間"), (3601, "1 時間 1 分"),
+                              (2700, "45 分"), (90, "2 分"), (60, "1 分"), (30, "30 秒"), (0.2, "1 秒"),
+                              (0, ""), (-5, ""), (float("inf"), "")):
+            with self.subTest(seconds=seconds):
+                self.assertEqual(p.format_wait(seconds), want)
+
+    def test_rate_limit_wait(self):
+        self.assertEqual(p.spotify_rate_limit_wait("spotify: rate limited by Spotify; retry after 24h0m0s"), 86400)
+        self.assertEqual(p.spotify_rate_limit_wait(
+            "spotify: search: spotify: rate limited by Spotify; retry after 1h0m0s"), 3600)
+        self.assertEqual(p.spotify_rate_limit_wait(
+            "spotify: playlists: spotify: rate limited by Spotify; retry after 45m0s."), 2700)
+        # 待ちの分からない制限 (cliamp 1.50.0 の素の文言・長さの無いもの) は 0
+        self.assertEqual(p.spotify_rate_limit_wait(
+            "spotify: web api rate-limited on /v1/me/playlists after 8 retries (try re-authenticating)"), 0.0)
+        self.assertEqual(p.spotify_rate_limit_wait("spotify: rate limited by Spotify"), 0.0)
+        self.assertEqual(p.spotify_rate_limit_wait("spotify: rate limited by Spotify; retry after soon"), 0.0)
+        for text in ("yt-dlp: ERROR: HTTP Error 429: Too Many Requests", "", None, "rate limited by YouTube",
+                     # cliamp の文言の位置に無いもの (曲名・フォルダ名・検索の語)
+                     "open /music/Rate Limited By Spotify/01.flac: no such file or directory",
+                     "yt-dlp: timed out resolving ytsearch1:Band Rate Limited By Spotify (30s)"):
+            with self.subTest(text=text):
+                self.assertIsNone(p.spotify_rate_limit_wait(text))
+
+    def test_rate_limit_message_in_catalog_errors(self):
+        r = decode_response('{"ok":false,"error":"spotify: rate limited by Spotify; retry after 24h0m0s"}')
+        self.assertEqual(r.message, "Spotify から回数の制限を受けています。24 時間ほど待ってから、もう一度試してください")
+        r = Response(False, {}, "spotify: web api rate-limited on /v1/search after 8 retries (try re-authenticating)",
+                     "error")
+        self.assertEqual(r.message, "Spotify から回数の制限を受けています。しばらく待ってから、もう一度試してください")
+
+    def test_search_blocked(self):
+        self.assertTrue(p.is_spotify_search_blocked(SEARCH_BLOCKED))
+        # friendlySearchError を通らない元の 400 "Invalid limit" も同じ
+        raw = 'spotify: search: http status 400 Bad Request: {"error":{"status":400,"message":"Invalid limit"}}'
+        self.assertTrue(p.is_spotify_search_blocked(raw))
+        for text in ("yt-dlp: exit status 1", "", None, "spotify: search: context deadline exceeded"):
+            with self.subTest(text=text):
+                self.assertFalse(p.is_spotify_search_blocked(text))
+        message = Response(False, {}, SEARCH_BLOCKED, "error").message
+        self.assertTrue(message.startswith(p.SPOTIFY_SEARCH_BLOCKED_TITLE), message)
+        self.assertIn("YouTube", message)
+        self.assertNotIn("client_id is too new", message)
+        # 回数の制限を受けた検索 (friendlySearchError は "spotify: search: " を前に付ける) は
+        # 「封鎖」とは言わない
+        limited = "spotify: search: spotify: rate limited by Spotify; retry after 1h0m0s"
+        self.assertFalse(p.is_spotify_search_blocked(limited))
+        self.assertIn("1 時間ほど", Response(False, {}, limited, "error").message)
+
+    def test_youtube_errors_that_echo_the_query_are_not_spotify(self):
+        """YouTube の検索の誤りは利用者の語をそのまま繰り返す (cliamp の resolve.go:
+        "resolving yt-dlp ytsearch20:<語>: …"、"yt-dlp: timed out resolving ytsearch20:<語> (30s)")。
+        語に Spotify の断りの言葉が入っていても、Spotify の断りとは読まない。"""
+        for query in ("search blocked", "Invalid Limit", "rate limited by Spotify; retry after 24h0m0s",
+                      "spotify: search blocked", "spotify: rate limited by Spotify; retry after 1h0m0s",
+                      "spotify: streaming unavailable", "spotify: web api rate-limited"):
+            for text in (f"resolving yt-dlp ytsearch20:{query}: yt-dlp: timed out resolving ytsearch20:{query} (30s)",
+                         f"yt-dlp: timed out resolving ytsearch20:{query} (30s)",
+                         f"resolving yt-dlp scsearch20:x: {query}: exit status 1"):
+                with self.subTest(text=text):
+                    self.assertFalse(p.is_spotify_search_blocked(text))
+                    self.assertEqual(p.describe_catalog_error(text), "")
+                    self.assertEqual(Response(False, {}, text, "error").message, text)
+        # 語が Spotify の文言に似ていなければ、Spotify の誤りの中でも見ない
+        self.assertFalse(p.is_spotify_search_blocked("spotify: playlist \"search blocked\" not found"))
+        self.assertFalse(p.is_spotify_search_blocked("spotify: list tracks: Invalid limit"))
+
+    def test_other_errors_are_unchanged(self):
+        self.assertEqual(Response(False, {}, "unknown provider: x", "error").message, "unknown provider: x")
+        self.assertEqual(p.describe_catalog_error("unknown provider: x"), "")
+        self.assertEqual(p.describe_catalog_error(""), "")
+        self.assertEqual(p.describe_catalog_error("spotify: streaming unavailable"), p.SPOTIFY_PREMIUM_REQUIRED)
+        self.assertEqual(p.describe_catalog_error(
+            "spotify: your music: spotify: rate limited by Spotify; retry after 24h0m0s"),
+            "Spotify から回数の制限を受けています。24 時間ほど待ってから、もう一度試してください")
+
+
 class PlaybackError(unittest.TestCase):
     """describe_playback_error: cliamp・yt-dlp の誤りの文言 → (短い日本語, 全文)。"""
 
@@ -481,6 +637,32 @@ class PlaybackError(unittest.TestCase):
                 self.assertEqual(self.short(text), "Spotify へのサインインが必要です (cliamp の端末で)")
         self.assertEqual(self.short("sign-in required"), "サインインが必要です (cliamp の端末で)")
 
+    def test_spotify_without_a_streaming_session_needs_premium(self):
+        """Web API だけの接続で spotify:track: の曲を始めた。login5 や credentials の語が続いても
+        サインインの誤りではない (サインインし直しても鳴らない)。"""
+        for text in (
+            "spotify: streaming unavailable",
+            "custom streamer: spotify: streaming unavailable: this Spotify connection is Web API only",
+            "spotify: streaming unavailable (no librespot session: failed authenticating with login5: "
+            "INVALID_CREDENTIALS)",
+        ):
+            with self.subTest(text=text[:60]):
+                short, detail = p.describe_playback_error(text)
+                self.assertEqual(short, "Spotify の曲の再生には Premium が必要です")
+                self.assertEqual(detail, text)
+        self.assertEqual(p.playback_error_headline("Spotify の曲の再生には Premium が必要です"),
+                         "Spotify の曲の再生には Premium が必要です")
+
+    def test_spotify_rate_limit(self):
+        short = self.short("spotify: rate limited by Spotify; retry after 24h0m0s")
+        self.assertEqual(short, "Spotify から回数の制限を受けています (24 時間ほど待つ)")
+        self.assertEqual(p.playback_error_headline(short), "Spotify から回数の制限を受けています")
+        self.assertEqual(self.short("custom streamer: spotify: rate limited by Spotify"),
+                         "Spotify から回数の制限を受けています (しばらく待つ)")
+        # YouTube の 429 は今までどおり
+        self.assertEqual(self.short("yt-dlp: ERROR: [youtube] abcdefghijk: HTTP Error 429: Too Many Requests"),
+                         "YouTube に一時的に拒否されました")
+
     def test_unknown_error_is_a_cleaned_first_line(self):
         self.assertEqual(self.short("yt-dlp: ERROR: [generic] Unsupported URL: https://example.com/x"),
                          "この URL は再生できません")
@@ -508,6 +690,12 @@ class PlaybackError(unittest.TestCase):
              "lookup ice.example: no such host", "ネットワークに繋がりません"),
             ("yt-dlp: ERROR: [generic] Unsupported URL: https://example.com/video-unavailable/403",
              "この URL は再生できません"),
+            # Spotify の断り (回数の制限・鳴らせない曲) の言葉も、cliamp の文言の位置に無ければ見ない
+            ("open /home/u/Music/Rate Limited By Spotify/01 Intro.flac: no such file or directory",
+             "ファイルが見つかりません"),
+            ("open /music/Spotify Streaming Unavailable/x.flac: no such file or directory", "ファイルが見つかりません"),
+            ('yt-dlp: ERROR: [youtube:search] "ytsearch1:x spotify: rate limited by Spotify; retry after 1h0m0s": '
+             "Unable to download webpage", "ネットワークに繋がりません"),
         ):
             with self.subTest(text=text[:60]):
                 self.assertEqual(self.short(text), want)

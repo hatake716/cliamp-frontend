@@ -103,6 +103,28 @@ class PureFunctions(unittest.TestCase):
         self.assertEqual(art_sources(Track(path="https://r.example/stream")), [])
 
     @unittest.skipUnless(HAVE_GTK, "GTK がありません")
+    def test_art_sources_for_youtube_bridged_spotify_tracks(self):
+        """YouTube で探して鳴らす Spotify の曲は、meta の曲 ID から Spotify (oEmbed) の絵を取る。
+        検索式の path からは YouTube のサムネイルを探さない。"""
+        sid = "4uLU6hMCjMI75M1A2tKUQC"
+        oembed = f"https://open.spotify.com/oembed?url=https://open.spotify.com/track/{sid}"
+        bridged = Track(path="ytsearch1:Aurora Lane 夜明けのバス停", title="夜明けのバス停", artist="Aurora Lane",
+                        meta={"spotify.id": sid, "spotify.bridge": "youtube"})
+        for size in (64, 400):
+            with self.subTest(size=size):
+                self.assertEqual(art_sources(bridged, size), [oembed])
+        # 探した動画の URL が path に入っていても、Spotify のアルバムの絵を先に
+        as_video = Track(path=f"https://www.youtube.com/watch?v={VID}",
+                         meta={"spotify.id": sid, "spotify.bridge": "youtube"})
+        self.assertEqual(art_sources(as_video, 128), [oembed, HQ])
+        # meta.art (撮影の絵など) は今までどおり最初
+        with_art = Track(path="ytsearch1:x", meta={"spotify.id": sid, "spotify.bridge": "youtube",
+                                                   "art": "https://img.example/a.jpg"})
+        self.assertEqual(art_sources(with_art), ["https://img.example/a.jpg", oembed])
+        # ID の無い検索式の曲 (ローカルのプレイリストに入れて meta が落ちたもの) は探しようがない
+        self.assertEqual(art_sources(Track(path="ytsearch1:Aurora Lane 夜明けのバス停")), [])
+
+    @unittest.skipUnless(HAVE_GTK, "GTK がありません")
     def test_crop_boxes(self):
         self.assertEqual(square_crop_box(480, 360, True), (105, 45, 270, 270))
         self.assertEqual(square_crop_box(640, 480, True), (140, 60, 360, 360))
@@ -265,6 +287,19 @@ class Loader(unittest.TestCase):
         texture = self.get(Track(path=f"spotify:track:{sid}"), 100)
         self.assertEqual(pixel(texture, 50, 50), (0x20, 0x40, 0xE0))
         self.assertEqual(self.fetched, [oembed, thumb])
+
+    def test_bridged_spotify_track_uses_oembed_not_youtube(self):
+        sid = "4uLU6hMCjMI75M1A2tKUQC"
+        oembed = f"https://open.spotify.com/oembed?url=https://open.spotify.com/track/{sid}"
+        thumb = "https://image-cdn.example/ab67616d00001e02-bridge"
+        self.served[oembed] = json.dumps({"thumbnail_url": thumb, "title": "x"}).encode()
+        self.served[thumb] = png(solid(300, 300, BLUE))
+        bridged = Track(path="ytsearch1:Aurora Lane 夜明けのバス停", title="夜明けのバス停",
+                        meta={"spotify.id": sid, "spotify.bridge": "youtube"})
+        texture = self.get(bridged, 100)
+        self.assertEqual(pixel(texture, 50, 50), (0x20, 0x40, 0xE0))
+        self.assertEqual(self.fetched, [oembed, thumb])
+        self.assertFalse(any("ytimg" in url for url in self.fetched))
 
     def test_file_url_and_folder_cover(self):
         folder = temp_dir("cm-album-")

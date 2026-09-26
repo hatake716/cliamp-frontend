@@ -13,6 +13,11 @@
   CLIAMP_MUSIC_REAL_LYRICS="アーティスト|曲名" (見つかる曲)、
   CLIAMP_MUSIC_REAL_LYRICS_MISSING="アーティスト|曲名" (見つからない曲)、
   CLIAMP_MUSIC_REAL_LOCAL_QUERY (ローカル検索で当たる語)。
+- Spotify の接続が Web API だけの cliamp (曲は YouTube で探して鳴らす) の断言は別の組
+  (WebOnly…)。偽 (spotify_web_only=True) にはいつも当て、本物は環境変数
+  CLIAMP_MUSIC_REAL_WEBONLY_SOCKET に、Spotify が Web API だけで繋がっている (偽の Spotify の
+  Web API に向けた) パッチ済みの cliamp のソケットがあるときだけ当てる。本物の Spotify には
+  繋がない。曲を鳴らさない (YouTube を探しに行かない) ので REAL_NETWORK は要らない。
 
 断言は PROTOCOL.md と、本物のパッチ (patches/cliamp-1.50.0-gui-ipc.patch) の実際の
 振る舞いに合わせてある。偽がこれに落ちるなら偽が本物とずれている。
@@ -39,8 +44,12 @@ sys.path.insert(0, str(HERE))
 from fake_cliamp import FakeCliamp, temp_socket_path  # noqa: E402
 
 from cliamp_music.protocol import (  # noqa: E402
+    SPOTIFY_PREMIUM_REQUIRED,
+    Response,
     decode_response,
     encode_request,
+    is_spotify_search_blocked,
+    is_youtube_bridge,
     parse_lyrics,
     parse_playlist,
     parse_providers,
@@ -50,6 +59,7 @@ from cliamp_music.protocol import (  # noqa: E402
 
 REAL_SOCKET = os.environ.get("CLIAMP_MUSIC_REAL_SOCKET", "")
 REAL_NETWORK = os.environ.get("CLIAMP_MUSIC_REAL_NETWORK") == "1"
+REAL_WEBONLY_SOCKET = os.environ.get("CLIAMP_MUSIC_REAL_WEBONLY_SOCKET", "")
 
 EQ_PRESETS = ["Flat", "Rock", "Pop", "Jazz", "Classical", "Bass Boost", "Treble Boost", "Vocal",
               "Electronic", "Acoustic", "Hip-Hop", "R&B", "Loudness", "Late Night", "Podcast",
@@ -87,15 +97,10 @@ def _call_raw(path: str, line: bytes, timeout: float) -> str:
         sock.close()
 
 
-class _Conformance:
-    """偽と本物に共通の断言。サブクラスが sock と、相手ごとの値を決める。"""
+class _Calls:
+    """1 要求 1 接続で送って受ける道具。サブクラスが sock を決める。"""
 
     sock = ""
-    real = False
-    network = True
-    lyrics_found = ("", "")
-    lyrics_missing = ("", "")
-    local_query = ""
 
     # --- 送受信 ---------------------------------------------------------------
 
@@ -132,6 +137,16 @@ class _Conformance:
             time.sleep(0.1)
             st = self.status()
         return st
+
+
+class _Conformance(_Calls):
+    """偽と本物に共通の断言。サブクラスが sock と、相手ごとの値を決める。"""
+
+    real = False
+    network = True
+    lyrics_found = ("", "")
+    lyrics_missing = ("", "")
+    local_query = ""
 
     # --- 用意 ---------------------------------------------------------------
 
@@ -595,6 +610,11 @@ class _Conformance:
         self.assertIs(by_key["local"]["search"], True)
         self.assertEqual(by_key["local"]["name"], "Local")
         self.assertEqual(parse_providers(data)[0].key, data["providers"][0]["key"])
+        # playback (omitempty) は Web API だけの Spotify にだけ付く。資格情報の無い Spotify や
+        # 自分で鳴らすプロバイダーでは省かれる
+        for entry in data["providers"]:
+            self.assertNotIn("playback", entry, entry)
+        self.assertTrue(all(info.playback == "" for info in parse_providers(data)))
 
     def test_providers_radio_is_not_searchable(self):
         """radio は Searcher でない (search は YouTube へ退避するだけ) ので search は false。"""
@@ -924,13 +944,104 @@ class _Conformance:
         self.wait(lambda st: st.get("index") == 1, 5, "prev")
 
 
-def _real_socket_problem() -> str:
-    if not REAL_SOCKET:
-        return "CLIAMP_MUSIC_REAL_SOCKET がありません"
-    if os.path.realpath(REAL_SOCKET) == _user_socket():
+class _WebOnlyConformance(_Calls):
+    """Spotify の接続が Web API だけの cliamp の断言 (偽と本物に共通)。
+
+    librespot のセッションを作れない (Spotify が資格情報を断る・Premium でない) とき、cliamp は
+    OAuth のトークンで Web API だけを使い、プレイリストと保存した曲の曲を YouTube で探して鳴らす
+    形で返す。曲を鳴らさない (yt-dlp で探しに行かない) ように組んである。"""
+
+    # 手元に無いファイル (開始が必ず失敗し、後ろの曲を鳴らさずに止まる)
+    MISSING = "/nonexistent/cliamp-music-conformance/__fail__-web-only.flac"
+
+    def spotify_lists(self) -> list[dict]:
+        lists = self.ok("playlists", provider="spotify").get("playlists") or []
+        self.assertTrue(lists, "Web API だけの Spotify でもプレイリストが取れる")
+        return lists
+
+    def bridged(self, pid: str) -> list[dict]:
+        tracks = self.ok("tracks", provider="spotify", id=pid).get("tracks") or []
+        self.assertTrue(tracks, f"プレイリスト {pid} の曲がありません")
+        return tracks
+
+    def test_providers_report_youtube_playback(self):
+        # playback はセッションができてから (spotify のカタログ系を 1 度通してから) 付く
+        self.spotify_lists()
+        data = self.ok("providers")
+        by_key = {p["key"]: p for p in data["providers"]}
+        self.assertEqual(by_key["spotify"].get("playback"), "youtube")
+        for key, entry in by_key.items():
+            if key != "spotify":
+                self.assertNotIn("playback", entry, entry)
+        info = next(i for i in parse_providers(data) if i.key == "spotify")
+        self.assertTrue(info.plays_via_youtube)
+        self.assertTrue(info.playlists)
+
+    def test_playlist_tracks_are_bridged_to_youtube(self):
+        lists = self.spotify_lists()
+        ids = [lists[0]["id"]]
+        if any(p["id"] == "YOUR MUSIC" for p in lists):
+            ids.append("YOUR MUSIC")  # 保存した曲 (Your Music) も同じ形
+        for pid in ids:
+            for t in self.bridged(pid):
+                with self.subTest(playlist=pid, title=t.get("title")):
+                    self.assertTrue(t.get("title"), t)
+                    self.assertTrue(t.get("artist"), t)
+                    self.assertGreater(t.get("duration", 0), 0, t)
+                    artists = " ".join(a for a in t["artist"].split(", ") if a)
+                    self.assertEqual(t["path"], f"ytsearch1:{artists} {t['title']}")
+                    self.assertNotIn("unplayable", t, "YouTube で探す曲は鳴らせる")
+                    self.assertNotIn("stream", t, "橋渡しの曲は stream ではない (本物の bridged())")
+                    meta = t.get("meta") or {}
+                    self.assertEqual(set(meta), {"spotify.id", "spotify.bridge"}, meta)
+                    self.assertEqual(meta["spotify.bridge"], "youtube")
+                    self.assertRegex(meta["spotify.id"], r"^[A-Za-z0-9]{22}$")
+                    track = parse_tracks([t])[0]
+                    self.assertTrue(is_youtube_bridge(track))
+                    self.assertIsNone(track.youtube_id)
+                    self.assertEqual(track.spotify_id, meta["spotify.id"])
+                    self.assertEqual(track.web_url, f"https://open.spotify.com/track/{meta['spotify.id']}")
+
+    def test_search_is_blocked_for_development_mode_apps(self):
+        error = self.err("search", provider="spotify", query="夜明けのバス停")
+        self.assertTrue(is_spotify_search_blocked(error), error)
+        message = Response(False, {}, error, "error").message
+        self.assertIn("YouTube", message)
+        self.assertNotIn("client_id is too new", message)
+
+    def test_spotify_track_without_streaming_session_fails(self):
+        sid = parse_tracks(self.bridged(self.spotify_lists()[0]["id"]))[0].spotify_id
+        self.ok("shuffle", name="off")
+        self.ok("repeat", name="off")
+        self.ok("replace", tracks=[{"path": f"spotify:track:{sid}", "title": "Spotify の曲"}], index=0)
+        st = self.wait(lambda st: st.get("playback_error"), 8, "playback_error")
+        self.assertIn("spotify: streaming unavailable", st["playback_error"])
+        self.assertEqual(st["state"], "stopped")
+        self.assertEqual(parse_status(st).playback_problem[0], SPOTIFY_PREMIUM_REQUIRED)
+
+    def test_bridged_tracks_round_trip(self):
+        """YouTube で探す曲を replace で送り返しても、meta (spotify.id / spotify.bridge) が残る。"""
+        bridged = self.bridged(self.spotify_lists()[0]["id"])[:3]
+        missing = {"path": self.MISSING, "title": "無いファイル"}
+        self.ok("shuffle", name="off")
+        self.ok("repeat", name="off")
+        self.ok("replace", tracks=[missing] + bridged, index=0,
+                source={"provider": "spotify", "id": "x", "name": "Web API だけ"})
+        self.wait(lambda st: st.get("playback_error") and st["state"] == "stopped", 8, "先頭の曲の失敗")
+        back = self.ok("playlist")["tracks"][1:]
+        for sent, got in zip(bridged, back):
+            self.assertEqual(got["path"], sent["path"])
+            self.assertEqual(got.get("meta"), sent.get("meta"))
+            self.assertTrue(is_youtube_bridge(parse_tracks([got])[0]))
+
+
+def _real_socket_problem(sock: str = REAL_SOCKET, name: str = "CLIAMP_MUSIC_REAL_SOCKET") -> str:
+    if not sock:
+        return f"{name} がありません"
+    if os.path.realpath(sock) == _user_socket():
         return "利用者の cliamp のソケットには当てません (リストを差し替えて音楽を壊すため)"
-    if not os.path.exists(REAL_SOCKET):
-        return f"{REAL_SOCKET} がありません"
+    if not os.path.exists(sock):
+        return f"{sock} がありません"
     return ""
 
 
@@ -975,6 +1086,50 @@ for _gap_name in KNOWN_FAKE_GAPS:
     setattr(FakeConformance, _gap_name, _expect_gap(_gap_name))
 
 
+class FakeWebOnlyConformance(_WebOnlyConformance, unittest.TestCase):
+    """Web API だけの Spotify の断言を偽の cliamp (spotify_web_only=True) に当てる (いつも走る)。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.sock = temp_socket_path()
+        cls.fake = FakeCliamp(cls.sock, spotify_web_only=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.fake.stop()
+
+    def test_fake_reports_playback_only_after_the_session(self):
+        """偽の側だけ: 起動したばかりの cliamp の providers には playback が無く、spotify の
+        カタログ系が (サインインの断りなしに) 通った後に付く (本物の PlaybackVia と同じ。本物は
+        Go の試験 TestProviderPlaybackVia が確かめる)。"""
+        for first in (("playlists", {"provider": "spotify"}), ("tracks", {"provider": "spotify", "id": "YOUR MUSIC"}),
+                      ("search", {"provider": "spotify", "query": "夜"})):
+            with self.subTest(first=first[0]):
+                fake = FakeCliamp(temp_socket_path(), spotify_web_only=True)
+                spotify = next(p for p in fake.dispatch({"cmd": "providers"})["providers"] if p["key"] == "spotify")
+                self.assertNotIn("playback", spotify)
+                fake.dispatch({"cmd": first[0], **first[1]})
+                spotify = next(p for p in fake.dispatch({"cmd": "providers"})["providers"] if p["key"] == "spotify")
+                self.assertEqual(spotify.get("playback"), "youtube")
+        # サインインが要るあいだはセッションができない
+        fake = FakeCliamp(temp_socket_path(), spotify_web_only=True, spotify_needs_auth=True)
+        self.assertTrue(fake.dispatch({"cmd": "playlists", "provider": "spotify"}).get("needs_auth"))
+        fake.spotify_needs_auth = False
+        spotify = next(p for p in fake.dispatch({"cmd": "providers"})["providers"] if p["key"] == "spotify")
+        self.assertNotIn("playback", spotify)
+
+    def test_fake_bridges_the_same_songs(self):
+        """偽の側だけ: YouTube で探す曲は、ふつうの偽の Spotify の曲と同じ曲 (ID・曲名・長さ)。"""
+        normal = FakeCliamp(temp_socket_path())
+        for pid, (_name, _section, tracks) in self.fake.spotify_lists.items():
+            plain = normal.spotify_lists[pid][2]
+            self.assertEqual([t["meta"]["spotify.id"] for t in tracks],
+                             [t["path"].removeprefix("spotify:track:") for t in plain])
+            for bridged, original in zip(tracks, plain):
+                for key in ("title", "artist", "album", "year", "track_number", "duration"):
+                    self.assertEqual(bridged.get(key), original.get(key), key)
+
+
 @unittest.skipIf(_real_socket_problem(), _real_socket_problem())
 class RealConformance(_Conformance, unittest.TestCase):
     """本物のパッチ済み cliamp (TUI モード) に同じ断言を当てる。"""
@@ -993,6 +1148,14 @@ class RealConformance(_Conformance, unittest.TestCase):
         cls.lyrics_missing = pair("CLIAMP_MUSIC_REAL_LYRICS_MISSING",
                                   ("Nobody Artist zzqx", "Nonexistent Lyrics Song zzqx"))
         cls.local_query = os.environ.get("CLIAMP_MUSIC_REAL_LOCAL_QUERY", "Silent Track")
+
+
+@unittest.skipIf(_real_socket_problem(REAL_WEBONLY_SOCKET, "CLIAMP_MUSIC_REAL_WEBONLY_SOCKET"),
+                 _real_socket_problem(REAL_WEBONLY_SOCKET, "CLIAMP_MUSIC_REAL_WEBONLY_SOCKET"))
+class RealWebOnlyConformance(_WebOnlyConformance, unittest.TestCase):
+    """本物のパッチ済み cliamp (Spotify が Web API だけで繋がっているもの) に同じ断言を当てる。"""
+
+    sock = REAL_WEBONLY_SOCKET
 
 
 if __name__ == "__main__":

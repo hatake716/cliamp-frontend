@@ -3,6 +3,10 @@
 PlaylistsPage: 大見出し「プレイリスト」。プロバイダーごとの節 (ローカルが先頭、
 次に playlists を持つプロバイダー。radio は除く) に、プレイリストのカードの格子。
 サインインの要るプロバイダーは節に小さな注意書きを出す。押すと詳細へ。
+曲を YouTube で探して鳴らすプロバイダー (ProviderInfo の playback が "youtube"。Web API
+だけの Spotify) の節には「曲は YouTube で探して再生します」と書き添える。playback は cliamp が
+Spotify のセッションを作った後 (spotify の playlists の初回の後) の providers にしか載らないので、
+カタログが取り直した答えを ctx が覚えたとき ("providers-changed") にも書き添えを直す。
 
 PlaylistDetailPage: Apple のアルバムの頁の形。左上に 250px の絵 (先頭 4 曲の 2x2、
 無ければ代わりの絵)、題 (26px/700)、提供元 (26px/400、赤)、情報の行、ボタン
@@ -11,7 +15,9 @@ PlaylistDetailPage: Apple のアルバムの頁の形。左上に 250px の絵 (
 取り直させて添字で選ぶので、その間にリストが変わっていると別の曲が鳴る)。replace の無い
 cliamp と、とても長いリストだけ `load_provider`。ローカルのプレイリストは「…」から
 削除でき (確認あり)、行の「…」に「プレイリストから削除」が出る。最後の曲を外すと cliamp は
-プレイリストごと消すので、そのときはページを閉じる。
+プレイリストごと消すので、そのときはページを閉じる。曲を YouTube で探して鳴らすプレイリスト
+(プロバイダーの playback が "youtube" か、曲が YouTube で探す Spotify の曲) は、情報の行の
+下に「曲は YouTube で探して再生します」と控えめに書き添える。
 """
 
 from __future__ import annotations
@@ -22,7 +28,15 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 from gi.repository import Adw, Gio, GObject, Gtk  # noqa: E402
 
-from ..protocol import RECENTLY_PLAYED, PlaylistInfo, Response, Source, Track  # noqa: E402
+from ..protocol import (  # noqa: E402
+    PLAYBACK_YOUTUBE,
+    RECENTLY_PLAYED,
+    PlaylistInfo,
+    Response,
+    Source,
+    Track,
+    is_youtube_bridge,
+)
 from ..widgets import MediaCard, SectionHeader, TrackList, TrackRow, format_count  # noqa: E402
 from .home import (  # noqa: E402
     DETAIL_LIST_SIDE,
@@ -31,6 +45,7 @@ from .home import (  # noqa: E402
     SIDE,
     UNSUPPORTED_TEXT,
     UNSUPPORTED_TITLE,
+    WEB_ONLY_NOTE,
     AdaptiveGrid,
     ChunkedRows,
     ContentStack,
@@ -40,6 +55,7 @@ from .home import (  # noqa: E402
     info_line,
     is_playing,
     provider_label,
+    provider_playback,
     remember_provider_names,
     row_key,
     set_playlist_art,
@@ -82,6 +98,9 @@ class _ProviderSection(Gtk.Box):
         self.groups = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         page.inset(self.groups)
         self.append(self.groups)
+        # プレイリストの一覧が取れたか (鳴らし方の書き添えは取れたときだけ)、取れないときの注意書き
+        self.loaded = False
+        self.problem = ""
 
     def show_note(self, text: str) -> None:
         self.note.set_text(text)
@@ -105,6 +124,8 @@ class PlaylistsPage(PageBase):
         self.watch(ctx.store, "connection-changed", self._on_connection)
         if isinstance(ctx, GObject.Object):
             self.watch(ctx, "local-playlists-changed", self._on_local_changed)
+            if GObject.signal_lookup("providers-changed", type(ctx)):
+                self.watch(ctx, "providers-changed", self._on_providers_changed)
 
     # --- 読み込み ---------------------------------------------------------------
 
@@ -145,6 +166,23 @@ class PlaylistsPage(PageBase):
         if LOCAL in self.sections:
             self._load_section(self._serial, LOCAL, False)
 
+    def _on_providers_changed(self, *_args) -> None:
+        # 鳴らし方が分かった・変わった (Spotify のセッションができた後の providers の答え)
+        for section in self.sections.values():
+            self._update_note(section)
+
+    def _update_note(self, section: _ProviderSection) -> None:
+        """節の注意書き: 取れないときの説明、無ければ曲を YouTube で探して鳴らすことの書き添え。"""
+        if not section.loaded:
+            return
+        if section.problem:
+            section.show_note(section.problem)
+        elif provider_playback(self.ctx, section.key) == PLAYBACK_YOUTUBE:
+            # Web API だけの Spotify (無料プランなど): 曲は YouTube で探して鳴らす
+            section.show_note(WEB_ONLY_NOTE)
+        else:
+            section.show_note("")
+
     def _arrange(self, keys: list[str]) -> None:
         """節をプロバイダーの並びに揃える (無くなったものは外す)。"""
         content = self.state.content
@@ -170,18 +208,21 @@ class PlaylistsPage(PageBase):
             section = self.sections.get(key)
             if section is None:
                 return
+            section.loaded = True
             if isinstance(result, Response):
                 section.keys = None
                 self._clear_groups(section)
-                section.show_note(auth_note(self.ctx, key) if result.needs_auth
-                                  else f"読み込めませんでした: {result.message}")
+                section.problem = (auth_note(self.ctx, key) if result.needs_auth
+                                   else f"読み込めませんでした: {result.message}")
+                self._update_note(section)
                 return
             infos = [info for info in result if not (key == LOCAL and info.id == RECENTLY_PLAYED)]
             if not infos:
-                section.show_note("プレイリストはありません。曲の「…」から「プレイリストに追加」で作れます。"
-                                  if key == LOCAL else "プレイリストはありません。")
+                section.problem = ("プレイリストはありません。曲の「…」から「プレイリストに追加」で作れます。"
+                                   if key == LOCAL else "プレイリストはありません。")
             else:
-                section.show_note("")
+                section.problem = ""
+            self._update_note(section)
             self._fill(section, infos)
 
         self.ctx.catalog.playlists(key, done, force=force)
@@ -295,6 +336,10 @@ class PlaylistDetailPage(PageBase):
         self.watch(store, "connection-changed", self._on_connection)
         if self.editable and isinstance(ctx, GObject.Object):
             self.watch(ctx, "local-playlists-changed", self._on_local_changed)
+        if (not self.is_local and isinstance(ctx, GObject.Object)
+                and GObject.signal_lookup("providers-changed", type(ctx))):
+            # カタログが取り直した providers の答え (鳴らし方) を ctx が覚えたとき
+            self.watch(ctx, "providers-changed", self._on_providers_changed)
 
     @property
     def is_local(self) -> bool:
@@ -322,6 +367,9 @@ class PlaylistDetailPage(PageBase):
             self.state.show_loading()
         self._serial += 1
         serial = self._serial
+        if not self.is_local and store.supports("providers"):
+            # 鳴らし方 (Web API だけの Spotify は YouTube で探して鳴らす) を確かめる
+            self.ctx.catalog.providers(weak_handler(self._on_providers), force=force)
 
         def done(result) -> None:
             if serial != self._serial:
@@ -374,11 +422,32 @@ class PlaylistDetailPage(PageBase):
         if self.ctx.store.connected:
             self.load(force=False)
 
+    def _on_providers(self, result) -> None:
+        if isinstance(result, Response):
+            return
+        remember_provider_names(self.ctx, result)
+        self._update_note()
+
+    def _on_providers_changed(self, *_args) -> None:
+        self._update_note()
+
+    @property
+    def plays_via_youtube(self) -> bool:
+        """曲を YouTube で探して鳴らすか (プロバイダーがそう言っているか、曲がそうなっている)。"""
+        if self.is_local:
+            return False
+        return (provider_playback(self.ctx, self.provider) == PLAYBACK_YOUTUBE
+                or any(is_youtube_bridge(t) for t in self._tracks))
+
+    def _update_note(self) -> None:
+        self.header.set_note(WEB_ONLY_NOTE if self._tracks and self.plays_via_youtube else "")
+
     def _show_problem(self, icon: str, title: str, text: str) -> None:
         self._tracks = []
         self._keys = None
         self.rows.build([])
         self.header.set_info("")
+        self.header.set_note("")
         self.header.set_actions_sensitive(False)
         # ローカルは曲が読めなくても「…」から削除できる
         self.header.more_button.set_sensitive(self.editable)
@@ -395,6 +464,7 @@ class PlaylistDetailPage(PageBase):
             set_playlist_art(self.ctx, self.header.art, self._tracks, self._art_key(), DetailHeader.ART)
             # 曲を外した・足したときは差分だけ (スクロール位置と開いているメニューを失わない)
             self.rows.update(self._tracks)
+        self._update_note()
         if not tracks:
             self.state.show_empty("music-note-list-symbolic", "曲がありません",
                                   "このプレイリストにはまだ曲がありません。")

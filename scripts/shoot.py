@@ -30,7 +30,9 @@
 nowplaying, lyrics, queue, fullscreen-lyrics, fullscreen-queue, mini-square, mini-compact,
 equalizer, stress, playback-error, playback-error-fullscreen, playback-error-mini, narrow, collapsed,
 collapsed-sidebar,
-panel-over, disconnected, reconnected, legacy, legacy-playlists, legacy-search。
+panel-over, disconnected, reconnected, legacy, legacy-playlists, legacy-search,
+playlist-web-only, playlists-web-only, search-spotify-blocked (Spotify の接続が Web API だけの
+cliamp。偽を --spotify-web-only で起こし直す)。
 """
 
 from __future__ import annotations
@@ -65,7 +67,8 @@ FAILURE_PATTERNS = (
 FRAMED = ("home", "search", "search-results", "radio", "recent", "playlists", "playlist",
           "nowplaying", "lyrics", "queue", "fullscreen-lyrics", "fullscreen-queue", "stress",
           "narrow", "collapsed-sidebar", "panel-over", "disconnected", "legacy", "mini-square", "mini-compact",
-          "equalizer", "playback-error", "playback-error-fullscreen", "playback-error-mini")
+          "equalizer", "playback-error", "playback-error-fullscreen", "playback-error-mini",
+          "playlist-web-only", "search-spotify-blocked")
 
 LONG_TITLE = "夜明け前のプラットホームで君を待つ & <特別版> — とても長い日本語の曲名が再生バーに入りきらないとき"
 LONG_ARTIST = "青い灯台 & <Friends> feat. 真夜中ポスト"
@@ -567,7 +570,8 @@ def child_main(args: argparse.Namespace) -> int:
     from gi.repository import Gio, GLib, Graphene, Gtk
 
     from cliamp_music import app as app_module
-    from cliamp_music.protocol import Track
+    from cliamp_music.pages.home import WEB_ONLY_NOTE, provider_playback
+    from cliamp_music.protocol import SPOTIFY_SEARCH_BLOCKED_TITLE, Track, is_youtube_bridge
 
     out = Path(args.out)
     work = Path(args.work)
@@ -1058,10 +1062,80 @@ def child_main(args: argparse.Namespace) -> int:
         yield Until(lambda: bool(store().playlist.tracks), 5, "拡張のある cliamp に戻ってもリストが戻らない")
         yield 1.0
 
+    def restart_fake(*extra: str):
+        """偽の cliamp を別の設定で起こし直し、アプリが切れて繋ぎ直す (カタログを捨てる) まで待つ。"""
+        seen = {"offline": False}
+
+        def on_connection(_client, connected):
+            if not connected:
+                seen["offline"] = True
+
+        client = ctx().client
+        handler = client.connect("connection-changed", on_connection)
+        try:
+            fake.start(*extra)
+            yield Until(lambda: seen["offline"] and store().connected and store().api == 1, 15,
+                        f"偽の cliamp ({' '.join(extra) or '既定'}) に繋ぎ直さない")
+            yield Until(lambda: bool(store().playlist.tracks), 5, "繋ぎ直した後にリストが戻らない")
+        finally:
+            client.disconnect(handler)
+
+    def scene_web_only():
+        """Spotify の接続が Web API だけの cliamp: 曲は YouTube で探して鳴らし、検索は断られる。"""
+        window = win()
+        yield from restart_fake("--spotify-web-only")
+        resize(1180)
+        window.navigate("playlist", provider="spotify", id="YOUR MUSIC", name="Your Music")
+        yield Until(lambda: page_id() == "playlist" and len(page().tracks) == 5, 10,
+                    "Web API だけの Spotify のプレイリストが開かない")
+        detail = page()
+        yield Until(lambda: detail.header.note_label.get_visible(), 5, "「YouTube で探して再生」の書き添えが出ない")
+        check(detail.header.note_label.get_text() == WEB_ONLY_NOTE,
+              f"書き添えが違います ({detail.header.note_label.get_text()!r})")
+        check(provider_playback(ctx(), "spotify") == "youtube", "providers の playback を覚えていません")
+        check(all(is_youtube_bridge(t) for t in detail.tracks), "曲が YouTube で探す形ではありません")
+        check(selected() == "playlist:spotify:YOUR MUSIC", f"サイドバーが Spotify の行を選んでいません ({selected()})")
+        # 2 曲目から鳴らす (探す曲の形のまま送り、再生バーには Spotify の曲名と絵)
+        detail.play_from(1)
+        yield Until(lambda: store().status.track is not None and is_youtube_bridge(store().status.track)
+                    and store().status.index == 1 and store().status.state == "playing", 8,
+                    "YouTube で探す曲が鳴らない")
+        yield 1.8
+        capture(window, "playlist-web-only")
+        # すべてのプレイリスト: Spotify の節にも書き添える
+        window.navigate("playlists")
+        yield Until(lambda: page_id() == "playlists" and "spotify" in page().sections
+                    and page().sections["spotify"].note.get_visible(), 10,
+                    "すべてのプレイリストの Spotify の節に書き添えが出ない")
+        yield 1.2
+        check(page().sections["spotify"].note.get_text() == WEB_ONLY_NOTE, "Spotify の節の書き添えが違います")
+        capture(window, "playlists-web-only")
+        # 検索: Spotify の範囲は開発モードのアプリでは断られる。英語の文ではなく日本語の説明とボタン
+        window.navigate("search")
+        yield Until(lambda: page_id() == "search", 5, "検索が開かない")
+        search = page()
+        yield Until(lambda: search.scopes.get_n_toggles() == 3, 10, "Spotify の範囲が出ない")
+        search.set_scope("spotify")
+        search.set_query("夜のドライブ")
+        yield Until(lambda: search.results.state == "empty", 10, "Spotify の検索の断りが出ない")
+        window.set_focus(None)
+        yield 1.0
+        empty = search.results.empty
+        check(empty.title_label.get_text() == SPOTIFY_SEARCH_BLOCKED_TITLE,
+              f"Spotify の検索の断りの題が違います ({empty.title_label.get_text()!r})")
+        check("client_id is too new" not in texts(search), "cliamp の英語の文がそのまま出ています")
+        check(empty.button is not None and empty.button.get_visible(), "「YouTube で検索」のボタンがありません")
+        capture(window, "search-spotify-blocked")
+        # ボタンで YouTube の範囲に替えて探し直す
+        empty.button.emit("clicked")
+        yield Until(lambda: search.scope == "youtube" and search.results.state == "content", 10,
+                    "「YouTube で検索」で YouTube の結果が出ない")
+        yield from restart_fake()
+
     scenes = [scene_start, scene_home, scene_search, scene_search_results, scene_radio, scene_recent,
               scene_playlists, scene_playlist, scene_nowplaying, scene_lyrics, scene_queue,
               scene_fullscreen, scene_miniplayer, scene_equalizer, scene_stress, scene_playback_error,
-              scene_narrow, scene_disconnected, scene_legacy]
+              scene_narrow, scene_disconnected, scene_legacy, scene_web_only]
 
     def all_steps():
         for scene in scenes:

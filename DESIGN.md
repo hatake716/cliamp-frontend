@@ -100,8 +100,9 @@ class Track:
     display_title -> str        # title、無ければ path の末尾
     subtitle -> str             # "artist — album" / "artist" / ""
     meta_get(key, default="") -> str
-    youtube_id -> str | None    # watch?v= / youtu.be/ / music.youtube.com
-    spotify_id -> str | None    # spotify:track:<id>
+    youtube_id -> str | None    # watch?v= / youtu.be/ / music.youtube.com (yt-dlp の検索式 "ytsearch1:…" は None)
+    spotify_id -> str | None    # spotify:track:<id> / open.spotify.com、無ければ meta "spotify.id" (22 文字のときだけ)
+    web_url -> str | None       # Spotify の曲 ID があれば open.spotify.com/track/<id>、無ければ http(s) の path
     is_local_file -> bool
     to_wire() -> dict           # PROTOCOL の TrackInfo (空の値は省く)
     from_wire(d) -> Track       # classmethod
@@ -127,16 +128,35 @@ def describe_playback_error(text) -> (short_ja, detail)  # 年齢確認・非公
                                                          # パス・URL・引用符の中の語では決めない
                                                          # (曲名やフォルダ名の "Timeout" など)。出どころ
                                                          # (YouTube / SoundCloud …) は yt-dlp の [抽出器] で
+                                                         # 見分ける。
+                                                         # "spotify: streaming unavailable" は
+                                                         # 「Spotify の曲の再生には Premium が必要です」、
+                                                         # "rate limited by Spotify; retry after 24h0m0s" は
+                                                         # 待つ長さつきの回数の制限 (どちらもパス等を除いた
+                                                         # 文の、先頭か ": " の直後の cliamp の文言だけ)
 def playback_error_headline(short) -> str   # 末尾の括弧書き (手当て) を除く (トースト用)
 def playback_error_tooltip(short, detail) -> str
+def describe_catalog_error(text) -> str     # カタログ系の失敗の言い直し (回数の制限・検索の封鎖・
+                                            # 鳴らせない曲)。Response.message が使う。無ければ ""。
+                                            # cliamp の Spotify の誤り ("spotify: " で始まる) だけ
+                                            # (YouTube の検索の誤りは語を繰り返すので見ない)
+def is_spotify_search_blocked(text) -> bool # "spotify: …" の誤りで、friendlySearchError ("spotify: search
+                                            # blocked") か "spotify: search: …" の 400 "Invalid limit"
+def spotify_rate_limit_wait(text) -> float | None   # 回数の制限なら待つ秒 (不明は 0)、違えば None。
+                                            # "spotify: rate limited by Spotify" が先頭か ": " の直後のときだけ
+def parse_go_duration(text) -> float | None; format_wait(seconds) -> str   # "24h0m0s" → 86400 → 「24 時間」
 
 @dataclass
 class PlaylistState:
     tracks: list[Track]; index: int; total: int
     queue: list[int]; up_next: list[int]; gen: int; source: Source
 
+def is_youtube_bridge(track) -> bool   # meta "spotify.bridge" が "youtube" (YouTube で探して鳴らす Spotify の曲)
+
 @dataclass(frozen=True)
 class ProviderInfo: key: str; name: str; search: bool; playlists: bool; virtual: bool
+    playback: str = ""    # "youtube" = 自分では鳴らせず YouTube で探して鳴らす (Web API だけの Spotify)
+    plays_via_youtube -> bool
 
 @dataclass(frozen=True)
 class PlaylistInfo: provider: str; id: str; name: str; track_count: int = 0; duration: int = 0; section: str = ""
@@ -258,9 +278,19 @@ class Catalog:
     def playlist_add(self, name, tracks, callback=None)
     def playlist_delete(self, name, callback=None)
     def playlist_remove_track(self, name, index, callback=None, path=None)
+    def add_providers_listener(self, listener(list[ProviderInfo]))   # providers の答えが届くたび
+    def invalidate(self, provider=None)   # 全部なら「セッションができた」印も忘れる (繋ぎ直し)
 ```
 
-失敗は `Response` (kind 付き) をそのまま callback に渡す。結果は短時間
+providers の `playback` は cliamp が Spotify のセッションを作った後の答えにしか載らない
+(セッションは spotify の playlists / tracks / search の初回にできる。PROTOCOL.md)。
+カタログは spotify のカタログ系がこの cliamp で初めて成功した後に providers を 1 度だけ
+取り直し (覚えている答えに playback が載っていれば取り直さない。送ってある providers が
+まだ届いていなければ、その答えは覚えずに届いてから取り直す)、聞き手に渡す。AppContext が
+聞き手になって覚え直し、鳴らし方が変われば "providers-changed" を出す。
+
+失敗は `Response` (kind 付き) をそのまま callback に渡す (`Response.message` は Spotify の回数の
+制限・検索の封鎖を日本語に言い直す。`describe_catalog_error`)。結果は短時間
 覚えておく (検索は同じ語で 10 分、プレイリスト一覧は 5 分)。期限切れは足すたびに
 まとめて捨て、検索は新しい 200 件、歌詞は 300 件、曲の一覧は 100 件まで。
 検索ページは `lane` を付けて検索し、打ち直しで古い語の検索が worker を塞がないようにする。
@@ -281,7 +311,9 @@ class ArtworkLoader:
 2. YouTube の曲: `https://i.ytimg.com/vi/<id>/hqdefault.jpg` (480x360 の上下に黒帯。
    16:9 の中央 270x270 を切り抜く)。大きな表示 (>= 300px) では `sddefault.jpg` を先に試す。
 3. Spotify: `https://open.spotify.com/oembed?url=https://open.spotify.com/track/<id>` の
-   `thumbnail_url` (認証不要)。
+   `thumbnail_url` (認証不要)。曲 ID は path か meta "spotify.id"。YouTube で探して鳴らす
+   Spotify の曲 (`is_youtube_bridge`、path "ytsearch1:…") はこれを 2 より先にし、検索式からは
+   YouTube のサムネイルを探さない。
 4. 手元のファイル: 埋め込みの絵 (mutagen があれば) → 同じフォルダの cover/folder.(jpg|png)。
 5. 取れなければ代わりの絵 (色のグラデーション + 音符)。
 取得した絵は正方形に切り抜き、最大 600px でキャッシュする (透けない絵は JPEG、透ける絵は
@@ -338,6 +370,11 @@ class AppContext:
         # 「空になったので削除しました」と知らせる (詳細のページは自分で閉じる)。
     local_playlists: list[str]; local_playlists_loaded: bool   # 実際に取れた一覧か
     def refresh_local_playlists(self, force=True, then=None)   # then(names | None)
+    def remember_providers(self, providers)   # 表示名と鳴らし方 (playback) を覚える (pages.home の
+                                              # remember_provider_names もこれを呼ぶ)
+    # シグナル: "local-playlists-changed" (ローカルのプレイリストの一覧か中身が変わった)、
+    #          "providers-changed" (鳴らし方が変わった。カタログが取り直した providers の答えなど。
+    #          すべてのプレイリストの節とプレイリストの詳細の書き添えが聞く)
 ```
 
 ### ページ
@@ -485,7 +522,12 @@ macOS 27 の形: 窓の端まで続く帯 (浮かない)、赤い記号、選択
 - 結果: 左に「トップの結果」(大きな絵 + 曲名 + アーティスト + 再生ボタン)、右に
   「曲」の最初の 4 行。その下に「すべての曲 (N)」の全件 (40px の絵、曲名、アーティスト、時間、「…」)。
   行のダブルクリック/Enter で結果全体を `replace` してその曲から再生。
-- 検索中はスピナー、失敗は理由を空状態で出す。
+- 検索中はスピナー、失敗は理由を空状態で出す。Spotify の範囲で、開発モードのアプリ (自分で
+  登録した client_id) の検索を Spotify が止めているとき (cliamp の friendlySearchError
+  "spotify: search blocked — …"、元の 400 "Invalid limit") は、英語の文の代わりに題
+  「Spotify では検索できません」と、使えるもの (プレイリスト・保存した曲) と YouTube で探すことを
+  言う説明、赤いカプセル「YouTube で検索」(範囲を YouTube に替えて同じ語で探し直す) を出す。
+  回数の制限 ("rate limited by Spotify; retry after …") は待つ長さつきの日本語 (Response.message)。
 
 ### ラジオ (pages/radio.py)
 
@@ -505,8 +547,15 @@ macOS 27 の形: 窓の端まで続く帯 (浮かない)、赤い記号、選択
   行に触らない)。スクロール位置・選択・フォーカス・開いているメニューを失わない。
 - すべてのプレイリスト (playlists.py): 題は「プレイリスト」(サイドバーの項目は
   「すべてのプレイリスト」)。プレイリストのカードの格子 (ローカル + 各プロバイダー)。
+  曲を YouTube で探して鳴らすプロバイダー (providers の `playback` が "youtube") の節には
+  見出しの下に「曲は YouTube で探して再生します」(12px 副次色の注意書き)。起動したばかりの
+  cliamp では最初の providers の答えに `playback` が無いので、カタログが spotify の playlists の
+  成功の後で取り直した答え ("providers-changed") で書き添える。
 - プレイリストの詳細: 左上に 250px の絵 (角 10、柔らかい影。先頭 4 曲の 2x2 か代わりの絵)、
   右に題 (26px/700)、提供元 (26px/400、赤)、情報の行「12 曲 · 48 分」(11px/600 副次色)、
+  YouTube で探して鳴らすプレイリスト (プロバイダーの `playback` が "youtube" か、曲が
+  `is_youtube_bridge`) はその下に「曲は YouTube で探して再生します」(11px/500 副次色、
+  `DetailHeader.set_note`)、
   ボタン: シャッフルの丸 (34px) / 「▶ 再生」カプセル (34x120) / 「…」の丸。
   下に曲の行 (43px、番号・曲名・時間・「…」、区切り線は曲名の列から)。行のダブルクリックは
   見えている並びをそのまま `replace` で送る (`load_provider` はプロバイダーに取り直させて
