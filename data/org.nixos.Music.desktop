@@ -1,0 +1,18 @@
+[Desktop Entry]
+Type=Application
+Version=1.5
+Name=ミュージック
+Name[en]=Music
+GenericName=音楽プレイヤー
+GenericName[en]=Music Player
+Comment=cliamp で流れている音楽を macOS のミュージックのように操作します
+Comment[en]=Control the cliamp music player with a macOS-style Music app
+Exec=cliamp-music
+TryExec=cliamp-music
+Icon=org.nixos.Music
+Terminal=false
+StartupNotify=true
+StartupWMClass=org.nixos.Music
+Categories=AudioVideo;Audio;Player;GTK;
+Keywords=music;player;audio;radio;lyrics;playlist;cliamp;youtube;音楽;ミュージック;再生;プレイヤー;ラジオ;歌詞;プレイリスト;
+Keywords[en]=music;player;audio;radio;lyrics;playlist;cliamp;youtube;

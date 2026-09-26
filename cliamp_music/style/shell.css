@@ -1,0 +1,795 @@
+/*
+ * ミュージック — 骨格 (窓・サイドバー・再生バー・右パネル・未接続の表示)
+ *
+ * base.css の後に USER + 1 で読む。すべて window.music の下に閉じ込める。
+ * 全体の ~/.config/gtk-4.0/gtk.css が USER (800) で overlay-split-view・
+ * .navigation-sidebar・toolbarview > .top-bar・headerbar・button・menubutton に
+ * ガラスの地・枠・影を当ててくる。GTK は選択子の詳しさより先に読み込みの優先度で
+ * 決めるので、ここで触る性質は必ず書き切る (背景色・背景画像・枠・影・高さ・余白)。
+ *
+ * 数値は macOS 27 のミュージックの画面写真からの実測を丸めた調整値
+ * (DESIGN.md §4・§5)。変数 (--m-…) は base.css。
+ */
+
+/* ------------------------------------------------------------------
+ * 窓の地と分割
+ * ------------------------------------------------------------------ */
+
+window.music.music-window {
+  background-color: var(--m-canvas);
+}
+
+window.music overlay-split-view.music-split,
+window.music overlay-split-view.music-panel-split {
+  background-color: transparent;
+  background-image: none;
+}
+
+/* 分割の枠 (libadwaita の shade・border・outline) は自前の線で描くので消す */
+window.music overlay-split-view.music-split > border,
+window.music overlay-split-view.music-panel-split > border,
+window.music overlay-split-view.music-split > outline,
+window.music overlay-split-view.music-panel-split > outline {
+  background-color: transparent;
+  background-image: none;
+  box-shadow: none;
+}
+
+window.music overlay-split-view.music-split > .sidebar-pane,
+window.music overlay-split-view.music-split > widget.background {
+  background-color: var(--m-sidebar);
+  background-image: none;
+  border: none;
+  box-shadow: inset -1px 0 rgba(0, 0, 0, 0.42);
+  color: var(--m-label);
+}
+
+window.music overlay-split-view.music-panel-split > .sidebar-pane,
+window.music overlay-split-view.music-panel-split > widget.background {
+  background-color: var(--m-sidebar);
+  background-image: none;
+  border: none;
+  box-shadow: inset 1px 0 rgba(0, 0, 0, 0.42);
+  color: var(--m-label);
+}
+
+/* 畳んだとき (内容の上に重ねたとき) は浮いた影 */
+window.music overlay-split-view.music-split.collapsed > .sidebar-pane,
+window.music overlay-split-view.music-split > widget.background {
+  box-shadow: 1px 0 rgba(0, 0, 0, 0.50), 10px 0 26px rgba(0, 0, 0, 0.36);
+}
+
+window.music overlay-split-view.music-panel-split > widget.background {
+  box-shadow: -1px 0 rgba(0, 0, 0, 0.50), -10px 0 26px rgba(0, 0, 0, 0.36);
+}
+
+window.music overlay-split-view.music-split > dimming,
+window.music overlay-split-view.music-panel-split > dimming {
+  background-color: rgba(0, 0, 0, 0.18);
+}
+
+window.music overlay-split-view.music-split > .content-pane,
+window.music overlay-split-view.music-panel-split > .content-pane {
+  background-color: var(--m-canvas);
+  background-image: none;
+}
+
+/* ------------------------------------------------------------------
+ * ページのツールバー (透明な帯が内容の上に浮く: macOS 27 の uniform toolbars)。
+ * 各ページの細部は pages.css。ここでは利用者の gtk.css のガラスの帯を外すだけ。
+ * ------------------------------------------------------------------ */
+
+window.music overlay.music-content toolbarview > .top-bar,
+window.music overlay.music-content toolbarview > .bottom-bar,
+window.music .music-sidebar toolbarview > .top-bar,
+window.music .music-sidebar toolbarview > .bottom-bar {
+  background-color: transparent;
+  background-image: none;
+  border: none;
+  box-shadow: none;
+}
+
+window.music overlay.music-content navigation-view,
+window.music overlay.music-content navigation-view-page {
+  background-color: var(--m-canvas);
+}
+
+/* 畳んだサイドバーを出すボタン (ページのヘッダーの先頭に足す) */
+window.music headerbar button.music-sidebar-toggle {
+  margin: 0 4px;
+  color: var(--m-label);
+}
+
+/* ------------------------------------------------------------------
+ * サイドバー
+ * ------------------------------------------------------------------ */
+
+window.music .music-sidebar {
+  background-color: transparent;
+  color: var(--m-label);
+}
+
+window.music .music-sidebar headerbar.music-sidebar-header {
+  min-height: 52px;
+  padding: 0 14px;
+  margin: 0;
+  border: none;
+  background-color: transparent;
+  background-image: none;
+  box-shadow: none;
+}
+
+window.music .music-sidebar scrolledwindow.music-sidebar-scroller,
+window.music .music-sidebar scrolledwindow.music-sidebar-scroller > viewport {
+  background-color: transparent;
+  background-image: none;
+}
+
+window.music list.music-sidebar-list,
+window.music list.music-sidebar-list:backdrop {
+  padding: 0 0 12px;
+  margin: 0;
+  border: none;
+  background-color: transparent;
+  background-image: none;
+  box-shadow: none;
+  color: var(--m-label);
+}
+
+window.music list.music-sidebar-list > row.music-sidebar-row {
+  min-height: 30px;
+  margin: 0 8px 0 10px;
+  padding: 0 10px;
+  border: none;
+  border-radius: 8px;
+  background-color: transparent;
+  background-image: none;
+  box-shadow: none;
+  color: var(--m-label);
+  outline-offset: -2px;
+  transition: background-color 120ms ease;
+}
+
+/* 記号と名前の間は Gtk.Box の spacing (9) だけ (CSS の border-spacing は足し算になる) */
+window.music list.music-sidebar-list > row.music-sidebar-row > box {
+  min-height: 30px;
+  padding: 0;
+  border-spacing: 0;
+}
+
+window.music list.music-sidebar-list > row.music-sidebar-row.with-art {
+  padding-left: 8px;
+}
+
+window.music list.music-sidebar-list > row.music-sidebar-row:hover {
+  background-color: rgba(255, 255, 255, 0.05);
+}
+
+window.music list.music-sidebar-list > row.music-sidebar-row:active {
+  background-color: rgba(255, 255, 255, 0.08);
+}
+
+window.music list.music-sidebar-list > row.music-sidebar-row:selected,
+window.music list.music-sidebar-list > row.music-sidebar-row:selected:hover,
+window.music list.music-sidebar-list > row.music-sidebar-row:selected:focus-within {
+  background-color: var(--m-selected);
+  color: var(--m-label);
+}
+
+window.music list.music-sidebar-list > row.music-sidebar-row image.music-sidebar-icon {
+  color: var(--m-key-text);
+  -gtk-icon-size: 16px;
+  min-width: 18px;
+}
+
+window.music list.music-sidebar-list > row.music-sidebar-row label.music-sidebar-label {
+  font-size: 13px;
+  font-weight: 400;
+  color: var(--m-label);
+}
+
+window.music list.music-sidebar-list > row.music-sidebar-row:selected label.music-sidebar-label {
+  font-weight: 700;
+}
+
+/* 節の見出し「ライブラリ」「プレイリスト」 (11px/600) */
+window.music list.music-sidebar-list label.music-sidebar-section {
+  margin: 14px 18px 5px 20px;
+  font-size: 11px;
+  font-weight: 600;
+  color: rgba(235, 235, 245, 0.40);
+}
+
+/* 下端の状態「● cliamp · 再生中」 */
+window.music menubutton.music-sidebar-status {
+  margin: 0;
+  padding: 0;
+}
+
+window.music menubutton.music-sidebar-status > button,
+window.music menubutton.music-sidebar-status > button:backdrop {
+  min-height: 34px;
+  margin: 4px 8px 10px 10px;
+  padding: 3px 10px;
+  border: none;
+  border-radius: 8px;
+  background-color: transparent;
+  background-image: none;
+  box-shadow: none;
+  color: var(--m-label);
+  transition: background-color 120ms ease;
+}
+
+window.music menubutton.music-sidebar-status > button:hover {
+  background-color: rgba(255, 255, 255, 0.05);
+  border: none;
+  box-shadow: none;
+}
+
+window.music menubutton.music-sidebar-status > button:active,
+window.music menubutton.music-sidebar-status > button:checked {
+  background-color: rgba(255, 255, 255, 0.09);
+  border: none;
+  box-shadow: none;
+}
+
+window.music .music-status-dot {
+  min-width: 8px;
+  min-height: 8px;
+  border-radius: 9999px;
+  background-color: var(--m-tertiary);
+}
+
+window.music .music-status-dot.playing { background-color: #32d74b; box-shadow: 0 0 0 3px rgba(50, 215, 75, 0.16); }
+window.music .music-status-dot.paused,
+window.music .music-status-dot.stopped { background-color: #32d74b; }
+window.music .music-status-dot.loading { background-color: #ffd60a; }
+window.music .music-status-dot.offline { background-color: rgba(235, 235, 245, 0.30); }
+
+window.music .music-status-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--m-label);
+}
+
+window.music .music-status-detail {
+  font-size: 11px;
+  color: var(--m-secondary);
+}
+
+window.music popover.music-status-popover > contents {
+  padding: 8px 10px;
+}
+
+window.music .music-status-heading {
+  margin-bottom: 4px;
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--m-label);
+}
+
+window.music .music-status-key {
+  font-size: 12px;
+  color: var(--m-secondary);
+}
+
+window.music .music-status-value {
+  font-size: 12px;
+  color: var(--m-label);
+}
+
+window.music button.music-status-reconnect,
+window.music button.music-link-button {
+  min-height: 24px;
+  min-width: 0;
+  padding: 0 4px;
+  margin: 0;
+  border: none;
+  border-radius: 6px;
+  background-color: transparent;
+  background-image: none;
+  box-shadow: none;
+  color: var(--m-key-text);
+  font-size: 13px;
+  font-weight: 500;
+}
+
+window.music button.music-status-reconnect:hover,
+window.music button.music-link-button:hover {
+  background-color: rgba(250, 45, 72, 0.12);
+  border: none;
+  box-shadow: none;
+}
+
+window.music button.music-status-reconnect:active,
+window.music button.music-link-button:active {
+  background-color: rgba(250, 45, 72, 0.20);
+  border: none;
+  box-shadow: none;
+}
+
+/* ------------------------------------------------------------------
+ * 再生バー (ガラスのカプセル)
+ * ------------------------------------------------------------------ */
+
+/* 後ろの内容を地の色へ溶かす帯 */
+window.music .music-bar-fade {
+  background-image: linear-gradient(to bottom,
+    rgba(28, 29, 33, 0),
+    rgba(28, 29, 33, 0.55) 45%,
+    rgba(28, 29, 33, 0.86));
+}
+
+window.music.fullscreen-player .music-bar-fade { background-image: none; }
+
+window.music box.music-player-bar {
+  min-height: 54px;
+  padding: 0 8px 0 10px;
+  border-radius: 9999px;
+  background-color: rgba(48, 49, 57, 0.94);
+  background-image: linear-gradient(to bottom,
+    rgba(255, 255, 255, 0.085),
+    rgba(255, 255, 255, 0.015) 48%,
+    rgba(0, 0, 0, 0.06));
+  border: 1px solid rgba(255, 255, 255, 0.11);
+  box-shadow:
+    inset 0 1px rgba(255, 255, 255, 0.13),
+    inset 0 -1px rgba(0, 0, 0, 0.30),
+    0 6px 14px rgba(0, 0, 0, 0.38),
+    0 1px 3px rgba(0, 0, 0, 0.30);
+  color: var(--m-label);
+}
+
+/* 操作の丸 (前へ・再生・次へ) は地なし。記号は明るい白 */
+window.music box.music-player-bar button.music-circle.flat {
+  color: var(--m-label);
+}
+
+window.music box.music-player-bar button.music-circle.flat:hover {
+  background-color: rgba(255, 255, 255, 0.08);
+}
+
+window.music box.music-player-bar button.music-circle.flat:disabled {
+  color: var(--m-tertiary);
+  background-color: transparent;
+}
+
+/* シャッフル・リピート: 切 = 灰色の記号、入 = 薄い赤の丸に赤い記号 */
+window.music box.music-player-bar .music-bar-transport button.music-toggle-circle {
+  color: var(--m-secondary);
+}
+
+window.music box.music-player-bar .music-bar-transport button.music-toggle-circle:checked {
+  background-color: var(--m-key-soft);
+  color: var(--m-key-text);
+}
+
+window.music box.music-player-bar button.music-toggle-circle:disabled {
+  color: var(--m-tertiary);
+  background-color: transparent;
+}
+
+/* 歌詞・次に再生: 入 = 赤い記号だけ (Apple の再生バーと同じく丸は薄く) */
+window.music box.music-player-bar button.music-toggle-circle.music-bar-panel-toggle {
+  color: var(--m-label);
+}
+
+window.music box.music-player-bar button.music-toggle-circle.music-bar-panel-toggle:checked {
+  background-color: rgba(250, 45, 72, 0.14);
+  color: var(--m-key-text);
+}
+
+/* 記号だけのメニューボタン (「…」・出力先・音量)。利用者の gtk.css の
+ * menubutton > button のガラスを外す */
+window.music box.music-player-bar menubutton.music-bar-icon > button,
+window.music box.music-player-bar menubutton.music-bar-icon > button:backdrop {
+  min-width: 32px;
+  min-height: 32px;
+  padding: 0;
+  margin: 0;
+  border: none;
+  border-radius: 9999px;
+  background-color: transparent;
+  background-image: none;
+  box-shadow: none;
+  color: var(--m-label);
+  -gtk-icon-size: 17px;
+  transition: background-color 120ms ease, color 120ms ease;
+}
+
+window.music box.music-player-bar menubutton.music-bar-icon > button:hover {
+  background-color: rgba(255, 255, 255, 0.08);
+  border: none;
+  box-shadow: none;
+}
+
+window.music box.music-player-bar menubutton.music-bar-icon > button:active,
+window.music box.music-player-bar menubutton.music-bar-icon > button:checked {
+  background-color: rgba(255, 255, 255, 0.13);
+  border: none;
+  box-shadow: none;
+}
+
+window.music box.music-player-bar menubutton.music-bar-icon > button:disabled {
+  background-color: transparent;
+  color: var(--m-tertiary);
+}
+
+window.music box.music-player-bar menubutton.music-bar-more > button {
+  min-width: 28px;
+  color: var(--m-label);
+}
+
+/* アートワーク (押すとミニプレーヤー / フルスクリーンのメニュー) */
+window.music box.music-player-bar menubutton.music-bar-art > button,
+window.music box.music-player-bar menubutton.music-bar-art > button:backdrop {
+  min-width: 0;
+  min-height: 0;
+  padding: 0;
+  margin: 0;
+  border: none;
+  border-radius: 5px;
+  background-color: transparent;
+  background-image: none;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.30);
+}
+
+window.music box.music-player-bar menubutton.music-bar-art > button:hover,
+window.music box.music-player-bar menubutton.music-bar-art > button:active,
+window.music box.music-player-bar menubutton.music-bar-art > button:checked {
+  background-color: transparent;
+  background-image: none;
+  border: none;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.30);
+}
+
+/* 乗せると絵が暗くなり、広げる記号が出る */
+window.music box.music-player-bar .music-bar-art-expand {
+  min-width: 36px;
+  min-height: 36px;
+  border-radius: 5px;
+  color: #ffffff;
+  background-color: rgba(0, 0, 0, 0.42);
+  opacity: 0;
+  transition: opacity 140ms ease;
+}
+
+window.music box.music-player-bar menubutton.music-bar-art > button:hover .music-bar-art-expand,
+window.music box.music-player-bar menubutton.music-bar-art > button:checked .music-bar-art-expand {
+  opacity: 1;
+}
+
+window.music box.music-player-bar .music-bar-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--m-label);
+}
+
+window.music box.music-player-bar .music-bar-subtitle {
+  font-size: 12px;
+  color: var(--m-secondary);
+}
+
+window.music box.music-player-bar .music-bar-subtitle.loading {
+  color: var(--m-tertiary);
+}
+
+window.music box.music-player-bar .music-bar-time {
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--m-secondary);
+  font-feature-settings: "tnum";
+}
+
+window.music box.music-player-bar .music-bar-star { color: var(--m-key-text); }
+
+window.music box.music-player-bar .music-bar-live {
+  padding: 0 5px;
+  border-radius: 4px;
+  background-color: var(--m-key-soft);
+  color: var(--m-key-text);
+  font-size: 10px;
+  font-weight: 700;
+}
+
+window.music box.music-player-bar .music-bar-idle {
+  color: var(--m-tertiary);
+}
+
+/* 再生位置の線 (color = 塗った部分。地の線はその色を薄くして描く) */
+window.music box.music-player-bar .music-progress {
+  color: rgba(255, 255, 255, 0.62);
+}
+
+window.music box.music-player-bar .music-progress:hover {
+  color: rgba(255, 255, 255, 0.80);
+}
+
+/* 未接続: 全体を薄く */
+window.music box.music-player-bar.disconnected .music-bar-transport,
+window.music box.music-player-bar.disconnected .music-bar-side {
+  opacity: 0.55;
+}
+
+/* 音量のポップオーバー (横のスライダー) */
+/* 角は有限の値で (9999px にするとポップオーバーの形の計算が崩れて開いた直後に閉じる) */
+window.music popover.music-volume-popover > contents {
+  padding: 6px 8px;
+  border-radius: 20px;
+}
+
+window.music popover.music-volume-popover image.music-volume-glyph {
+  color: var(--m-secondary);
+}
+
+window.music scale.music-volume-scale {
+  min-height: 20px;
+  padding: 0;
+  margin: 0;
+}
+
+window.music scale.music-volume-scale > trough {
+  min-height: 4px;
+  border-radius: 9999px;
+  background-color: rgba(255, 255, 255, 0.18);
+  background-image: none;
+  border: none;
+  box-shadow: none;
+  outline: none;
+}
+
+window.music scale.music-volume-scale > trough > highlight {
+  min-height: 4px;
+  border-radius: 9999px;
+  background-color: rgba(255, 255, 255, 0.86);
+  background-image: none;
+  border: none;
+  box-shadow: none;
+}
+
+window.music scale.music-volume-scale > trough > slider {
+  min-width: 16px;
+  min-height: 16px;
+  margin: -6px;
+  border: none;
+  border-radius: 9999px;
+  background-color: #ffffff;
+  background-image: none;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.45), 0 0 0 0.5px rgba(0, 0, 0, 0.20);
+}
+
+window.music scale.music-volume-scale > trough > slider:hover { background-color: #f2f2f2; }
+window.music scale.music-volume-scale > trough > slider:active { background-color: #e6e6e6; }
+
+/* ------------------------------------------------------------------
+ * トースト: 再生バーの上に出す
+ * ------------------------------------------------------------------ */
+
+window.music.music-window toast {
+  margin-bottom: 86px;
+}
+
+window.music.music-window.fullscreen-player toast {
+  margin-bottom: 24px;
+}
+
+/* ------------------------------------------------------------------
+ * 拡張の無い cliamp のときの細い帯
+ * ------------------------------------------------------------------ */
+
+window.music banner.music-banner > revealer > widget {
+  min-height: 30px;
+  padding: 3px 14px;
+  border: none;
+  background-color: rgba(255, 159, 10, 0.16);
+  background-image: none;
+  box-shadow: inset 0 -1px rgba(255, 159, 10, 0.22);
+  color: #ffd28a;
+}
+
+window.music banner.music-banner > revealer > widget > label {
+  font-size: 12px;
+  font-weight: 600;
+  color: #ffd28a;
+}
+
+/* ------------------------------------------------------------------
+ * 未接続の全面の空状態
+ * ------------------------------------------------------------------ */
+
+window.music toolbarview.music-offline {
+  background-color: var(--m-canvas);
+}
+
+window.music toolbarview.music-offline headerbar.music-offline-header {
+  min-height: 52px;
+  padding: 0 10px;
+  border: none;
+  background-color: transparent;
+  background-image: none;
+  box-shadow: none;
+}
+
+/* ------------------------------------------------------------------
+ * 右パネル (歌詞・次に再生)。幅 300、サイドバーと同じ地
+ * ------------------------------------------------------------------ */
+
+window.music .music-panel {
+  background-color: transparent;
+  color: var(--m-label);
+}
+
+window.music .music-panel-top {
+  min-height: 52px;
+}
+
+window.music .music-panel scrolledwindow,
+window.music .music-panel scrolledwindow > viewport {
+  background-color: transparent;
+  background-image: none;
+}
+
+window.music .music-panel .music-empty.music-panel-empty {
+  padding: 24px 22px 60px;
+}
+
+window.music .music-panel .music-empty.music-panel-empty .music-empty-icon {
+  -gtk-icon-size: 36px;
+}
+
+window.music .music-panel .music-empty.music-panel-empty .music-empty-title {
+  font-size: 15px;
+  font-weight: 700;
+}
+
+window.music .music-panel .music-empty.music-panel-empty .music-empty-description {
+  font-size: 12px;
+}
+
+/* 歌詞: 22px/700。今の行は明るく、他は 3 次色 */
+window.music .music-lyrics {
+  padding: 0 18px 0 14px;
+}
+
+window.music button.music-lyric-line,
+window.music button.music-lyric-line:backdrop {
+  min-height: 0;
+  min-width: 0;
+  padding: 6px 8px 7px;
+  margin: 0 0 4px;
+  border: none;
+  border-radius: 10px;
+  background-color: transparent;
+  background-image: none;
+  box-shadow: none;
+  color: var(--m-tertiary);
+  transition: background-color 120ms ease, color 260ms ease;
+}
+
+window.music button.music-lyric-line:hover {
+  background-color: rgba(255, 255, 255, 0.05);
+  border: none;
+  box-shadow: none;
+}
+
+window.music button.music-lyric-line:active {
+  background-color: rgba(255, 255, 255, 0.09);
+  border: none;
+  box-shadow: none;
+}
+
+window.music button.music-lyric-line .music-lyric-text {
+  font-size: 22px;
+  font-weight: 700;
+  letter-spacing: -0.2px;
+  color: inherit;
+}
+
+window.music button.music-lyric-line.past { color: rgba(235, 235, 245, 0.26); }
+window.music button.music-lyric-line.current { color: var(--m-label); }
+window.music .music-lyrics.unsynced button.music-lyric-line { color: var(--m-label); }
+window.music .music-lyrics.unsynced button.music-lyric-line .music-lyric-text { font-size: 20px; }
+
+/* 次に再生: 上の横長のカプセル */
+window.music .music-panel-toggles {
+  margin: 10px 14px 10px 14px;
+}
+
+window.music button.music-panel-toggle,
+window.music button.music-panel-toggle:backdrop {
+  min-height: 32px;
+  min-width: 0;
+  padding: 0 10px;
+  margin: 0;
+  border: none;
+  border-radius: 9999px;
+  background-color: rgba(118, 118, 128, 0.28);
+  background-image: none;
+  box-shadow: none;
+  color: var(--m-label);
+  transition: background-color 140ms ease, color 140ms ease;
+}
+
+window.music button.music-panel-toggle:hover {
+  background-color: rgba(118, 118, 128, 0.38);
+  border: none;
+  box-shadow: none;
+}
+
+window.music button.music-panel-toggle:checked,
+window.music button.music-panel-toggle:checked:backdrop {
+  background-color: var(--m-key);
+  color: #ffffff;
+  border: none;
+  box-shadow: none;
+}
+
+window.music button.music-panel-toggle:checked:hover { background-color: var(--m-key-hover); }
+window.music button.music-panel-toggle:disabled { color: var(--m-tertiary); background-color: rgba(118, 118, 128, 0.16); }
+
+window.music .music-panel-toggle-label {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+/* 「履歴」「次に再生」の見出し */
+window.music .music-queue-content {
+  padding: 0 8px 24px 10px;
+}
+
+window.music .music-queue-header {
+  min-height: 34px;
+  margin: 10px 8px 2px 8px;
+}
+
+window.music .music-queue-header .music-section-title {
+  font-size: 17px;
+  font-weight: 700;
+}
+
+window.music .music-queue-header.next {
+  margin-top: 22px;
+  padding-top: 10px;
+  border-top: 1px solid var(--m-separator);
+}
+
+window.music .music-queue-note {
+  margin: 6px 8px 8px 8px;
+  font-size: 12px;
+  color: var(--m-tertiary);
+}
+
+window.music list.music-queue-list > row.music-track-row {
+  padding: 0 4px 0 6px;
+}
+
+/* 履歴の曲は少し沈めて、これからの曲と見分ける */
+window.music list.music-queue-list > row.music-track-row.history .music-track-title {
+  color: var(--m-secondary);
+}
+
+/* スクロールした内容の上端の影: 歌詞は出さず (行が静かに流れる)、次に再生は細い線 */
+window.music scrolledwindow.music-lyrics-scroller > undershoot.top,
+window.music scrolledwindow.music-lyrics-scroller > undershoot.bottom,
+window.music scrolledwindow.music-queue-scroller > undershoot.bottom {
+  background: none;
+  box-shadow: none;
+}
+
+window.music scrolledwindow.music-queue-scroller > undershoot.top {
+  background: none;
+  box-shadow: inset 0 1px var(--m-separator);
+}
+
+window.music .music-offline-socket {
+  margin-top: 2px;
+  font-size: 11px;
+  color: var(--m-tertiary);
+  font-family: "Geist Mono", monospace;
+}
+
+/* 未接続などで押せないときは、入っていても赤くしない */
+window.music box.music-player-bar button.music-toggle-circle:checked:disabled {
+  background-color: transparent;
+  color: var(--m-tertiary);
+}

@@ -1,0 +1,72 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <title>ミュージック</title>
+  <desc>桃色がかった赤から深い赤へ沈む角丸スクエアに、白いガラスの連桁の 8 分音符 (♫) を浮かべたもの。macOS のミュージックの色 (赤) に合わせ、cliamp の再生を操作するアプリであることを表す</desc>
+  <defs>
+    <!-- 土台。上が明るく下が沈む縦のグラデーション。上端は桃色寄り、中ほどが
+         ミュージックの赤 (#FA233B)、下端は Dock の暗い地でも沈みきらない深い赤。 -->
+    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FB5C74"/>
+      <stop offset="0.55" stop-color="#FA233B"/>
+      <stop offset="1" stop-color="#C80F2C"/>
+    </linearGradient>
+
+    <!-- 土台のふちに乗る光。上辺だけ強くして厚みを出す。 -->
+    <linearGradient id="tile-rim" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.58"/>
+      <stop offset="0.35" stop-color="#FFFFFF" stop-opacity="0.10"/>
+      <stop offset="1" stop-color="#FFFFFF" stop-opacity="0.16"/>
+    </linearGradient>
+
+    <!-- 土台上部の艶。形で切らず、土台全体に敷いて透明度 0 まで滑らかに消す
+         (切り口の水平線が音符を横切って見えないように)。 -->
+    <linearGradient id="tile-gloss" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.28"/>
+      <stop offset="0.22" stop-color="#FFFFFF" stop-opacity="0.12"/>
+      <stop offset="0.45" stop-color="#FFFFFF" stop-opacity="0.03"/>
+      <stop offset="0.6" stop-color="#FFFFFF" stop-opacity="0"/>
+    </linearGradient>
+
+    <!-- 音符の中身。上を白く、下をわずかに赤みへ寄せてガラスの厚みにする。
+         図形ごとに bbox が違うので、座標は利用者空間で固定する
+         (objectBoundingBox だと符頭と連桁で濃さがずれる)。 -->
+    <linearGradient id="glyph" x1="0" y1="26" x2="0" y2="98" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="0.6" stop-color="#FFF6F7"/>
+      <stop offset="1" stop-color="#FFDDE2"/>
+    </linearGradient>
+
+    <!-- 音符の上半分に乗る照り返し。 -->
+    <linearGradient id="glyph-gloss" x1="0" y1="26" x2="0" y2="98" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.9"/>
+      <stop offset="0.5" stop-color="#FFFFFF" stop-opacity="0"/>
+    </linearGradient>
+
+    <!-- 音符の落とす柔らかい影。黒ではなく深い赤にして、土台から浮かせつつ濁らせない。 -->
+    <filter id="glyph-shadow" x="-20%" y="-20%" width="140%" height="150%">
+      <feDropShadow dx="0" dy="2.5" stdDeviation="2.6" flood-color="#6E0014" flood-opacity="0.45"/>
+    </filter>
+
+    <!-- 音符の形 (連桁の 8 分音符 2 つ)。影・中身・照り返しで同じ形を使い回す。 -->
+    <g id="notes">
+      <!-- 符頭。少し右上がりに傾けた楕円 -->
+      <ellipse cx="45" cy="86" rx="14" ry="10.6" transform="rotate(-22 45 86)"/>
+      <ellipse cx="85" cy="78" rx="14" ry="10.6" transform="rotate(-22 85 78)"/>
+      <!-- 符幹。符頭の右端から立ち上げる -->
+      <rect x="51.5" y="40" width="7" height="46" rx="1.5"/>
+      <rect x="91.5" y="32" width="7" height="46" rx="1.5"/>
+      <!-- 連桁。右上がりの太い帯 -->
+      <path d="M51.5 38.2 Q51.5 36.4 53.3 36 L96.6 26.6 Q98.5 26.2 98.5 28.2 L98.5 40.6 Q98.5 42 97.1 42.3 L53.4 51.8 Q51.5 52.2 51.5 50.2 Z"/>
+    </g>
+  </defs>
+
+  <!-- 土台 -->
+  <rect x="8" y="8" width="112" height="112" rx="26" ry="26" fill="url(#tile)"/>
+  <rect x="8" y="8" width="112" height="112" rx="26" ry="26" fill="url(#tile-gloss)"/>
+
+  <!-- 音符。影つきの白いガラス、その上に照り返し -->
+  <use href="#notes" fill="url(#glyph)" filter="url(#glyph-shadow)"/>
+  <use href="#notes" fill="url(#glyph-gloss)" opacity="0.55"/>
+
+  <!-- ふちの光 -->
+  <rect x="8.75" y="8.75" width="110.5" height="110.5" rx="25.25" ry="25.25" fill="none" stroke="url(#tile-rim)" stroke-width="1.5"/>
+</svg>

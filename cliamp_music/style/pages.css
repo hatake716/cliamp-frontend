@@ -1,0 +1,254 @@
+/*
+ * ミュージック — 各ページ (pages/*.py)
+ *
+ * base.css の後に USER + 1 で読む。すべて window.music の下に閉じ込める。
+ * 全体の ~/.config/gtk-4.0/gtk.css が USER (800) で headerbar・button・entry に
+ * ガラスの地や高さを当ててくるので、ここで触る性質は必ず書き切る
+ * (背景色・背景画像・枠・影・高さ・余白)。
+ * 数値は macOS 27 のミュージックの画面写真からの実測を丸めたもの (DESIGN.md §4・§5)。
+ */
+
+/* ------------------------------------------------------------------
+ * ページのヘッダー (透明。スクロールすると上端に地の色がにじむ)
+ * ------------------------------------------------------------------ */
+
+/* 利用者の gtk.css は toolbarview > .top-bar にガラスの帯を塗る。ページでは外す
+ * (shell.css も骨格の中で外しているが、ページ単体でも透明にしておく) */
+window.music .music-page toolbarview > .top-bar {
+  background-color: transparent;
+  background-image: none;
+  border: none;
+  box-shadow: none;
+}
+
+window.music headerbar.music-page-header {
+  min-height: 52px;
+  padding: 0 10px;
+  margin: 0;
+  border: none;
+  background-color: transparent;
+  background-image: none;
+  box-shadow: none;
+  color: var(--m-label);
+}
+
+window.music headerbar.music-page-header.scrolled {
+  background-image: linear-gradient(to bottom,
+    rgba(28, 29, 33, 0.97),
+    rgba(28, 29, 33, 0.90) 62%,
+    rgba(28, 29, 33, 0));
+}
+
+window.music .music-header-title {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--m-label);
+  opacity: 0;
+  transition: opacity 160ms ease;
+}
+
+window.music .music-header-title.shown { opacity: 1; }
+
+/* 戻る (ガラスの丸) */
+window.music headerbar.music-page-header button.music-back-button {
+  margin: 0 0 0 4px;
+  color: var(--m-label);
+}
+
+/* ------------------------------------------------------------------
+ * 本文
+ * ------------------------------------------------------------------ */
+
+window.music scrolledwindow.music-page-scroller,
+window.music scrolledwindow.music-page-scroller > viewport {
+  background-color: transparent;
+  background-image: none;
+}
+
+/* 大見出しと最初の棚の間 (Apple: 見出しの下端から棚の見出しまで約 30pt) */
+window.music .music-page-large-title {
+  margin-top: 0;
+  margin-bottom: 22px;
+}
+
+window.music .music-title-row { margin-bottom: 8px; }
+window.music .music-title-row .music-page-large-title { margin-bottom: 0; }
+
+/* 棚と棚の間 */
+window.music .music-page-shelf { margin-bottom: 30px; }
+
+/* 棚の見出しの下の小さな注意書き (サインインが必要・読めなかった理由) */
+window.music .music-page-note {
+  margin-top: 4px;
+  margin-bottom: 10px;
+  font-size: 12px;
+  color: var(--m-secondary);
+}
+
+/* 読み込み中・空の表示は本文の中で上下に余白を持たせる */
+window.music .music-page-state {
+  min-height: 300px;
+}
+
+/* 見出しの右の赤い文字のボタン (「消去」) */
+window.music button.music-text-link {
+  min-width: 0;
+  min-height: 0;
+  padding: 2px 4px;
+  margin: 0;
+  border: none;
+  border-radius: 6px;
+  background-color: transparent;
+  background-image: none;
+  box-shadow: none;
+  color: var(--m-key-text);
+  font-size: 13px;
+  font-weight: 500;
+}
+
+window.music button.music-text-link:hover { background-color: transparent; opacity: 0.78; }
+window.music button.music-text-link:active { opacity: 0.6; }
+
+/* ------------------------------------------------------------------
+ * 詳細ページの頭 (プレイリスト・再生中のリスト)
+ * ------------------------------------------------------------------ */
+
+window.music .music-detail-header { margin-top: 2px; }
+
+window.music .music-detail-texts { margin-top: 8px; margin-bottom: 14px; }
+
+window.music .music-detail-subtitle { margin-top: 1px; }
+
+window.music .music-detail-info {
+  font-feature-settings: "tnum";
+}
+
+/* 「▶ 再生」は 34x120 (Apple 122x34) */
+window.music button.music-capsule.music-detail-play {
+  min-width: 84px;
+  padding: 0 18px;
+}
+
+/* 「…」の丸 (MenuButton の中のボタンを CircleButton と同じに) */
+window.music menubutton.music-circle-menu > button {
+  min-width: 34px;
+  min-height: 34px;
+  padding: 0;
+  margin: 0;
+  border: none;
+  border-radius: 9999px;
+  background-color: var(--m-fill);
+  background-image: none;
+  box-shadow: none;
+  color: var(--m-key-text);
+  outline-offset: 1px;
+  transition: background-color 120ms ease;
+}
+
+window.music menubutton.music-circle-menu > button:hover { background-color: var(--m-fill-hover); }
+window.music menubutton.music-circle-menu > button:active,
+window.music menubutton.music-circle-menu > button:checked { background-color: var(--m-fill-active); }
+window.music menubutton.music-circle-menu > button:disabled { color: var(--m-tertiary); }
+
+/* ------------------------------------------------------------------
+ * 検索
+ * ------------------------------------------------------------------ */
+
+/* ヘッダーの中の検索欄は少し高く (Apple 34pt のカプセル) */
+window.music headerbar entry.music-search-entry {
+  min-height: 32px;
+}
+
+window.music headerbar toggle-group.music-scope > toggle {
+  min-height: 26px;
+  padding: 0 12px;
+}
+
+window.music .music-search-browse { margin-top: 6px; }
+window.music .music-search-recent { margin-bottom: 30px; }
+
+window.music .music-chips > flowboxchild {
+  padding: 0;
+  margin: 0;
+  background-color: transparent;
+  background-image: none;
+}
+
+window.music .music-search-top {
+  margin-top: 6px;
+  margin-bottom: 30px;
+}
+
+window.music .music-search-all-header { margin-bottom: 8px; }
+
+/* トップの結果: 薄い面の上に大きめの絵と題、右下に赤い再生の丸 */
+window.music button.music-top-result {
+  min-width: 0;
+  min-height: 0;
+  padding: 18px;
+  margin: 0;
+  border: none;
+  border-radius: 12px;
+  background-color: rgba(255, 255, 255, 0.05);
+  background-image: none;
+  box-shadow: none;
+  color: var(--m-label);
+  outline-offset: 2px;
+  transition: background-color 140ms ease;
+}
+
+window.music button.music-top-result:hover { background-color: rgba(255, 255, 255, 0.08); }
+window.music button.music-top-result:active { background-color: rgba(255, 255, 255, 0.11); }
+
+window.music .music-top-result-title {
+  font-size: 22px;
+  font-weight: 700;
+  letter-spacing: -0.2px;
+  color: var(--m-label);
+}
+
+window.music .music-top-result-subtitle {
+  font-size: 13px;
+  color: var(--m-secondary);
+}
+
+window.music .music-top-result-play {
+  min-width: 40px;
+  min-height: 40px;
+  border-radius: 9999px;
+  background-color: var(--m-key);
+  color: #ffffff;
+  box-shadow: 0 2px 5px rgba(0, 0, 0, 0.30);
+  opacity: 0;
+  transition: opacity 140ms ease;
+}
+
+window.music button.music-top-result:hover .music-top-result-play,
+window.music button.music-top-result:focus-visible .music-top-result-play {
+  opacity: 1;
+}
+
+/* ------------------------------------------------------------------
+ * ラジオ
+ * ------------------------------------------------------------------ */
+
+window.music headerbar .music-radio-search entry.music-search-entry {
+  min-height: 30px;
+}
+
+/* ------------------------------------------------------------------
+ * すべてのプレイリスト
+ * ------------------------------------------------------------------ */
+
+window.music .music-playlists-section { margin-bottom: 34px; }
+window.music .music-playlists-section .music-section-header { margin-bottom: 12px; }
+
+window.music .music-playlists-group {
+  margin-top: 4px;
+  margin-bottom: 10px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--m-secondary);
+}
+
+window.music .music-playlists-grid { margin-bottom: 18px; }

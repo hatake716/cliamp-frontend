@@ -1,0 +1,4004 @@
+cliamp 1.50.0 の IPC (~/.config/cliamp/cliamp.sock) に、GTK のフロントエンド
+「ミュージック」(org.nixos.Music) が使うコマンドを足す (api 1)。仕様は
+PROTOCOL.md。
+
+- 状態系 (seek_to, playlist, play_index, replace, enqueue, queue_edit,
+  remove) は既存のコマンドと同じく TUI の Update (--daemon では daemon.Send)
+  で処理し、容量 1 の返信で必ず 1 回だけ答える。ここでは I/O をしない。
+- カタログ系 (providers, playlists, tracks, search, load_provider, lyrics,
+  history, playlist_add, playlist_delete, playlist_remove_track) は
+  ネットワークや yt-dlp を待つので、IPC の接続ごとの goroutine で処理し、
+  Update を通さない。通すと、その間 TUI も他の IPC も固まる。
+- seek_to は MPRIS と同じ非同期の絶対シーク (playback.SetPositionMsg) を使う。
+  既存の seek は yt-dlp の曲で Update を数秒止めるが、試験がその動きを
+  前提にしているので残してある。
+- status に曲の詳しい情報・EQ・リストの世代番号 (gen)・出どころ・ICY の
+  曲名・読み込み中の印を足し、yt-dlp のシーク待ちの間はシーク先を返す。
+  capabilities で拡張の有無と版を返す。
+- 要求 1 行の上限を 64 KiB から 8 MiB に広げる (replace で曲の一覧を送るため)。
+  超えたときは黙って切らずに "request too large" と返す。
+- --daemon でも状態系はすべて同じ意味で動く。可視化に頼る bands は、待ち時間
+  切れにせず "not supported in daemon mode" と答える。
+- 既存の eq で帯域を 1 つ変えたとき、TUI の EQ キーと同じくプリセットを
+  Custom にする。前のプリセット名のまま保存されると、次の起動でそのプリセットが
+  当て直され、手で変えた帯域が消えていた。
+
+上の eq の直し以外は、既存のコマンドと応答の形、`cliamp status` の平文の出力、CLI、TUI のキー操作は
+変えない。Open-Voice が平文の status と tmux 越しのキー入力で cliamp を操作して
+いるため。同じ理由で、IPC の処理は TUI のオーバーレイを開かず、フォーカスも
+動かさない。
+
+変更は新しいファイル (ipc/gui.go, playlist/gui.go, ui/model/ipc_gui.go,
+catalog.go, daemon_gui.go と各試験) に寄せ、既存のファイルには型の
+フィールド、呼び出し、世代番号を増やす行など最小限だけを足している。
+上流のファイルが変わって当たらなくなったらビルドが落ちる (cliamp.nix は
+版が 1.50.0 でなければ評価の時点で止める)。go.mod は変えず、新しく import
+するのは既に vendor にあるパッケージだけなので、vendorHash はそのまま使える。
+
+diff --git a/catalog.go b/catalog.go
+new file mode 100644
+index 0000000..43a5210
+--- /dev/null
++++ b/catalog.go
+@@ -0,0 +1,276 @@
++package main
++
++// catalog.go — GUI 向け拡張 IPC のカタログ系コマンド (ipc.Catalog) の実装。
++//
++// プロバイダーの一覧・プレイリスト・曲・検索、歌詞、履歴、ローカルの
++// プレイリストの編集を受け持つ。どれもネットワークや yt-dlp を待つので、
++// IPC の接続の goroutine から呼ばれ、TUI の Update は通らない。TUI と daemon の
++// どちらでも同じものを使う。
++//
++// ブラウザでのサインイン (playlist.Authenticator) はここからは始めない。
++// サインインが要るときは playlist.ErrNeedsAuth をそのまま返し、IPC が
++// needs_auth を立てる。
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"strings"
++	"time"
++
++	"cliamp/external/local"
++	"cliamp/history"
++	"cliamp/ipc"
++	"cliamp/lyrics"
++	"cliamp/playlist"
++	"cliamp/provider"
++	"cliamp/resolve"
++	"cliamp/ui/model"
++)
++
++// searchTimeout は Searcher に渡す文脈の期限。IPC 側の上限 (120 秒) より
++// 先に切れるようにして、Spotify の再試行の待ちが残らないようにする。
++const searchTimeout = 110 * time.Second
++
++// 疑似プロバイダーのキー。cliamp のプロバイダー一覧には無い。
++const (
++	virtualYouTube = "youtube"
++	virtualURL     = "url"
++)
++
++// guiCatalog は ipc.Catalog の実装。外への呼び出し (yt-dlp、歌詞) は
++// 試験で差し替えられるよう関数で持つ。
++type guiCatalog struct {
++	entries []model.ProviderEntry
++	local   *local.Provider
++	history *history.Store
++
++	resolveArgs   func([]string) (resolve.Result, error)
++	resolveRemote func([]string) ([]playlist.Track, error)
++	unwrap        func([]playlist.Track) []playlist.Track
++	fetchLyrics   func(artist, title string) ([]lyrics.Line, error)
++}
++
++var _ ipc.Catalog = (*guiCatalog)(nil)
++
++func newGUICatalog(entries []model.ProviderEntry, localProv *local.Provider) *guiCatalog {
++	return &guiCatalog{
++		entries:       entries,
++		local:         localProv,
++		history:       history.New(),
++		resolveArgs:   resolve.Args,
++		resolveRemote: resolve.Remote,
++		unwrap:        model.ResolveWrapperURLs,
++		fetchLyrics:   lyrics.Fetch,
++	}
++}
++
++// installGUIIPC は IPC サーバーに GUI 拡張のカタログと EQ プリセット名を差し込む。
++func installGUIIPC(srv *ipc.Server, catalog ipc.Catalog) {
++	if catalog != nil {
++		srv.SetCatalog(catalog)
++	}
++	srv.SetEQPresets(model.EQPresetNames())
++}
++
++func (c *guiCatalog) find(key string) (playlist.Provider, bool) {
++	for _, e := range c.entries {
++		if e.Key == key && e.Provider != nil {
++			return e.Provider, true
++		}
++	}
++	return nil, false
++}
++
++// ytSearchKey は Searcher でないときに YouTube 検索へ退避してよいプロバイダー。
++func ytSearchKey(key string) bool {
++	switch key {
++	case "yt", "youtube", "ytmusic":
++		return true
++	}
++	return false
++}
++
++// Providers は登録されたプロバイダーと疑似プロバイダー youtube を返す。
++// search は、そのキーで search を呼んで意味のある結果が返るものだけ立てる
++// (radio などは YouTube 検索へ退避はするが、その局の検索ではないので立てない)。
++func (c *guiCatalog) Providers() []ipc.ProviderInfo {
++	var out []ipc.ProviderInfo
++	hasYouTube := false
++	for _, e := range c.entries {
++		if e.Provider == nil {
++			continue
++		}
++		_, searcher := e.Provider.(provider.Searcher)
++		out = append(out, ipc.ProviderInfo{
++			Key:       e.Key,
++			Name:      e.Name,
++			Search:    searcher || ytSearchKey(e.Key) || e.Key == "soundcloud",
++			Playlists: true,
++		})
++		if e.Key == virtualYouTube {
++			hasYouTube = true
++		}
++	}
++	if !hasYouTube {
++		out = append(out, ipc.ProviderInfo{
++			Key:     virtualYouTube,
++			Name:    "YouTube",
++			Search:  true,
++			Virtual: true,
++		})
++	}
++	return out
++}
++
++func (c *guiCatalog) Playlists(key string) ([]playlist.PlaylistInfo, error) {
++	prov, ok := c.find(key)
++	if !ok {
++		if key == virtualYouTube || key == virtualURL {
++			return nil, fmt.Errorf("provider %s has no playlists", key)
++		}
++		return nil, fmt.Errorf("unknown provider: %s", key)
++	}
++	return prov.Playlists()
++}
++
++func (c *guiCatalog) Tracks(key, id string) ([]playlist.Track, error) {
++	if key == virtualURL {
++		return c.resolveURL(id)
++	}
++	prov, ok := c.find(key)
++	if !ok {
++		if key == virtualYouTube {
++			return nil, fmt.Errorf("provider %s has no playlists", key)
++		}
++		return nil, fmt.Errorf("unknown provider: %s", key)
++	}
++	tracks, err := prov.Tracks(id)
++	if err != nil {
++		return nil, err
++	}
++	// ラジオの .m3u / .pls の中継 URL は、TUI と同じく実体の URL へ展開する。
++	return c.unwrap(tracks), nil
++}
++
++// resolveURL は URL (YouTube の動画・再生リスト・ミックス、M3U/PLS、
++// ポッドキャストのフィード、直接の音声 URL) を曲にする。TUI の URL 入力 (u) と
++// 同じく resolve.Args で振り分けてから resolve.Remote で取りに行く。
++// 手元のファイルやフォルダーは受け付けない (IPC から任意のパスを読ませないため)。
++func (c *guiCatalog) resolveURL(u string) ([]playlist.Track, error) {
++	u = strings.TrimSpace(u)
++	if !strings.HasPrefix(u, "http://") && !strings.HasPrefix(u, "https://") {
++		return nil, fmt.Errorf("url: not an http(s) URL: %q", u)
++	}
++	res, err := c.resolveArgs([]string{u})
++	if err != nil {
++		return nil, err
++	}
++	tracks := res.Tracks
++	if len(res.Pending) > 0 {
++		more, err := c.resolveRemote(res.Pending)
++		if err != nil {
++			return nil, err
++		}
++		tracks = append(tracks, more...)
++	}
++	return tracks, nil
++}
++
++// Search は Searcher を実装したプロバイダーならその検索を使い、そうでなければ
++// TUI の Ctrl+F と同じく yt-dlp の YouTube 検索へ退避する。soundcloud は
++// Searcher が登録されていなければ scsearch へ退避する。provider が空なら youtube。
++func (c *guiCatalog) Search(key, query string, limit int) ([]playlist.Track, error) {
++	if key == "" {
++		key = virtualYouTube
++	}
++	if key == virtualURL {
++		return nil, fmt.Errorf("provider %s does not support search", key)
++	}
++	prov, ok := c.find(key)
++	if ok {
++		if s, isSearcher := prov.(provider.Searcher); isSearcher {
++			ctx, cancel := context.WithTimeout(context.Background(), searchTimeout)
++			defer cancel()
++			return s.SearchTracks(ctx, query, limit)
++		}
++	} else if key != virtualYouTube && key != "soundcloud" {
++		return nil, fmt.Errorf("unknown provider: %s", key)
++	}
++	prefix := "ytsearch"
++	if key == "soundcloud" {
++		prefix = "scsearch"
++	}
++	return c.resolveRemote([]string{fmt.Sprintf("%s%d:%s", prefix, limit, query)})
++}
++
++// Lyrics は TUI の歌詞表示と同じ lyrics.Fetch (LRCLIB → NetEase) を使う。
++func (c *guiCatalog) Lyrics(artist, title string) ([]ipc.LyricLine, bool, error) {
++	lines, err := c.fetchLyrics(artist, title)
++	if errors.Is(err, lyrics.ErrNotFound) {
++		return nil, false, ipc.ErrNotFound
++	}
++	if err != nil {
++		return nil, false, err
++	}
++	out := make([]ipc.LyricLine, len(lines))
++	synced := false
++	for i, l := range lines {
++		out[i] = ipc.LyricLine{T: l.Start.Seconds(), Text: l.Text}
++		if l.Start > 0 {
++			synced = true
++		}
++	}
++	return out, synced, nil
++}
++
++// History は history.toml を新しい順に返す (TUI が記録したもの。daemon は
++// 記録しないが、読むことはできる)。
++func (c *guiCatalog) History(limit int) ([]ipc.TrackInfo, error) {
++	if c.history == nil {
++		return nil, nil
++	}
++	entries, err := c.history.Recent(limit)
++	if err != nil {
++		return nil, err
++	}
++	out := make([]ipc.TrackInfo, len(entries))
++	for i, e := range entries {
++		out[i] = ipc.NewTrackInfo(e.Track)
++		if !e.PlayedAt.IsZero() {
++			out[i].PlayedAt = e.PlayedAt.UTC().Format(time.RFC3339)
++		}
++	}
++	return out, nil
++}
++
++func (c *guiCatalog) localProvider() (*local.Provider, error) {
++	if c.local == nil {
++		return nil, errors.New("local playlists unavailable")
++	}
++	return c.local, nil
++}
++
++func (c *guiCatalog) PlaylistAdd(name string, tracks []playlist.Track) error {
++	lp, err := c.localProvider()
++	if err != nil {
++		return err
++	}
++	return lp.AddTracks(name, tracks)
++}
++
++func (c *guiCatalog) PlaylistDelete(name string) error {
++	lp, err := c.localProvider()
++	if err != nil {
++		return err
++	}
++	return lp.DeletePlaylist(name)
++}
++
++func (c *guiCatalog) PlaylistRemoveTrack(name string, index int) error {
++	lp, err := c.localProvider()
++	if err != nil {
++		return err
++	}
++	return lp.RemoveTrack(name, index)
++}
+diff --git a/catalog_test.go b/catalog_test.go
+new file mode 100644
+index 0000000..3f68913
+--- /dev/null
++++ b/catalog_test.go
+@@ -0,0 +1,303 @@
++package main
++
++import (
++	"context"
++	"errors"
++	"path/filepath"
++	"slices"
++	"testing"
++	"time"
++
++	"cliamp/external/local"
++	"cliamp/history"
++	"cliamp/ipc"
++	"cliamp/lyrics"
++	"cliamp/playlist"
++	"cliamp/resolve"
++	"cliamp/ui/model"
++)
++
++type catalogTestProvider struct {
++	name   string
++	tracks []playlist.Track
++	lists  []playlist.PlaylistInfo
++	err    error
++}
++
++func (p *catalogTestProvider) Name() string { return p.name }
++func (p *catalogTestProvider) Playlists() ([]playlist.PlaylistInfo, error) {
++	return p.lists, p.err
++}
++func (p *catalogTestProvider) Tracks(string) ([]playlist.Track, error) { return p.tracks, p.err }
++
++type catalogTestSearcher struct {
++	catalogTestProvider
++	gotQuery string
++	gotLimit int
++}
++
++func (s *catalogTestSearcher) SearchTracks(_ context.Context, q string, limit int) ([]playlist.Track, error) {
++	s.gotQuery, s.gotLimit = q, limit
++	return s.tracks, s.err
++}
++
++// newTestCatalog は外への呼び出しをすべて偽物にした guiCatalog を作る。
++func newTestCatalog(entries ...model.ProviderEntry) (*guiCatalog, *[]string) {
++	var remote []string
++	c := &guiCatalog{
++		entries: entries,
++		resolveArgs: func(args []string) (resolve.Result, error) {
++			return resolve.Result{Pending: args}, nil
++		},
++		resolveRemote: func(urls []string) ([]playlist.Track, error) {
++			remote = append(remote, urls...)
++			return []playlist.Track{{Path: "https://www.youtube.com/watch?v=x", Stream: true}}, nil
++		},
++		unwrap: func(t []playlist.Track) []playlist.Track { return t },
++		fetchLyrics: func(string, string) ([]lyrics.Line, error) {
++			return nil, lyrics.ErrNotFound
++		},
++	}
++	return c, &remote
++}
++
++func TestCatalogProviders(t *testing.T) {
++	spotify := &catalogTestSearcher{catalogTestProvider: catalogTestProvider{name: "Spotify"}}
++	c, _ := newTestCatalog(
++		model.ProviderEntry{Key: "radio", Name: "Radio", Provider: &catalogTestProvider{name: "Radio"}},
++		model.ProviderEntry{Key: "spotify", Name: "Spotify", Provider: spotify},
++		model.ProviderEntry{Key: "nil", Name: "Nil"},
++	)
++	got := c.Providers()
++	want := []ipc.ProviderInfo{
++		{Key: "radio", Name: "Radio", Search: false, Playlists: true},
++		{Key: "spotify", Name: "Spotify", Search: true, Playlists: true},
++		{Key: "youtube", Name: "YouTube", Search: true, Virtual: true},
++	}
++	if !slices.Equal(got, want) {
++		t.Fatalf("Providers() =\n %+v\nwant\n %+v", got, want)
++	}
++
++	// 登録された youtube があれば疑似プロバイダーは出さない。
++	c, _ = newTestCatalog(model.ProviderEntry{Key: "youtube", Name: "YouTube", Provider: &catalogTestProvider{name: "YT"}})
++	got = c.Providers()
++	if len(got) != 1 || got[0].Virtual || !got[0].Search {
++		t.Fatalf("Providers() with a registered youtube = %+v", got)
++	}
++}
++
++func TestCatalogSearchFallbacks(t *testing.T) {
++	spotify := &catalogTestSearcher{catalogTestProvider: catalogTestProvider{name: "Spotify", tracks: []playlist.Track{{Path: "spotify:track:1"}}}}
++	c, remote := newTestCatalog(
++		model.ProviderEntry{Key: "radio", Name: "Radio", Provider: &catalogTestProvider{name: "Radio"}},
++		model.ProviderEntry{Key: "spotify", Name: "Spotify", Provider: spotify},
++	)
++
++	if _, err := c.Search("", "米津玄師", 25); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := c.Search("radio", "lofi", 10); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := c.Search("soundcloud", "ambient", 5); err != nil {
++		t.Fatal(err)
++	}
++	want := []string{"ytsearch25:米津玄師", "ytsearch10:lofi", "scsearch5:ambient"}
++	if !slices.Equal(*remote, want) {
++		t.Fatalf("yt-dlp queries = %v, want %v", *remote, want)
++	}
++
++	tracks, err := c.Search("spotify", "q", 20)
++	if err != nil || len(tracks) != 1 || spotify.gotQuery != "q" || spotify.gotLimit != 20 {
++		t.Fatalf("Searcher not used: tracks=%v err=%v query=%q limit=%d", tracks, err, spotify.gotQuery, spotify.gotLimit)
++	}
++	if len(*remote) != 3 {
++		t.Fatal("Searcher search also ran yt-dlp")
++	}
++
++	for _, key := range []string{"url", "nosuch"} {
++		if _, err := c.Search(key, "q", 5); err == nil {
++			t.Errorf("Search(%q) succeeded, want error", key)
++		}
++	}
++}
++
++func TestCatalogTracks(t *testing.T) {
++	radio := &catalogTestProvider{name: "Radio", tracks: []playlist.Track{{Path: "https://radio.cliamp.stream/streams.m3u", Title: "cliamp radio", Stream: true, Realtime: true}}}
++	c, remote := newTestCatalog(model.ProviderEntry{Key: "radio", Name: "Radio", Provider: radio})
++	unwrapped := false
++	c.unwrap = func(t []playlist.Track) []playlist.Track { unwrapped = true; return t }
++
++	tracks, err := c.Tracks("radio", "l:0")
++	if err != nil || len(tracks) != 1 || !unwrapped {
++		t.Fatalf("Tracks(radio) = %v, %v (unwrapped=%v)", tracks, err, unwrapped)
++	}
++
++	tracks, err = c.Tracks("url", " https://www.youtube.com/watch?v=abc&list=RDabc ")
++	if err != nil || len(tracks) != 1 || !slices.Equal(*remote, []string{"https://www.youtube.com/watch?v=abc&list=RDabc"}) {
++		t.Fatalf("Tracks(url) = %v, %v (remote %v)", tracks, err, *remote)
++	}
++	// 手元のパスは受け付けない。
++	for _, bad := range []string{"/etc/passwd", "~/Music", "file:///tmp/a.mp3", "ytsearch5:foo"} {
++		if _, err := c.Tracks("url", bad); err == nil {
++			t.Errorf("Tracks(url, %q) succeeded, want error", bad)
++		}
++	}
++	for _, key := range []string{"youtube", "nosuch"} {
++		if _, err := c.Tracks(key, "x"); err == nil {
++			t.Errorf("Tracks(%q) succeeded, want error", key)
++		}
++	}
++
++	// サインインが要るという失敗はそのまま返す (IPC が needs_auth にする)。
++	radio.err = playlist.ErrNeedsAuth
++	if _, err := c.Tracks("radio", "l:0"); !errors.Is(err, playlist.ErrNeedsAuth) {
++		t.Fatalf("err = %v, want ErrNeedsAuth", err)
++	}
++}
++
++func TestCatalogResolveURLUsesArgsForDirectStreams(t *testing.T) {
++	c, remote := newTestCatalog()
++	c.resolveArgs = func(args []string) (resolve.Result, error) {
++		return resolve.Result{Tracks: []playlist.Track{{Path: args[0], Stream: true}}}, nil
++	}
++	tracks, err := c.Tracks("url", "https://example.com/live.mp3")
++	if err != nil || len(tracks) != 1 || len(*remote) != 0 {
++		t.Fatalf("direct stream: tracks=%v err=%v remote=%v", tracks, err, *remote)
++	}
++}
++
++func TestCatalogPlaylists(t *testing.T) {
++	radio := &catalogTestProvider{name: "Radio", lists: []playlist.PlaylistInfo{{ID: "l:0", Name: "cliamp radio"}}}
++	c, _ := newTestCatalog(model.ProviderEntry{Key: "radio", Name: "Radio", Provider: radio})
++	lists, err := c.Playlists("radio")
++	if err != nil || len(lists) != 1 {
++		t.Fatalf("Playlists(radio) = %v, %v", lists, err)
++	}
++	for _, key := range []string{"youtube", "url", "nosuch"} {
++		if _, err := c.Playlists(key); err == nil {
++			t.Errorf("Playlists(%q) succeeded, want error", key)
++		}
++	}
++}
++
++func TestCatalogLyrics(t *testing.T) {
++	c, _ := newTestCatalog()
++	c.fetchLyrics = func(artist, title string) ([]lyrics.Line, error) {
++		return []lyrics.Line{{Start: 0, Text: "intro"}, {Start: 12500 * time.Millisecond, Text: "歌詞"}}, nil
++	}
++	lines, synced, err := c.Lyrics("a", "t")
++	if err != nil || !synced || len(lines) != 2 || lines[1].T != 12.5 || lines[1].Text != "歌詞" {
++		t.Fatalf("Lyrics = %v, %v, %v", lines, synced, err)
++	}
++
++	c.fetchLyrics = func(string, string) ([]lyrics.Line, error) {
++		return []lyrics.Line{{Text: "plain"}}, nil
++	}
++	if _, synced, _ := c.Lyrics("a", "t"); synced {
++		t.Fatal("plain lyrics reported as synced")
++	}
++
++	c.fetchLyrics = func(string, string) ([]lyrics.Line, error) { return nil, lyrics.ErrNotFound }
++	if _, _, err := c.Lyrics("a", "t"); !errors.Is(err, ipc.ErrNotFound) {
++		t.Fatalf("err = %v, want ipc.ErrNotFound", err)
++	}
++	c.fetchLyrics = func(string, string) ([]lyrics.Line, error) { return nil, errors.New("network down") }
++	if _, _, err := c.Lyrics("a", "t"); err == nil || errors.Is(err, ipc.ErrNotFound) {
++		t.Fatalf("err = %v, want the network error", err)
++	}
++}
++
++func TestCatalogHistory(t *testing.T) {
++	c, _ := newTestCatalog()
++	if got, err := c.History(10); err != nil || got != nil {
++		t.Fatalf("History without a store = %v, %v", got, err)
++	}
++
++	c.history = history.NewAt(filepath.Join(t.TempDir(), "history.toml"))
++	old := time.Date(2026, 9, 25, 10, 0, 0, 0, time.UTC)
++	_ = c.history.Record(playlist.Track{Path: "/a.flac", Title: "A", DurationSecs: 100}, old)
++	_ = c.history.Record(playlist.Track{Path: "/b.flac", Title: "B"}, old.Add(time.Hour))
++
++	got, err := c.History(10)
++	if err != nil || len(got) != 2 {
++		t.Fatalf("History = %v, %v", got, err)
++	}
++	if got[0].Title != "B" || got[0].PlayedAt != "2026-09-25T11:00:00Z" || got[1].Duration != 100 {
++		t.Fatalf("History = %+v", got)
++	}
++	if got, _ := c.History(1); len(got) != 1 {
++		t.Fatalf("History(1) returned %d entries", len(got))
++	}
++}
++
++func TestCatalogLocalPlaylistEdits(t *testing.T) {
++	t.Setenv("HOME", t.TempDir())
++	c, _ := newTestCatalog()
++	if err := c.PlaylistAdd("x", []playlist.Track{{Path: "/a"}}); err == nil {
++		t.Fatal("PlaylistAdd without a local provider succeeded")
++	}
++
++	c.local = local.New()
++	tracks := []playlist.Track{
++		{Path: "https://www.youtube.com/watch?v=1", Title: "One", Artist: "A", DurationSecs: 61},
++		{Path: "/music/two.flac", Title: "Two"},
++	}
++	if err := c.PlaylistAdd("朝の曲", tracks); err != nil {
++		t.Fatal(err)
++	}
++	if err := c.PlaylistAdd("朝の曲", tracks[:1]); err != nil {
++		t.Fatal(err)
++	}
++	got, err := c.local.Tracks("朝の曲")
++	if err != nil || len(got) != 3 || got[0].Title != "One" || got[0].DurationSecs != 61 {
++		t.Fatalf("saved tracks = %+v, %v", got, err)
++	}
++	if err := c.PlaylistRemoveTrack("朝の曲", 1); err != nil {
++		t.Fatal(err)
++	}
++	if got, _ := c.local.Tracks("朝の曲"); len(got) != 2 || got[1].Title != "One" {
++		t.Fatalf("after remove = %+v", got)
++	}
++	if err := c.PlaylistRemoveTrack("朝の曲", 5); err == nil {
++		t.Fatal("out of range remove succeeded")
++	}
++	if err := c.PlaylistAdd("../escape", tracks); err == nil {
++		t.Fatal("path traversal accepted")
++	}
++	if err := c.PlaylistAdd(history.PlaylistName, tracks); err == nil {
++		t.Fatal("writing to Recently Played accepted")
++	}
++	if err := c.PlaylistDelete("朝の曲"); err != nil {
++		t.Fatal(err)
++	}
++	if c.local.Exists("朝の曲") {
++		t.Fatal("playlist still exists after delete")
++	}
++	if err := c.PlaylistDelete("朝の曲"); err == nil {
++		t.Fatal("deleting a missing playlist succeeded")
++	}
++}
++
++func TestInstallGUIIPC(t *testing.T) {
++	sock := filepath.Join(t.TempDir(), "cliamp.sock")
++	srv, err := ipc.NewServer(sock, ipc.DispatcherFunc(func(any) {}))
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer srv.Close()
++	c, _ := newTestCatalog()
++	installGUIIPC(srv, c)
++
++	resp, err := ipc.Send(sock, ipc.Request{Cmd: "capabilities"})
++	if err != nil {
++		t.Fatal(err)
++	}
++	if !slices.Contains(resp.Commands, "providers") || !slices.Equal(resp.EQPresets, model.EQPresetNames()) {
++		t.Fatalf("capabilities = %+v", resp)
++	}
++	resp, err = ipc.Send(sock, ipc.Request{Cmd: "providers"})
++	if err != nil || !resp.OK || len(resp.Providers) != 1 || resp.Providers[0].Key != "youtube" {
++		t.Fatalf("providers = %+v, %v", resp, err)
++	}
++}
+diff --git a/daemon.go b/daemon.go
+index 88e4221..5badd96 100644
+--- a/daemon.go
++++ b/daemon.go
+@@ -21,7 +21,7 @@ import (
+ 
+ // runDaemon runs cliamp without a TUI: serves IPC against the shared
+ // player+playlist, auto-advances tracks, exits on SIGINT/SIGTERM.
+-func runDaemon(p *player.Player, pl *playlist.Playlist, localProv *local.Provider, autoPlay bool) error {
++func runDaemon(p *player.Player, pl *playlist.Playlist, localProv *local.Provider, autoPlay bool, catalog ipc.Catalog) error {
+ 	fmt.Fprintf(os.Stderr, "cliamp: running headless (socket: %s)\n", ipc.DefaultSocketPath())
+ 	applog.Info("daemon: starting headless mode")
+ 
+@@ -42,6 +42,7 @@ func runDaemon(p *player.Player, pl *playlist.Playlist, localProv *local.Provide
+ 		return fmt.Errorf("ipc: %w", err)
+ 	}
+ 	defer srv.Close()
++	installGUIIPC(srv, catalog)
+ 
+ 	sigCh := make(chan os.Signal, 1)
+ 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+@@ -69,6 +70,11 @@ type daemon struct {
+ 	player    *player.Player
+ 	playlist  *playlist.Playlist
+ 	localProv *local.Provider
++
++	// GUI 拡張 IPC (daemon_gui.go)
++	source      ipc.SourceInfo // いまのリストの出どころ
++	sourceEpoch uint64         // source を覚えたときの playlist の Epoch
++	buffering   bool           // playTrack が再生の準備を待っている間
+ }
+ 
+ func (d *daemon) Send(msg any) {
+@@ -139,6 +145,15 @@ func (d *daemon) Send(msg any) {
+ 
+ 	case ipc.StatusRequestMsg:
+ 		reply(m.Reply, d.statusResponse())
++
++	case playback.SetPositionMsg:
++		d.seekTo(m.Position)
++
++	case ipc.BandsRequestMsg:
++		reply(m.Reply, ipc.Response{OK: false, Error: "not supported in daemon mode"})
++
++	default:
++		d.handleGUI(msg)
+ 	}
+ }
+ 
+@@ -168,6 +183,7 @@ func (d *daemon) playCurrent() {
+ // Caller must hold d.mu; the lock is held again on return.
+ func (d *daemon) playTrack(track playlist.Track) {
+ 	dur := time.Duration(track.DurationSecs) * time.Second
++	d.buffering = true
+ 	d.mu.Unlock()
+ 	var err error
+ 	if playlist.IsYTDL(track.Path) {
+@@ -176,6 +192,7 @@ func (d *daemon) playTrack(track playlist.Track) {
+ 		err = d.player.Play(track.Path, dur)
+ 	}
+ 	d.mu.Lock()
++	d.buffering = false
+ 	if err != nil {
+ 		applog.Warn("daemon: play %q: %v", track.Path, err)
+ 	}
+@@ -231,6 +248,7 @@ func (d *daemon) handleLoad(m ipc.LoadMsg) {
+ 		return
+ 	}
+ 	d.playlist.Replace(tracks)
++	d.setListSource(ipc.SourceInfo{Provider: "local", ID: m.Playlist, Name: m.Playlist})
+ 	d.playCurrent()
+ 	reply(m.Reply, ipc.Response{OK: true, Playlist: m.Playlist, Total: len(tracks)})
+ }
+@@ -358,6 +376,7 @@ func (d *daemon) statusResponse() ipc.Response {
+ 	mono := d.player.Mono()
+ 	resp.Mono = &mono
+ 	resp.Speed = d.player.Speed()
++	d.extendStatus(&resp)
+ 	return resp
+ }
+ 
+diff --git a/daemon_gui.go b/daemon_gui.go
+new file mode 100644
+index 0000000..9180032
+--- /dev/null
++++ b/daemon_gui.go
+@@ -0,0 +1,205 @@
++package main
++
++// daemon_gui.go — GUI 向け拡張 IPC (ipc/gui.go) の状態系コマンドを daemon
++// (--daemon) で処理する。TUI 側 (ui/model/ipc_gui.go) と同じ意味にしてある。
++//
++// どれも daemon.Send から d.mu を持った状態で呼ばれる。playTrack は再生の
++// 準備の間だけ d.mu を手放すので、答えは再生を始める前に返す。daemon には
++// gapless の先読みが無いので、先読みのやり直しは要らない。
++
++import (
++	"fmt"
++	"time"
++
++	"cliamp/applog"
++	"cliamp/ipc"
++)
++
++// handleGUI は拡張 IPC のメッセージを処理する。知らないメッセージは捨てる
++// (既存の Send と同じ)。
++func (d *daemon) handleGUI(msg any) {
++	switch m := msg.(type) {
++	case ipc.PlaylistRequestMsg:
++		resp := ipc.PlaylistSnapshot(d.playlist, m.Limit)
++		resp.Source = d.listSource()
++		ipc.SendReply(m.Reply, resp)
++	case ipc.PlayIndexMsg:
++		d.guiPlayIndex(m)
++	case ipc.ReplaceMsg:
++		d.guiReplace(m)
++	case ipc.EnqueueMsg:
++		d.guiEnqueue(m)
++	case ipc.QueueEditMsg:
++		d.guiQueueEdit(m)
++	case ipc.RemoveMsg:
++		d.guiRemove(m)
++	}
++}
++
++// extendStatus は status の応答に拡張のフィールドを足す。
++func (d *daemon) extendStatus(resp *ipc.Response) {
++	resp.API = ipc.APIVersion
++	if cur, idx := d.playlist.Current(); idx >= 0 && cur.Path != "" {
++		ti := ipc.NewTrackInfo(cur)
++		resp.Track = &ti
++	}
++	bands := d.player.EQBands()
++	resp.EQ = bands[:]
++	resp.Gen = d.playlist.Gen()
++	resp.Source = d.listSource()
++	resp.StreamTitle = d.player.StreamTitle()
++	buffering := d.buffering
++	resp.Buffering = &buffering
++}
++
++func (d *daemon) setListSource(src ipc.SourceInfo) {
++	d.source = src
++	d.sourceEpoch = d.playlist.Epoch()
++}
++
++func (d *daemon) listSource() *ipc.SourceInfo {
++	if d.sourceEpoch != d.playlist.Epoch() || d.source == (ipc.SourceInfo{}) {
++		return nil
++	}
++	src := d.source
++	return &src
++}
++
++// seekTo は絶対位置へシークする (seek_to)。yt-dlp の曲は数秒かかるので、
++// その間 d.mu を手放す (status を止めないため)。
++func (d *daemon) seekTo(target time.Duration) {
++	if !d.player.IsPlaying() {
++		return
++	}
++	delta := target - d.player.Position()
++	d.mu.Unlock()
++	err := d.player.Seek(delta)
++	d.mu.Lock()
++	if err != nil {
++		applog.Warn("daemon: seek to %s: %v", target, err)
++	}
++}
++
++// playSelected は選ばれた行から、再生できる曲を探して鳴らす (TUI の
++// playCurrentTrack と同じく再生できない曲は飛ばす)。
++func (d *daemon) playSelected() {
++	act, ok := d.playlist.ActivateSelected()
++	if !ok {
++		d.player.Stop()
++		return
++	}
++	d.playTrack(act.Track)
++}
++
++func (d *daemon) idle() bool {
++	return !d.player.IsPlaying() && !d.buffering
++}
++
++func (d *daemon) guiPlayIndex(m ipc.PlayIndexMsg) {
++	if m.Index < 0 || m.Index >= d.playlist.Len() {
++		ipc.SendReply(m.Reply, ipc.Response{OK: false, Error: "index out of range"})
++		return
++	}
++	d.playlist.SetIndex(m.Index)
++	ipc.SendReply(m.Reply, ipc.Response{OK: true})
++	d.playSelected()
++}
++
++func (d *daemon) guiReplace(m ipc.ReplaceMsg) {
++	if len(m.Tracks) == 0 || m.Index < 0 || m.Index >= len(m.Tracks) {
++		ipc.SendReply(m.Reply, ipc.Response{OK: false, Error: "index out of range"})
++		return
++	}
++	d.player.Stop()
++	d.player.ClearPreload()
++	d.playlist.Replace(m.Tracks)
++	d.playlist.StartAt(m.Index)
++	d.setListSource(m.Source)
++	ipc.SendReply(m.Reply, ipc.Response{OK: true, Total: d.playlist.Len(), Gen: d.playlist.Gen()})
++	d.playSelected()
++}
++
++func (d *daemon) guiEnqueue(m ipc.EnqueueMsg) {
++	if len(m.Tracks) == 0 {
++		ipc.SendReply(m.Reply, ipc.Response{OK: false, Error: "enqueue requires tracks"})
++		return
++	}
++	idle := d.idle()
++	start := d.playlist.Len()
++	d.playlist.Add(m.Tracks...)
++	mode := m.Mode
++	if mode == "next" && start == 0 {
++		mode = "end" // 理由は ui/model/ipc_gui.go の guiEnqueue
++	}
++	play := false
++	switch mode {
++	case "now":
++		d.player.Stop()
++		if d.playlist.Shuffled() {
++			for i := 1; i < len(m.Tracks); i++ {
++				d.playlist.Queue(start + i)
++			}
++		}
++		d.playlist.SetIndex(start)
++		play = true
++	case "end":
++		if idle {
++			d.playlist.SetIndex(start)
++			play = true
++		}
++	default: // "next"
++		for i := range m.Tracks {
++			d.playlist.Queue(start + i)
++		}
++	}
++	ipc.SendReply(m.Reply, ipc.Response{OK: true, Total: d.playlist.Len(), Gen: d.playlist.Gen()})
++	switch {
++	case play:
++		d.playSelected()
++	case mode == "next" && idle:
++		d.nextTrack()
++	}
++}
++
++func (d *daemon) guiQueueEdit(m ipc.QueueEditMsg) {
++	switch m.Mode {
++	case "add":
++		if m.Index < 0 || m.Index >= d.playlist.Len() {
++			ipc.SendReply(m.Reply, ipc.Response{OK: false, Error: "index out of range"})
++			return
++		}
++		if d.playlist.QueuePosition(m.Index) == 0 {
++			d.playlist.Queue(m.Index)
++		}
++	case "remove":
++		if m.Index < 0 || m.Index >= d.playlist.Len() {
++			ipc.SendReply(m.Reply, ipc.Response{OK: false, Error: "index out of range"})
++			return
++		}
++		d.playlist.Dequeue(m.Index)
++	case "move":
++		if !d.playlist.MoveQueueTo(m.Index, m.To) {
++			ipc.SendReply(m.Reply, ipc.Response{OK: false, Error: "queue position out of range"})
++			return
++		}
++	case "clear":
++		d.playlist.ClearQueue()
++	default:
++		ipc.SendReply(m.Reply, ipc.Response{OK: false, Error: fmt.Sprintf("queue_edit: unknown mode %q", m.Mode)})
++		return
++	}
++	ipc.SendReply(m.Reply, ipc.Response{OK: true, Queue: d.playlist.QueueIndices(), Gen: d.playlist.Gen()})
++}
++
++func (d *daemon) guiRemove(m ipc.RemoveMsg) {
++	if m.Index < 0 || m.Index >= d.playlist.Len() {
++		ipc.SendReply(m.Reply, ipc.Response{OK: false, Error: "index out of range"})
++		return
++	}
++	if m.Index == d.playlist.Index() && !d.idle() {
++		ipc.SendReply(m.Reply, ipc.Response{OK: false, Error: "cannot remove the current track"})
++		return
++	}
++	d.playlist.Remove(m.Index)
++	ipc.SendReply(m.Reply, ipc.Response{OK: true, Total: d.playlist.Len(), Gen: d.playlist.Gen()})
++}
+diff --git a/ipc/client.go b/ipc/client.go
+index f41c118..a8dec80 100644
+--- a/ipc/client.go
++++ b/ipc/client.go
+@@ -56,6 +56,8 @@ func SendWithDeadline(sockPath string, req Request, deadline time.Duration) (Res
+ 
+ 	// Read the response line.
+ 	scanner := bufio.NewScanner(conn)
++	// playlist などの GUI 拡張の応答は 64 KiB を超えうる。
++	scanner.Buffer(make([]byte, 0, 64*1024), MaxRequestBytes)
+ 	if !scanner.Scan() {
+ 		if err := scanner.Err(); err != nil {
+ 			return Response{}, fmt.Errorf("read response: %w", err)
+diff --git a/ipc/dispatch_test.go b/ipc/dispatch_test.go
+index 3fb4bb4..fdaefc7 100644
+--- a/ipc/dispatch_test.go
++++ b/ipc/dispatch_test.go
+@@ -38,6 +38,18 @@ func (c *captureDispatcher) Send(msg any) {
+ 		m.Reply <- c.autoReply
+ 	case StatusRequestMsg:
+ 		m.Reply <- c.autoReply
++	case PlaylistRequestMsg:
++		m.Reply <- c.autoReply
++	case PlayIndexMsg:
++		m.Reply <- c.autoReply
++	case ReplaceMsg:
++		m.Reply <- c.autoReply
++	case EnqueueMsg:
++		m.Reply <- c.autoReply
++	case QueueEditMsg:
++		m.Reply <- c.autoReply
++	case RemoveMsg:
++		m.Reply <- c.autoReply
+ 	}
+ }
+ 
+@@ -385,6 +397,12 @@ func TestDispatchReplyTimeout(t *testing.T) {
+ 		{Cmd: "eq", Name: "rock"},
+ 		{Cmd: "device", Name: "list"},
+ 		{Cmd: "status"},
++		{Cmd: "playlist"},
++		{Cmd: "play_index", Index: intPtr(0)},
++		{Cmd: "replace", Tracks: []TrackInfo{{Path: "/a.mp3"}}},
++		{Cmd: "enqueue", Tracks: []TrackInfo{{Path: "/a.mp3"}}},
++		{Cmd: "queue_edit", Mode: "clear"},
++		{Cmd: "remove", Index: intPtr(0)},
+ 	}
+ 	for _, r := range tests {
+ 		t.Run(r.Cmd, func(t *testing.T) {
+diff --git a/ipc/gui.go b/ipc/gui.go
+new file mode 100644
+index 0000000..416328e
+--- /dev/null
++++ b/ipc/gui.go
+@@ -0,0 +1,612 @@
++package ipc
++
++// gui.go — GUI フロントエンド向けの拡張コマンド (api 1)。
++//
++// 既存のコマンドと応答の形は変えず、足すだけにしてある。コマンドは 2 系統:
++//
++//   - 状態系 (seek_to, playlist, play_index, replace, enqueue, queue_edit,
++//     remove): Dispatcher (TUI の Update、または daemon の Send) へ送り、
++//     容量 1 の Reply で 1 回だけ答えを受ける。I/O はしない。
++//   - カタログ系 (providers, playlists, tracks, search, load_provider, lyrics,
++//     history, playlist_*): 接続ごとの goroutine で Catalog を呼ぶ。ネットワークや
++//     yt-dlp を待つので Update を通さない (通すと TUI が固まる)。
++//
++// capabilities はサーバーだけで答える。
++
++import (
++	"errors"
++	"fmt"
++	"maps"
++	"strings"
++	"time"
++
++	"cliamp/internal/playback"
++	"cliamp/playlist"
++)
++
++// APIVersion は拡張 IPC の版。capabilities と status の api で返す。
++const APIVersion = 1
++
++// MaxRequestBytes は要求 1 行の上限。replace で曲の一覧を送るため、
++// bufio.Scanner の既定 (64 KiB) から広げてある。
++const MaxRequestBytes = 8 << 20
++
++// catalogTimeout はカタログ系 1 要求の待ち時間の上限。ytmusic の Tracks は
++// 内部で 5 分待つことがあるが、GUI を待たせすぎないようここで切る。
++// 試験で短くするため変数にしてある。
++var catalogTimeout = 120 * time.Second
++
++// upNextLimit は playlist の up_next に載せる曲の上限。
++const upNextLimit = 200
++
++// ErrNotFound は Catalog.Lyrics が歌詞を見つけられなかったときに返す。
++// 応答の error は "not found" になる。
++var ErrNotFound = errors.New("not found")
++
++// SourceInfo はいま読み込まれているリストの出どころ。
++type SourceInfo struct {
++	Provider string `json:"provider,omitempty"`
++	ID       string `json:"id,omitempty"`
++	Name     string `json:"name,omitempty"`
++}
++
++// ProviderInfo は providers の応答の 1 件。真偽は false でも省かない。
++type ProviderInfo struct {
++	Key       string `json:"key"`
++	Name      string `json:"name"`
++	Search    bool   `json:"search"`
++	Playlists bool   `json:"playlists"`
++	Virtual   bool   `json:"virtual"`
++}
++
++// PlaylistInfo は playlist.PlaylistInfo の JSON 形。
++type PlaylistInfo struct {
++	ID         string `json:"id"`
++	Name       string `json:"name"`
++	TrackCount int    `json:"track_count,omitempty"`
++	Duration   int    `json:"duration,omitempty"`
++	Section    string `json:"section,omitempty"`
++}
++
++// LyricLine は歌詞の 1 行。T は秒 (同期していない歌詞は全行 0)。
++// 0 でも省かない。
++type LyricLine struct {
++	T    float64 `json:"t"`
++	Text string  `json:"text"`
++}
++
++// Catalog はカタログ系コマンドの実装 (main パッケージの catalog.go)。
++// どのメソッドも IPC の接続の goroutine から呼ばれ、Update は通らない。
++// 並行して呼ばれうるので、共有する状態は実装側で守ること。
++type Catalog interface {
++	Providers() []ProviderInfo
++	Playlists(provider string) ([]playlist.PlaylistInfo, error)
++	Tracks(provider, id string) ([]playlist.Track, error)
++	Search(provider, query string, limit int) ([]playlist.Track, error)
++	Lyrics(artist, title string) (lines []LyricLine, synced bool, err error)
++	History(limit int) ([]TrackInfo, error)
++	PlaylistAdd(name string, tracks []playlist.Track) error
++	PlaylistDelete(name string) error
++	PlaylistRemoveTrack(name string, index int) error
++}
++
++// SetCatalog はカタログ系コマンドの実装を差し込む。無ければ
++// カタログ系は "catalog not enabled" を返す。
++func (s *Server) SetCatalog(c Catalog) {
++	s.catalog = c
++}
++
++// SetEQPresets は capabilities で返す組み込み EQ プリセットの名前 (表示順)。
++// ui/model を import すると循環するため、外から渡す。
++func (s *Server) SetEQPresets(names []string) {
++	s.eqPresets = append([]string(nil), names...)
++}
++
++// 状態系の要求。どれも Reply は容量 1 で、処理側は必ず 1 回だけ答える
++// (SendReply を使う)。
++
++// PlaylistRequestMsg はいまのリストの写しを求める。Limit 0 は全件。
++type PlaylistRequestMsg struct {
++	Limit int
++	Reply chan Response
++}
++
++// PlayIndexMsg はリスト上の添字 Index の曲を再生する (TUI の行で Enter)。
++type PlayIndexMsg struct {
++	Index int
++	Reply chan Response
++}
++
++// ReplaceMsg はリストを Tracks に差し替えて Index の曲から再生する。
++type ReplaceMsg struct {
++	Tracks []playlist.Track
++	Index  int
++	Source SourceInfo
++	Reply  chan Response
++}
++
++// EnqueueMsg は曲を足す。Mode は "next" / "end" / "now"。
++type EnqueueMsg struct {
++	Tracks []playlist.Track
++	Mode   string
++	Reply  chan Response
++}
++
++// QueueEditMsg は「次に再生」の待ち行列を編集する。Mode は
++// "add" / "remove" (Index はリスト上の添字)、"move" (Index と To は
++// 待ち行列の位置)、"clear"。
++type QueueEditMsg struct {
++	Mode  string
++	Index int
++	To    int
++	Reply chan Response
++}
++
++// RemoveMsg はリストから添字 Index の曲を消す。
++type RemoveMsg struct {
++	Index int
++	Reply chan Response
++}
++
++// SendReply は ch へ resp を 1 回送る。ch が nil か、すでに答えが入って
++// いれば捨てる (2 回目で Update を止めないため)。
++func SendReply(ch chan Response, resp Response) {
++	if ch == nil {
++		return
++	}
++	select {
++	case ch <- resp:
++	default:
++	}
++}
++
++// NewTrackInfo は playlist.Track を IPC の形にする。
++func NewTrackInfo(t playlist.Track) TrackInfo {
++	ti := TrackInfo{
++		Title:       t.Title,
++		Artist:      t.Artist,
++		Path:        t.Path,
++		Album:       t.Album,
++		Genre:       t.Genre,
++		Year:        t.Year,
++		TrackNumber: t.TrackNumber,
++		Duration:    t.DurationSecs,
++		Stream:      t.Stream,
++		Live:        t.Realtime,
++		Feed:        t.Feed,
++		Unplayable:  t.Unplayable,
++		Bookmark:    t.Bookmark,
++	}
++	if len(t.ProviderMeta) > 0 {
++		ti.Meta = maps.Clone(t.ProviderMeta)
++	}
++	return ti
++}
++
++// ToTrack は NewTrackInfo の逆。Queued と PlayedAt は捨てる。
++func (ti TrackInfo) ToTrack() playlist.Track {
++	t := playlist.Track{
++		Path:         ti.Path,
++		Title:        ti.Title,
++		Artist:       ti.Artist,
++		Album:        ti.Album,
++		Genre:        ti.Genre,
++		Year:         ti.Year,
++		TrackNumber:  ti.TrackNumber,
++		DurationSecs: ti.Duration,
++		Stream:       ti.Stream,
++		Realtime:     ti.Live,
++		Feed:         ti.Feed,
++		Unplayable:   ti.Unplayable,
++		Bookmark:     ti.Bookmark,
++	}
++	if len(ti.Meta) > 0 {
++		t.ProviderMeta = maps.Clone(ti.Meta)
++	}
++	return t
++}
++
++// NewTrackInfos は曲の並びをまとめて IPC の形にする。
++func NewTrackInfos(tracks []playlist.Track) []TrackInfo {
++	if len(tracks) == 0 {
++		return nil
++	}
++	out := make([]TrackInfo, len(tracks))
++	for i, t := range tracks {
++		out[i] = NewTrackInfo(t)
++	}
++	return out
++}
++
++// newPlaylistInfos は playlist.PlaylistInfo を IPC の形にする。
++func newPlaylistInfos(lists []playlist.PlaylistInfo) []PlaylistInfo {
++	if len(lists) == 0 {
++		return nil
++	}
++	out := make([]PlaylistInfo, len(lists))
++	for i, p := range lists {
++		out[i] = PlaylistInfo{
++			ID:         p.ID,
++			Name:       p.Name,
++			TrackCount: p.TrackCount,
++			Duration:   p.DurationSecs,
++			Section:    p.Section,
++		}
++	}
++	return out
++}
++
++// tracksFromRequest は GUI から来た曲を playlist.Track にする。path の無い曲は
++// 受け付けない。http(s) の URL で yt-dlp で再生しないものは stream を立てる
++// (立っていないと TUI が Update の中で同期的に HTTP を開き、固まるため)。
++func tracksFromRequest(in []TrackInfo) ([]playlist.Track, error) {
++	out := make([]playlist.Track, 0, len(in))
++	for i, ti := range in {
++		if strings.TrimSpace(ti.Path) == "" {
++			return nil, fmt.Errorf("track %d has no path", i)
++		}
++		t := ti.ToTrack()
++		if !t.Stream && playlist.IsURL(t.Path) && !playlist.IsYTDL(t.Path) {
++			t.Stream = true
++		}
++		out = append(out, t)
++	}
++	return out, nil
++}
++
++// PlaylistSnapshot は playlist 要求の応答を組み立てる (TUI と daemon で共用)。
++// source は呼ぶ側が足す。
++func PlaylistSnapshot(pl *playlist.Playlist, limit int) Response {
++	tracks := pl.Tracks()
++	if limit > 0 && limit < len(tracks) {
++		tracks = tracks[:limit]
++	}
++	queue := pl.QueueIndices()
++	queuedAt := make(map[int]int, len(queue))
++	for i, idx := range queue {
++		queuedAt[idx] = i + 1
++	}
++	infos := NewTrackInfos(tracks)
++	for i := range infos {
++		infos[i].Queued = queuedAt[i]
++	}
++	return Response{
++		OK:     true,
++		Tracks: infos,
++		Index:  pl.Index(),
++		Total:  pl.Len(),
++		Queue:  queue,
++		UpNext: pl.Upcoming(upNextLimit),
++		Gen:    pl.Gen(),
++	}
++}
++
++// 既存のコマンド (server.go の dispatch)。capabilities の commands に載せる。
++var baseCommands = []string{
++	"play", "pause", "toggle", "stop", "next", "prev", "volume", "seek",
++	"load", "queue", "theme", "vis", "shuffle", "repeat", "mono", "speed",
++	"eq", "device", "status", "bands",
++}
++
++var pluginCommands = []string{"plugin.call", "plugin.commands"}
++
++var guiStateCommands = []string{
++	"capabilities", "seek_to", "playlist", "play_index", "replace",
++	"enqueue", "queue_edit", "remove",
++}
++
++var guiCatalogCommands = []string{
++	"providers", "playlists", "tracks", "search", "load_provider", "lyrics",
++	"history", "playlist_add", "playlist_delete", "playlist_remove_track",
++}
++
++// commandNames はこのサーバーが受け付けるコマンドの一覧。差し込まれて
++// いない機能 (プラグイン、カタログ) のコマンドは載せない。
++func (s *Server) commandNames() []string {
++	out := append([]string(nil), baseCommands...)
++	if s.plugins != nil {
++		out = append(out, pluginCommands...)
++	}
++	out = append(out, guiStateCommands...)
++	if s.catalog != nil {
++		out = append(out, guiCatalogCommands...)
++	}
++	return out
++}
++
++// dispatchGUI は拡張コマンドを処理する。知らないコマンドなら ok=false。
++func (s *Server) dispatchGUI(req Request) (Response, bool) {
++	switch strings.ToLower(req.Cmd) {
++	case "capabilities":
++		return Response{
++			OK:        true,
++			API:       APIVersion,
++			Commands:  s.commandNames(),
++			EQPresets: append([]string(nil), s.eqPresets...),
++		}, true
++
++	case "seek_to":
++		if req.Value < 0 {
++			return Response{OK: false, Error: "seek_to requires a non-negative position"}, true
++		}
++		// TUI では非同期の seekAbsolute に回り、yt-dlp の曲でも Update を止めない。
++		s.disp.Send(playback.SetPositionMsg{Position: time.Duration(req.Value * float64(time.Second))})
++		return Response{OK: true}, true
++
++	case "playlist":
++		reply := make(chan Response, 1)
++		s.disp.Send(PlaylistRequestMsg{Limit: max(req.Limit, 0), Reply: reply})
++		return waitReply(reply, s.done), true
++
++	case "play_index":
++		if req.Index == nil {
++			return Response{OK: false, Error: "play_index requires an index"}, true
++		}
++		reply := make(chan Response, 1)
++		s.disp.Send(PlayIndexMsg{Index: *req.Index, Reply: reply})
++		return waitReply(reply, s.done), true
++
++	case "replace":
++		tracks, err := tracksFromRequest(req.Tracks)
++		if err != nil {
++			return Response{OK: false, Error: "replace: " + err.Error()}, true
++		}
++		if len(tracks) == 0 {
++			return Response{OK: false, Error: "replace requires tracks"}, true
++		}
++		start := 0
++		if req.Index != nil {
++			start = *req.Index
++		}
++		if start < 0 || start >= len(tracks) {
++			return Response{OK: false, Error: "index out of range"}, true
++		}
++		var src SourceInfo
++		if req.Source != nil {
++			src = *req.Source
++		}
++		return s.replace(tracks, start, src), true
++
++	case "enqueue":
++		tracks, err := tracksFromRequest(req.Tracks)
++		if err != nil {
++			return Response{OK: false, Error: "enqueue: " + err.Error()}, true
++		}
++		if len(tracks) == 0 {
++			return Response{OK: false, Error: "enqueue requires tracks"}, true
++		}
++		mode := strings.ToLower(req.Mode)
++		switch mode {
++		case "":
++			mode = "next"
++		case "next", "end", "now":
++		default:
++			return Response{OK: false, Error: fmt.Sprintf("enqueue: unknown mode %q", req.Mode)}, true
++		}
++		reply := make(chan Response, 1)
++		s.disp.Send(EnqueueMsg{Tracks: tracks, Mode: mode, Reply: reply})
++		return waitReply(reply, s.done), true
++
++	case "queue_edit":
++		msg := QueueEditMsg{Mode: strings.ToLower(req.Mode), Index: -1, To: -1}
++		switch msg.Mode {
++		case "add", "remove":
++			if req.Index == nil {
++				return Response{OK: false, Error: "queue_edit " + msg.Mode + " requires an index"}, true
++			}
++			msg.Index = *req.Index
++		case "move":
++			if req.Index == nil || req.To == nil {
++				return Response{OK: false, Error: "queue_edit move requires index and to"}, true
++			}
++			msg.Index, msg.To = *req.Index, *req.To
++		case "clear":
++		default:
++			return Response{OK: false, Error: fmt.Sprintf("queue_edit: unknown mode %q", req.Mode)}, true
++		}
++		msg.Reply = make(chan Response, 1)
++		s.disp.Send(msg)
++		return waitReply(msg.Reply, s.done), true
++
++	case "remove":
++		if req.Index == nil {
++			return Response{OK: false, Error: "remove requires an index"}, true
++		}
++		reply := make(chan Response, 1)
++		s.disp.Send(RemoveMsg{Index: *req.Index, Reply: reply})
++		return waitReply(reply, s.done), true
++
++	case "providers":
++		return s.runCatalog(func(c Catalog) Response {
++			return Response{OK: true, Providers: c.Providers()}
++		}), true
++
++	case "playlists":
++		if req.Provider == "" {
++			return Response{OK: false, Error: "playlists requires a provider"}, true
++		}
++		return s.runCatalog(func(c Catalog) Response {
++			lists, err := c.Playlists(req.Provider)
++			if err != nil {
++				return catalogError(err)
++			}
++			return Response{OK: true, Playlists: newPlaylistInfos(lists)}
++		}), true
++
++	case "tracks":
++		if req.Provider == "" || req.ID == "" {
++			return Response{OK: false, Error: "tracks requires a provider and an id"}, true
++		}
++		return s.runCatalog(func(c Catalog) Response {
++			tracks, err := c.Tracks(req.Provider, req.ID)
++			if err != nil {
++				return catalogError(err)
++			}
++			return Response{OK: true, Tracks: NewTrackInfos(tracks)}
++		}), true
++
++	case "search":
++		query := strings.TrimSpace(req.Query)
++		if query == "" {
++			return Response{OK: false, Error: "search requires a query"}, true
++		}
++		limit := req.Limit
++		if limit <= 0 {
++			limit = 25
++		}
++		limit = min(limit, 50)
++		return s.runCatalog(func(c Catalog) Response {
++			tracks, err := c.Search(req.Provider, query, limit)
++			if err != nil {
++				return catalogError(err)
++			}
++			if len(tracks) > limit {
++				tracks = tracks[:limit]
++			}
++			return Response{OK: true, Tracks: NewTrackInfos(tracks)}
++		}), true
++
++	case "load_provider":
++		if req.Provider == "" || req.ID == "" {
++			return Response{OK: false, Error: "load_provider requires a provider and an id"}, true
++		}
++		start := 0
++		if req.Index != nil {
++			start = *req.Index
++		}
++		resp := s.runCatalog(func(c Catalog) Response {
++			tracks, err := c.Tracks(req.Provider, req.ID)
++			if err != nil {
++				return catalogError(err)
++			}
++			if len(tracks) == 0 {
++				return Response{OK: false, Error: "no tracks"}
++			}
++			if start < 0 || start >= len(tracks) {
++				return Response{OK: false, Error: "index out of range"}
++			}
++			return Response{OK: true, Tracks: NewTrackInfos(tracks)}
++		})
++		if !resp.OK {
++			return resp, true
++		}
++		tracks := make([]playlist.Track, len(resp.Tracks))
++		for i, ti := range resp.Tracks {
++			tracks[i] = ti.ToTrack()
++		}
++		return s.replace(tracks, start, SourceInfo{Provider: req.Provider, ID: req.ID, Name: req.Name}), true
++
++	case "lyrics":
++		if strings.TrimSpace(req.Artist) == "" && strings.TrimSpace(req.Title) == "" {
++			return Response{OK: false, Error: "lyrics requires an artist or a title"}, true
++		}
++		return s.runCatalog(func(c Catalog) Response {
++			lines, synced, err := c.Lyrics(req.Artist, req.Title)
++			if err != nil {
++				return catalogError(err)
++			}
++			if len(lines) == 0 {
++				return Response{OK: false, Error: ErrNotFound.Error()}
++			}
++			return Response{OK: true, Lyrics: lines, Synced: &synced}
++		}), true
++
++	case "history":
++		limit := req.Limit
++		if limit <= 0 {
++			limit = 50
++		}
++		return s.runCatalog(func(c Catalog) Response {
++			tracks, err := c.History(limit)
++			if err != nil {
++				return catalogError(err)
++			}
++			return Response{OK: true, Tracks: tracks}
++		}), true
++
++	case "playlist_add":
++		if req.Name == "" {
++			return Response{OK: false, Error: "playlist_add requires a name"}, true
++		}
++		tracks, err := tracksFromRequest(req.Tracks)
++		if err != nil {
++			return Response{OK: false, Error: "playlist_add: " + err.Error()}, true
++		}
++		if len(tracks) == 0 {
++			return Response{OK: false, Error: "playlist_add requires tracks"}, true
++		}
++		return s.runCatalog(func(c Catalog) Response {
++			if err := c.PlaylistAdd(req.Name, tracks); err != nil {
++				return catalogError(err)
++			}
++			return Response{OK: true}
++		}), true
++
++	case "playlist_delete":
++		if req.Name == "" {
++			return Response{OK: false, Error: "playlist_delete requires a name"}, true
++		}
++		return s.runCatalog(func(c Catalog) Response {
++			if err := c.PlaylistDelete(req.Name); err != nil {
++				return catalogError(err)
++			}
++			return Response{OK: true}
++		}), true
++
++	case "playlist_remove_track":
++		if req.Name == "" || req.Index == nil {
++			return Response{OK: false, Error: "playlist_remove_track requires a name and an index"}, true
++		}
++		index := *req.Index
++		return s.runCatalog(func(c Catalog) Response {
++			if err := c.PlaylistRemoveTrack(req.Name, index); err != nil {
++				return catalogError(err)
++			}
++			return Response{OK: true}
++		}), true
++	}
++	return Response{}, false
++}
++
++// replace は ReplaceMsg を送り、答えを待つ (replace と load_provider で共用)。
++func (s *Server) replace(tracks []playlist.Track, start int, src SourceInfo) Response {
++	reply := make(chan Response, 1)
++	s.disp.Send(ReplaceMsg{Tracks: tracks, Index: start, Source: src, Reply: reply})
++	return waitReply(reply, s.done)
++}
++
++// runCatalog は fn を別の goroutine で走らせ、catalogTimeout まで待つ。
++// プロバイダーの不具合で panic しても、プレイヤーごと落とさずに error で返す。
++func (s *Server) runCatalog(fn func(Catalog) Response) Response {
++	c := s.catalog
++	if c == nil {
++		return Response{OK: false, Error: "catalog not enabled"}
++	}
++	ch := make(chan Response, 1)
++	go func() {
++		defer func() {
++			if r := recover(); r != nil {
++				ch <- Response{OK: false, Error: fmt.Sprintf("internal error: %v", r)}
++			}
++		}()
++		ch <- fn(c)
++	}()
++	select {
++	case resp := <-ch:
++		return resp
++	case <-time.After(catalogTimeout):
++		return Response{OK: false, Error: "timeout"}
++	case <-s.done:
++		return Response{OK: false, Error: "server shutting down"}
++	}
++}
++
++// catalogError はカタログの失敗を応答にする。サインインが要るときは
++// needs_auth を立てる (ブラウザでのサインインは IPC からは始めない)。
++func catalogError(err error) Response {
++	return Response{
++		OK:        false,
++		Error:     err.Error(),
++		NeedsAuth: errors.Is(err, playlist.ErrNeedsAuth),
++	}
++}
+diff --git a/ipc/gui_client_test.go b/ipc/gui_client_test.go
+new file mode 100644
+index 0000000..886c3e0
+--- /dev/null
++++ b/ipc/gui_client_test.go
+@@ -0,0 +1,128 @@
++package ipc
++
++import (
++	"bufio"
++	"encoding/json"
++	"fmt"
++	"net"
++	"path/filepath"
++	"strings"
++	"testing"
++	"time"
++)
++
++// TestSendLargeReplaceRoundTrip は 64 KiB (bufio.Scanner の既定の上限) を
++// 超える replace が本物のソケットを通って届くことを確かめる。
++func TestSendLargeReplaceRoundTrip(t *testing.T) {
++	sock := filepath.Join(t.TempDir(), "cliamp.sock")
++	disp := &captureDispatcher{autoReply: Response{OK: true, Total: 2000, Gen: 1}}
++	srv, err := NewServer(sock, disp)
++	if err != nil {
++		t.Fatalf("NewServer: %v", err)
++	}
++	t.Cleanup(func() { _ = srv.Close() })
++
++	tracks := make([]TrackInfo, 2000)
++	for i := range tracks {
++		tracks[i] = TrackInfo{
++			Path:   fmt.Sprintf("https://www.youtube.com/watch?v=%011d", i),
++			Title:  strings.Repeat("長い曲名", 8),
++			Artist: "Artist",
++			Meta:   map[string]string{"k": "v"},
++		}
++	}
++	req := Request{Cmd: "replace", Tracks: tracks, Index: intPtr(1999)}
++	if data, _ := json.Marshal(req); len(data) < 256*1024 {
++		t.Fatalf("request is only %d bytes, want > 256 KiB", len(data))
++	}
++
++	resp, err := Send(sock, req)
++	if err != nil {
++		t.Fatalf("Send: %v", err)
++	}
++	if !resp.OK || resp.Total != 2000 {
++		t.Fatalf("resp = %+v", resp)
++	}
++	got, ok := disp.last.(ReplaceMsg)
++	if !ok || len(got.Tracks) != 2000 || got.Index != 1999 {
++		t.Fatalf("server received %T with %d tracks", disp.last, len(got.Tracks))
++	}
++}
++
++// TestSendLargeResponse は playlist のような 64 KiB を超える応答を Go の
++// クライアント (cliamp の CLI) が読めることを確かめる。
++func TestSendLargeResponse(t *testing.T) {
++	sock := filepath.Join(t.TempDir(), "cliamp.sock")
++	big := make([]TrackInfo, 3000)
++	for i := range big {
++		big[i] = TrackInfo{Path: fmt.Sprintf("/music/%05d-%s.flac", i, strings.Repeat("x", 40))}
++	}
++	disp := &captureDispatcher{autoReply: Response{OK: true, Tracks: big, Total: len(big)}}
++	srv, err := NewServer(sock, disp)
++	if err != nil {
++		t.Fatalf("NewServer: %v", err)
++	}
++	t.Cleanup(func() { _ = srv.Close() })
++
++	resp, err := Send(sock, Request{Cmd: "playlist"})
++	if err != nil {
++		t.Fatalf("Send: %v", err)
++	}
++	if len(resp.Tracks) != 3000 {
++		t.Fatalf("got %d tracks, want 3000", len(resp.Tracks))
++	}
++}
++
++// TestRequestTooLarge は上限 (8 MiB) を超えた要求に理由を返して閉じることを確かめる。
++func TestRequestTooLarge(t *testing.T) {
++	sock := filepath.Join(t.TempDir(), "cliamp.sock")
++	srv, err := NewServer(sock, &captureDispatcher{})
++	if err != nil {
++		t.Fatalf("NewServer: %v", err)
++	}
++	t.Cleanup(func() { _ = srv.Close() })
++
++	conn, err := net.Dial("unix", sock)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer conn.Close()
++	conn.SetDeadline(time.Now().Add(10 * time.Second))
++
++	go func() {
++		payload := `{"cmd":"replace","tracks":[{"path":"` + strings.Repeat("a", MaxRequestBytes+1024) + `"}]}` + "\n"
++		_, _ = conn.Write([]byte(payload)) // サーバーが閉じると途中で失敗する
++	}()
++
++	line, err := bufio.NewReader(conn).ReadString('\n')
++	if err != nil {
++		t.Fatalf("read: %v", err)
++	}
++	var resp Response
++	if err := json.Unmarshal([]byte(line), &resp); err != nil {
++		t.Fatalf("unmarshal %q: %v", line, err)
++	}
++	if resp.OK || resp.Error != "request too large" {
++		t.Fatalf("resp = %+v", resp)
++	}
++}
++
++// TestCapabilitiesOverSocket は拡張の有無の判定に使う capabilities が
++// 本物のソケットで答えることを確かめる。
++func TestCapabilitiesOverSocket(t *testing.T) {
++	sock := filepath.Join(t.TempDir(), "cliamp.sock")
++	srv, err := NewServer(sock, &captureDispatcher{})
++	if err != nil {
++		t.Fatalf("NewServer: %v", err)
++	}
++	t.Cleanup(func() { _ = srv.Close() })
++	srv.SetEQPresets([]string{"Flat"})
++
++	resp, err := Send(sock, Request{Cmd: "capabilities"})
++	if err != nil {
++		t.Fatalf("Send: %v", err)
++	}
++	if !resp.OK || resp.API != APIVersion || len(resp.Commands) == 0 || resp.EQPresets[0] != "Flat" {
++		t.Fatalf("resp = %+v", resp)
++	}
++}
+diff --git a/ipc/gui_test.go b/ipc/gui_test.go
+new file mode 100644
+index 0000000..5ba0b96
+--- /dev/null
++++ b/ipc/gui_test.go
+@@ -0,0 +1,715 @@
++package ipc
++
++import (
++	"encoding/json"
++	"errors"
++	"fmt"
++	"reflect"
++	"slices"
++	"strings"
++	"testing"
++	"time"
++
++	"cliamp/internal/playback"
++	"cliamp/playlist"
++)
++
++func intPtr(i int) *int { return &i }
++
++// fakeCatalog は Catalog の試験用の実装。呼ばれた引数を覚えておく。
++type fakeCatalog struct {
++	providers []ProviderInfo
++	lists     []playlist.PlaylistInfo
++	tracks    []playlist.Track
++	lyrics    []LyricLine
++	synced    bool
++	history   []TrackInfo
++	err       error
++	block     chan struct{} // 閉じられるまで Tracks を待たせる
++	panicMsg  string
++
++	gotProvider, gotID, gotQuery, gotName string
++	gotLimit, gotIndex                    int
++	gotTracks                             []playlist.Track
++	calls                                 []string
++}
++
++func (f *fakeCatalog) Providers() []ProviderInfo {
++	f.calls = append(f.calls, "providers")
++	return f.providers
++}
++
++func (f *fakeCatalog) Playlists(provider string) ([]playlist.PlaylistInfo, error) {
++	f.calls = append(f.calls, "playlists")
++	f.gotProvider = provider
++	return f.lists, f.err
++}
++
++func (f *fakeCatalog) Tracks(provider, id string) ([]playlist.Track, error) {
++	f.calls = append(f.calls, "tracks")
++	f.gotProvider, f.gotID = provider, id
++	if f.panicMsg != "" {
++		panic(f.panicMsg)
++	}
++	if f.block != nil {
++		<-f.block
++	}
++	return f.tracks, f.err
++}
++
++func (f *fakeCatalog) Search(provider, query string, limit int) ([]playlist.Track, error) {
++	f.calls = append(f.calls, "search")
++	f.gotProvider, f.gotQuery, f.gotLimit = provider, query, limit
++	return f.tracks, f.err
++}
++
++func (f *fakeCatalog) Lyrics(artist, title string) ([]LyricLine, bool, error) {
++	f.calls = append(f.calls, "lyrics")
++	f.gotQuery = artist + "/" + title
++	return f.lyrics, f.synced, f.err
++}
++
++func (f *fakeCatalog) History(limit int) ([]TrackInfo, error) {
++	f.calls = append(f.calls, "history")
++	f.gotLimit = limit
++	return f.history, f.err
++}
++
++func (f *fakeCatalog) PlaylistAdd(name string, tracks []playlist.Track) error {
++	f.calls = append(f.calls, "playlist_add")
++	f.gotName, f.gotTracks = name, tracks
++	return f.err
++}
++
++func (f *fakeCatalog) PlaylistDelete(name string) error {
++	f.calls = append(f.calls, "playlist_delete")
++	f.gotName = name
++	return f.err
++}
++
++func (f *fakeCatalog) PlaylistRemoveTrack(name string, index int) error {
++	f.calls = append(f.calls, "playlist_remove_track")
++	f.gotName, f.gotIndex = name, index
++	return f.err
++}
++
++func newGUITestServer(disp Dispatcher, cat Catalog) *Server {
++	s := newTestServer(disp)
++	if cat != nil {
++		s.SetCatalog(cat)
++	}
++	return s
++}
++
++func TestDispatchCapabilities(t *testing.T) {
++	s := newGUITestServer(&captureDispatcher{}, &fakeCatalog{})
++	s.SetEQPresets([]string{"Flat", "Rock"})
++	resp := s.dispatch(Request{Cmd: "capabilities"})
++	if !resp.OK || resp.API != APIVersion {
++		t.Fatalf("capabilities = %+v, want ok api=%d", resp, APIVersion)
++	}
++	for _, cmd := range []string{"play", "status", "seek_to", "replace", "remove", "providers", "playlist_remove_track"} {
++		if !slices.Contains(resp.Commands, cmd) {
++			t.Errorf("commands %v lack %q", resp.Commands, cmd)
++		}
++	}
++	if slices.Contains(resp.Commands, "plugin.call") {
++		t.Error("plugin.call listed without a plugin dispatcher")
++	}
++	if !slices.Equal(resp.EQPresets, []string{"Flat", "Rock"}) {
++		t.Errorf("eq_presets = %v", resp.EQPresets)
++	}
++
++	// カタログが無ければカタログ系は載せない。
++	resp = newGUITestServer(&captureDispatcher{}, nil).dispatch(Request{Cmd: "capabilities"})
++	if slices.Contains(resp.Commands, "providers") || !slices.Contains(resp.Commands, "playlist") {
++		t.Errorf("commands without catalog = %v", resp.Commands)
++	}
++}
++
++func TestCapabilitiesListsEveryDispatchedCommand(t *testing.T) {
++	s := newGUITestServer(&captureDispatcher{}, &fakeCatalog{})
++	s.plugins = fakePlugins{}
++	for _, cmd := range s.commandNames() {
++		resp := s.dispatch(Request{Cmd: cmd})
++		if strings.HasPrefix(resp.Error, "unknown command") {
++			t.Errorf("%s is listed but unknown to dispatch", cmd)
++		}
++	}
++}
++
++type fakePlugins struct{}
++
++func (fakePlugins) EmitCommand(string, string, []string) (string, error) { return "", nil }
++func (fakePlugins) CommandList() []string                                { return nil }
++
++func TestDispatchSeekTo(t *testing.T) {
++	disp := &captureDispatcher{}
++	s := newGUITestServer(disp, nil)
++	resp := s.dispatch(Request{Cmd: "seek_to", Value: 12.25})
++	if !resp.OK {
++		t.Fatalf("seek_to err=%q", resp.Error)
++	}
++	want := playback.SetPositionMsg{Position: 12250 * time.Millisecond}
++	if got, ok := disp.last.(playback.SetPositionMsg); !ok || got != want {
++		t.Fatalf("sent %#v, want %#v", disp.last, want)
++	}
++
++	// value を省いた (0) ときは先頭へ。
++	s.dispatch(Request{Cmd: "seek_to"})
++	if got := disp.last.(playback.SetPositionMsg); got.Position != 0 {
++		t.Fatalf("seek_to without value sent %v, want 0", got.Position)
++	}
++
++	disp.last = nil
++	if resp := s.dispatch(Request{Cmd: "seek_to", Value: -1}); resp.OK || disp.last != nil {
++		t.Fatalf("negative seek_to = %+v (sent %v), want error and nothing sent", resp, disp.last)
++	}
++}
++
++func TestDispatchPlaylistRequest(t *testing.T) {
++	disp := &captureDispatcher{autoReply: Response{OK: true, Total: 3, Gen: 7}}
++	s := newGUITestServer(disp, nil)
++	resp := s.dispatch(Request{Cmd: "playlist", Limit: 2})
++	if !resp.OK || resp.Gen != 7 {
++		t.Fatalf("playlist = %+v", resp)
++	}
++	if got, ok := disp.last.(PlaylistRequestMsg); !ok || got.Limit != 2 {
++		t.Fatalf("sent %#v, want PlaylistRequestMsg{Limit:2}", disp.last)
++	}
++	s.dispatch(Request{Cmd: "playlist", Limit: -5})
++	if got := disp.last.(PlaylistRequestMsg); got.Limit != 0 {
++		t.Fatalf("negative limit sent %d, want 0 (all)", got.Limit)
++	}
++}
++
++func TestDispatchPlayIndex(t *testing.T) {
++	disp := &captureDispatcher{autoReply: Response{OK: true}}
++	s := newGUITestServer(disp, nil)
++
++	if resp := s.dispatch(Request{Cmd: "play_index"}); resp.OK || disp.last != nil {
++		t.Fatalf("play_index without index = %+v, want error before dispatch", resp)
++	}
++	// 0 は有効な添字 (JSON では省かれないようポインタにしてある)。
++	var req Request
++	if err := json.Unmarshal([]byte(`{"cmd":"play_index","index":0}`), &req); err != nil {
++		t.Fatal(err)
++	}
++	if resp := s.dispatch(req); !resp.OK {
++		t.Fatalf("play_index 0 err=%q", resp.Error)
++	}
++	if got, ok := disp.last.(PlayIndexMsg); !ok || got.Index != 0 {
++		t.Fatalf("sent %#v, want PlayIndexMsg{Index:0}", disp.last)
++	}
++}
++
++func TestDispatchReplace(t *testing.T) {
++	disp := &captureDispatcher{autoReply: Response{OK: true, Total: 2, Gen: 3}}
++	s := newGUITestServer(disp, nil)
++
++	resp := s.dispatch(Request{
++		Cmd: "replace",
++		Tracks: []TrackInfo{
++			{Path: "https://www.youtube.com/watch?v=abc", Title: "YT"},
++			{Path: "https://radio.example/stream", Title: "Radio", Live: true},
++		},
++		Index:  intPtr(1),
++		Source: &SourceInfo{Provider: "radio", ID: "l:0", Name: "cliamp radio"},
++	})
++	if !resp.OK || resp.Total != 2 || resp.Gen != 3 {
++		t.Fatalf("replace = %+v", resp)
++	}
++	got, ok := disp.last.(ReplaceMsg)
++	if !ok {
++		t.Fatalf("sent %T, want ReplaceMsg", disp.last)
++	}
++	if got.Index != 1 || got.Source.Name != "cliamp radio" || len(got.Tracks) != 2 {
++		t.Fatalf("ReplaceMsg = %+v", got)
++	}
++	// yt-dlp で鳴らす曲はそのまま、ただの http の流れは stream を立てる。
++	if got.Tracks[0].Stream {
++		t.Error("YouTube track got Stream=true, want untouched")
++	}
++	if !got.Tracks[1].Stream || !got.Tracks[1].Realtime {
++		t.Errorf("radio track = %+v, want Stream and Realtime", got.Tracks[1])
++	}
++
++	// index の既定は 0。
++	s.dispatch(Request{Cmd: "replace", Tracks: []TrackInfo{{Path: "/a.flac"}}})
++	if got := disp.last.(ReplaceMsg); got.Index != 0 || got.Source != (SourceInfo{}) {
++		t.Fatalf("default ReplaceMsg = %+v", got)
++	}
++}
++
++func TestDispatchReplaceErrors(t *testing.T) {
++	tests := []struct {
++		name string
++		req  Request
++		want string
++	}{
++		{"no tracks", Request{Cmd: "replace"}, "requires tracks"},
++		{"empty path", Request{Cmd: "replace", Tracks: []TrackInfo{{Path: "/a"}, {Title: "x"}}}, "track 1 has no path"},
++		{"index too large", Request{Cmd: "replace", Tracks: []TrackInfo{{Path: "/a"}}, Index: intPtr(1)}, "index out of range"},
++		{"negative index", Request{Cmd: "replace", Tracks: []TrackInfo{{Path: "/a"}}, Index: intPtr(-1)}, "index out of range"},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			disp := &captureDispatcher{}
++			resp := newGUITestServer(disp, nil).dispatch(tt.req)
++			if resp.OK || !strings.Contains(resp.Error, tt.want) {
++				t.Fatalf("resp = %+v, want error containing %q", resp, tt.want)
++			}
++			if disp.last != nil {
++				t.Fatalf("sent %T despite the error", disp.last)
++			}
++		})
++	}
++}
++
++func TestDispatchEnqueue(t *testing.T) {
++	for _, tt := range []struct{ mode, want string }{
++		{"", "next"}, {"next", "next"}, {"END", "end"}, {"now", "now"},
++	} {
++		disp := &captureDispatcher{autoReply: Response{OK: true, Total: 5}}
++		resp := newGUITestServer(disp, nil).dispatch(Request{Cmd: "enqueue", Mode: tt.mode, Tracks: []TrackInfo{{Path: "/a.mp3"}}})
++		if !resp.OK || resp.Total != 5 {
++			t.Fatalf("enqueue %q = %+v", tt.mode, resp)
++		}
++		if got := disp.last.(EnqueueMsg); got.Mode != tt.want || len(got.Tracks) != 1 {
++			t.Fatalf("enqueue %q sent %+v, want mode %q", tt.mode, got, tt.want)
++		}
++	}
++	disp := &captureDispatcher{}
++	s := newGUITestServer(disp, nil)
++	if resp := s.dispatch(Request{Cmd: "enqueue", Mode: "later", Tracks: []TrackInfo{{Path: "/a"}}}); resp.OK || !strings.Contains(resp.Error, "unknown mode") {
++		t.Fatalf("bad mode = %+v", resp)
++	}
++	if resp := s.dispatch(Request{Cmd: "enqueue"}); resp.OK {
++		t.Fatalf("enqueue without tracks = %+v", resp)
++	}
++	if disp.last != nil {
++		t.Fatalf("sent %T despite errors", disp.last)
++	}
++}
++
++func TestDispatchQueueEdit(t *testing.T) {
++	disp := &captureDispatcher{autoReply: Response{OK: true, Queue: []int{2, 1}}}
++	s := newGUITestServer(disp, nil)
++
++	resp := s.dispatch(Request{Cmd: "queue_edit", Mode: "move", Index: intPtr(0), To: intPtr(1)})
++	if !resp.OK || !slices.Equal(resp.Queue, []int{2, 1}) {
++		t.Fatalf("move = %+v", resp)
++	}
++	if got := disp.last.(QueueEditMsg); got.Mode != "move" || got.Index != 0 || got.To != 1 {
++		t.Fatalf("sent %+v", got)
++	}
++	s.dispatch(Request{Cmd: "queue_edit", Mode: "Add", Index: intPtr(4)})
++	if got := disp.last.(QueueEditMsg); got.Mode != "add" || got.Index != 4 {
++		t.Fatalf("sent %+v", got)
++	}
++	s.dispatch(Request{Cmd: "queue_edit", Mode: "clear"})
++	if got := disp.last.(QueueEditMsg); got.Mode != "clear" || got.Index != -1 {
++		t.Fatalf("sent %+v", got)
++	}
++
++	disp.last = nil
++	for _, req := range []Request{
++		{Cmd: "queue_edit"},
++		{Cmd: "queue_edit", Mode: "shuffle"},
++		{Cmd: "queue_edit", Mode: "add"},
++		{Cmd: "queue_edit", Mode: "remove"},
++		{Cmd: "queue_edit", Mode: "move", Index: intPtr(1)},
++	} {
++		if resp := s.dispatch(req); resp.OK || resp.Error == "" {
++			t.Errorf("%+v = %+v, want error", req, resp)
++		}
++	}
++	if disp.last != nil {
++		t.Fatalf("sent %T despite errors", disp.last)
++	}
++}
++
++func TestDispatchRemove(t *testing.T) {
++	disp := &captureDispatcher{autoReply: Response{OK: true, Total: 1, Gen: 9}}
++	s := newGUITestServer(disp, nil)
++	if resp := s.dispatch(Request{Cmd: "remove"}); resp.OK {
++		t.Fatal("remove without index should fail")
++	}
++	resp := s.dispatch(Request{Cmd: "remove", Index: intPtr(0)})
++	if !resp.OK || resp.Gen != 9 {
++		t.Fatalf("remove = %+v", resp)
++	}
++	if got := disp.last.(RemoveMsg); got.Index != 0 {
++		t.Fatalf("sent %+v", got)
++	}
++}
++
++func TestDispatchStateCommandsPassErrorsThrough(t *testing.T) {
++	disp := &captureDispatcher{autoReply: Response{OK: false, Error: "index out of range"}}
++	s := newGUITestServer(disp, nil)
++	resp := s.dispatch(Request{Cmd: "play_index", Index: intPtr(99)})
++	if resp.OK || resp.Error != "index out of range" {
++		t.Fatalf("resp = %+v", resp)
++	}
++}
++
++func TestDispatchCatalogDisabled(t *testing.T) {
++	s := newGUITestServer(&captureDispatcher{}, nil)
++	for _, req := range []Request{
++		{Cmd: "providers"},
++		{Cmd: "playlists", Provider: "local"},
++		{Cmd: "tracks", Provider: "local", ID: "x"},
++		{Cmd: "search", Query: "q"},
++		{Cmd: "load_provider", Provider: "local", ID: "x"},
++		{Cmd: "lyrics", Title: "t"},
++		{Cmd: "history"},
++		{Cmd: "playlist_add", Name: "n", Tracks: []TrackInfo{{Path: "/a"}}},
++		{Cmd: "playlist_delete", Name: "n"},
++		{Cmd: "playlist_remove_track", Name: "n", Index: intPtr(0)},
++	} {
++		resp := s.dispatch(req)
++		if resp.OK || resp.Error != "catalog not enabled" {
++			t.Errorf("%s = %+v, want catalog not enabled", req.Cmd, resp)
++		}
++	}
++}
++
++func TestDispatchCatalogArgumentErrors(t *testing.T) {
++	cat := &fakeCatalog{}
++	s := newGUITestServer(&captureDispatcher{}, cat)
++	for _, req := range []Request{
++		{Cmd: "playlists"},
++		{Cmd: "tracks", Provider: "local"},
++		{Cmd: "tracks", ID: "x"},
++		{Cmd: "search", Query: "   "},
++		{Cmd: "load_provider", Provider: "local"},
++		{Cmd: "lyrics"},
++		{Cmd: "playlist_add", Name: "n"},
++		{Cmd: "playlist_add", Tracks: []TrackInfo{{Path: "/a"}}},
++		{Cmd: "playlist_add", Name: "n", Tracks: []TrackInfo{{Title: "no path"}}},
++		{Cmd: "playlist_delete"},
++		{Cmd: "playlist_remove_track", Name: "n"},
++	} {
++		if resp := s.dispatch(req); resp.OK || resp.Error == "" {
++			t.Errorf("%+v = %+v, want error", req, resp)
++		}
++	}
++	if len(cat.calls) != 0 {
++		t.Fatalf("catalog called %v despite argument errors", cat.calls)
++	}
++}
++
++func TestDispatchProvidersAndPlaylists(t *testing.T) {
++	cat := &fakeCatalog{
++		providers: []ProviderInfo{{Key: "radio", Name: "Radio", Playlists: true}},
++		lists:     []playlist.PlaylistInfo{{ID: "l:0", Name: "cliamp radio", TrackCount: 1, DurationSecs: 60, Section: "Local"}},
++	}
++	s := newGUITestServer(&captureDispatcher{}, cat)
++	resp := s.dispatch(Request{Cmd: "providers"})
++	if !resp.OK || len(resp.Providers) != 1 || resp.Providers[0].Key != "radio" {
++		t.Fatalf("providers = %+v", resp)
++	}
++	resp = s.dispatch(Request{Cmd: "playlists", Provider: "radio"})
++	want := []PlaylistInfo{{ID: "l:0", Name: "cliamp radio", TrackCount: 1, Duration: 60, Section: "Local"}}
++	if !resp.OK || !reflect.DeepEqual(resp.Playlists, want) || cat.gotProvider != "radio" {
++		t.Fatalf("playlists = %+v", resp)
++	}
++}
++
++func TestDispatchCatalogNeedsAuth(t *testing.T) {
++	cat := &fakeCatalog{err: fmt.Errorf("spotify: %w", playlist.ErrNeedsAuth)}
++	s := newGUITestServer(&captureDispatcher{}, cat)
++	for _, req := range []Request{
++		{Cmd: "playlists", Provider: "spotify"},
++		{Cmd: "tracks", Provider: "spotify", ID: "x"},
++		{Cmd: "search", Provider: "spotify", Query: "q"},
++		{Cmd: "load_provider", Provider: "spotify", ID: "x"},
++	} {
++		resp := s.dispatch(req)
++		if resp.OK || !resp.NeedsAuth || !strings.Contains(resp.Error, "sign-in required") {
++			t.Errorf("%s = %+v, want needs_auth", req.Cmd, resp)
++		}
++	}
++	cat.err = errors.New("boom")
++	if resp := s.dispatch(Request{Cmd: "playlists", Provider: "x"}); resp.OK || resp.NeedsAuth || resp.Error != "boom" {
++		t.Fatalf("plain error = %+v", resp)
++	}
++}
++
++func TestDispatchTracksAndSearch(t *testing.T) {
++	tracks := make([]playlist.Track, 60)
++	for i := range tracks {
++		tracks[i] = playlist.Track{Path: fmt.Sprintf("https://www.youtube.com/watch?v=%02d", i), Stream: true}
++	}
++	cat := &fakeCatalog{tracks: tracks}
++	s := newGUITestServer(&captureDispatcher{}, cat)
++
++	resp := s.dispatch(Request{Cmd: "tracks", Provider: "url", ID: "https://example/list"})
++	if !resp.OK || len(resp.Tracks) != 60 || cat.gotID != "https://example/list" {
++		t.Fatalf("tracks = ok:%v n:%d", resp.OK, len(resp.Tracks))
++	}
++
++	resp = s.dispatch(Request{Cmd: "search", Query: " 米津玄師 "})
++	if !resp.OK || cat.gotLimit != 25 || cat.gotQuery != "米津玄師" || cat.gotProvider != "" {
++		t.Fatalf("search default: limit=%d query=%q provider=%q", cat.gotLimit, cat.gotQuery, cat.gotProvider)
++	}
++	if len(resp.Tracks) != 25 {
++		t.Fatalf("search returned %d tracks, want trimmed to 25", len(resp.Tracks))
++	}
++	s.dispatch(Request{Cmd: "search", Provider: "spotify", Query: "q", Limit: 500})
++	if cat.gotLimit != 50 || cat.gotProvider != "spotify" {
++		t.Fatalf("search limit clamp: limit=%d provider=%q", cat.gotLimit, cat.gotProvider)
++	}
++}
++
++func TestDispatchLoadProvider(t *testing.T) {
++	cat := &fakeCatalog{tracks: []playlist.Track{
++		{Path: "spotify:track:1", Title: "One", ProviderMeta: map[string]string{"spotify.id": "1"}},
++		{Path: "spotify:track:2", Title: "Two"},
++	}}
++	disp := &captureDispatcher{autoReply: Response{OK: true, Total: 2, Gen: 4}}
++	s := newGUITestServer(disp, cat)
++
++	resp := s.dispatch(Request{Cmd: "load_provider", Provider: "spotify", ID: "pl1", Name: "My list", Index: intPtr(1)})
++	if !resp.OK || resp.Total != 2 {
++		t.Fatalf("load_provider = %+v", resp)
++	}
++	got, ok := disp.last.(ReplaceMsg)
++	if !ok {
++		t.Fatalf("sent %T, want ReplaceMsg", disp.last)
++	}
++	if got.Index != 1 || got.Source != (SourceInfo{Provider: "spotify", ID: "pl1", Name: "My list"}) {
++		t.Fatalf("ReplaceMsg = %+v", got)
++	}
++	if !reflect.DeepEqual(got.Tracks, cat.tracks) {
++		t.Fatalf("tracks changed on the way: %+v", got.Tracks)
++	}
++
++	disp.last = nil
++	if resp := s.dispatch(Request{Cmd: "load_provider", Provider: "spotify", ID: "pl1", Index: intPtr(2)}); resp.OK || resp.Error != "index out of range" || disp.last != nil {
++		t.Fatalf("out of range load_provider = %+v (sent %T)", resp, disp.last)
++	}
++	cat.tracks = nil
++	if resp := s.dispatch(Request{Cmd: "load_provider", Provider: "spotify", ID: "empty"}); resp.OK || resp.Error != "no tracks" {
++		t.Fatalf("empty load_provider = %+v", resp)
++	}
++}
++
++func TestDispatchLyrics(t *testing.T) {
++	cat := &fakeCatalog{lyrics: []LyricLine{{T: 0, Text: "a"}, {T: 12.5, Text: "b"}}, synced: true}
++	s := newGUITestServer(&captureDispatcher{}, cat)
++	resp := s.dispatch(Request{Cmd: "lyrics", Artist: "YOASOBI", Title: "夜に駆ける"})
++	if !resp.OK || resp.Synced == nil || !*resp.Synced || len(resp.Lyrics) != 2 || cat.gotQuery != "YOASOBI/夜に駆ける" {
++		t.Fatalf("lyrics = %+v", resp)
++	}
++	// t=0 と synced=false も JSON に出る (省かない)。
++	cat.synced = false
++	data, _ := json.Marshal(s.dispatch(Request{Cmd: "lyrics", Title: "x"}))
++	if !strings.Contains(string(data), `"synced":false`) || !strings.Contains(string(data), `{"t":0,"text":"a"}`) {
++		t.Fatalf("lyrics JSON = %s", data)
++	}
++
++	cat.err = ErrNotFound
++	if resp := s.dispatch(Request{Cmd: "lyrics", Title: "x"}); resp.OK || resp.Error != "not found" {
++		t.Fatalf("not found = %+v", resp)
++	}
++	cat.err, cat.lyrics = nil, nil
++	if resp := s.dispatch(Request{Cmd: "lyrics", Title: "x"}); resp.OK || resp.Error != "not found" {
++		t.Fatalf("empty lyrics = %+v", resp)
++	}
++}
++
++func TestDispatchHistory(t *testing.T) {
++	cat := &fakeCatalog{history: []TrackInfo{{Path: "/a", PlayedAt: "2026-09-26T01:02:03Z"}}}
++	s := newGUITestServer(&captureDispatcher{}, cat)
++	resp := s.dispatch(Request{Cmd: "history"})
++	if !resp.OK || cat.gotLimit != 50 || len(resp.Tracks) != 1 || resp.Tracks[0].PlayedAt == "" {
++		t.Fatalf("history = %+v (limit %d)", resp, cat.gotLimit)
++	}
++	s.dispatch(Request{Cmd: "history", Limit: 5})
++	if cat.gotLimit != 5 {
++		t.Fatalf("history limit = %d, want 5", cat.gotLimit)
++	}
++}
++
++func TestDispatchLocalPlaylistEdits(t *testing.T) {
++	cat := &fakeCatalog{}
++	s := newGUITestServer(&captureDispatcher{}, cat)
++
++	resp := s.dispatch(Request{Cmd: "playlist_add", Name: "お気に入り", Tracks: []TrackInfo{
++		{Path: "https://www.youtube.com/watch?v=x", Title: "X", Duration: 200},
++	}})
++	if !resp.OK || cat.gotName != "お気に入り" || len(cat.gotTracks) != 1 || cat.gotTracks[0].DurationSecs != 200 {
++		t.Fatalf("playlist_add = %+v, got %+v", resp, cat.gotTracks)
++	}
++	if resp := s.dispatch(Request{Cmd: "playlist_delete", Name: "old"}); !resp.OK || cat.gotName != "old" {
++		t.Fatalf("playlist_delete = %+v", resp)
++	}
++	if resp := s.dispatch(Request{Cmd: "playlist_remove_track", Name: "list", Index: intPtr(0)}); !resp.OK || cat.gotName != "list" || cat.gotIndex != 0 {
++		t.Fatalf("playlist_remove_track = %+v", resp)
++	}
++	cat.err = errors.New("track index 9 out of range")
++	if resp := s.dispatch(Request{Cmd: "playlist_remove_track", Name: "list", Index: intPtr(9)}); resp.OK || !strings.Contains(resp.Error, "out of range") {
++		t.Fatalf("error = %+v", resp)
++	}
++}
++
++func TestDispatchCatalogTimeout(t *testing.T) {
++	old := catalogTimeout
++	catalogTimeout = 50 * time.Millisecond
++	defer func() { catalogTimeout = old }()
++
++	cat := &fakeCatalog{block: make(chan struct{})}
++	defer close(cat.block)
++	disp := &captureDispatcher{}
++	s := newGUITestServer(disp, cat)
++	start := time.Now()
++	resp := s.dispatch(Request{Cmd: "load_provider", Provider: "p", ID: "x"})
++	if resp.OK || resp.Error != "timeout" {
++		t.Fatalf("resp = %+v, want timeout", resp)
++	}
++	if time.Since(start) > 2*time.Second {
++		t.Fatal("catalog timeout took too long")
++	}
++	if disp.last != nil {
++		t.Fatalf("replace sent after a catalog timeout: %T", disp.last)
++	}
++}
++
++func TestDispatchCatalogShutdown(t *testing.T) {
++	cat := &fakeCatalog{block: make(chan struct{})}
++	defer close(cat.block)
++	s := newGUITestServer(&captureDispatcher{}, cat)
++	close(s.done)
++	resp := s.dispatch(Request{Cmd: "tracks", Provider: "p", ID: "x"})
++	if resp.OK || resp.Error != "server shutting down" {
++		t.Fatalf("resp = %+v", resp)
++	}
++}
++
++func TestDispatchCatalogPanicIsAnError(t *testing.T) {
++	s := newGUITestServer(&captureDispatcher{}, &fakeCatalog{panicMsg: "provider bug"})
++	resp := s.dispatch(Request{Cmd: "tracks", Provider: "p", ID: "x"})
++	if resp.OK || !strings.Contains(resp.Error, "provider bug") {
++		t.Fatalf("resp = %+v", resp)
++	}
++}
++
++func TestSendReplyNeverBlocks(t *testing.T) {
++	ch := make(chan Response, 1)
++	SendReply(ch, Response{OK: true})
++	SendReply(ch, Response{OK: false}) // 2 回目は捨てる
++	SendReply(nil, Response{OK: true})
++	if got := <-ch; !got.OK {
++		t.Fatalf("first reply lost: %+v", got)
++	}
++}
++
++func fullTrack() playlist.Track {
++	return playlist.Track{
++		Path:         "https://www.youtube.com/watch?v=abc",
++		Title:        "Title & <b>",
++		Artist:       "Artist",
++		Album:        "Album",
++		Genre:        "J-Pop",
++		Year:         2024,
++		TrackNumber:  3,
++		Stream:       true,
++		Realtime:     true,
++		Feed:         true,
++		DurationSecs: 245,
++		Bookmark:     true,
++		Unplayable:   true,
++		ProviderMeta: map[string]string{"navidrome.id": "42", "art": "https://example/a.jpg"},
++	}
++}
++
++func TestTrackInfoRoundTripIsLossless(t *testing.T) {
++	for _, tr := range []playlist.Track{fullTrack(), {Path: "/music/a.flac"}, {Path: "spotify:track:1", Title: "x"}} {
++		ti := NewTrackInfo(tr)
++		if got := ti.ToTrack(); !reflect.DeepEqual(got, tr) {
++			t.Fatalf("round trip\n got %+v\nwant %+v", got, tr)
++		}
++		// 線の上 (JSON) を通しても同じ。
++		data, err := json.Marshal(ti)
++		if err != nil {
++			t.Fatal(err)
++		}
++		var back TrackInfo
++		if err := json.Unmarshal(data, &back); err != nil {
++			t.Fatal(err)
++		}
++		if got := back.ToTrack(); !reflect.DeepEqual(got, tr) {
++			t.Fatalf("JSON round trip\n got %+v\nwant %+v\njson %s", got, tr, data)
++		}
++	}
++}
++
++func TestTrackInfoDoesNotShareMeta(t *testing.T) {
++	tr := fullTrack()
++	ti := NewTrackInfo(tr)
++	ti.Meta["navidrome.id"] = "changed"
++	if tr.ProviderMeta["navidrome.id"] != "42" {
++		t.Fatal("NewTrackInfo shares the ProviderMeta map")
++	}
++	back := ti.ToTrack()
++	back.ProviderMeta["art"] = "changed"
++	if ti.Meta["art"] == "changed" {
++		t.Fatal("ToTrack shares the Meta map")
++	}
++}
++
++func TestTrackInfoJSONFieldNames(t *testing.T) {
++	ti := NewTrackInfo(fullTrack())
++	ti.Queued = 2
++	ti.PlayedAt = "2026-09-26T00:00:00Z"
++	data, _ := json.Marshal(ti)
++	var raw map[string]any
++	_ = json.Unmarshal(data, &raw)
++	for _, k := range []string{"path", "title", "artist", "album", "genre", "year", "track_number", "duration", "stream", "live", "feed", "unplayable", "bookmark", "meta", "queued", "played_at"} {
++		if _, ok := raw[k]; !ok {
++			t.Errorf("JSON %s lacks %q", data, k)
++		}
++	}
++	// path は空でも出す (既存の約束)。
++	data, _ = json.Marshal(TrackInfo{})
++	if string(data) != `{"path":""}` {
++		t.Errorf("empty TrackInfo = %s", data)
++	}
++}
++
++func TestPlaylistSnapshot(t *testing.T) {
++	pl := playlist.New()
++	pl.Replace([]playlist.Track{{Path: "/a"}, {Path: "/b"}, {Path: "/c"}, {Path: "/d"}})
++	pl.SetIndex(1)
++	pl.Queue(3)
++	pl.Queue(0)
++
++	resp := PlaylistSnapshot(pl, 0)
++	if !resp.OK || resp.Total != 4 || resp.Index != 1 || len(resp.Tracks) != 4 {
++		t.Fatalf("snapshot = %+v", resp)
++	}
++	if !slices.Equal(resp.Queue, []int{3, 0}) || !slices.Equal(resp.UpNext, []int{2}) {
++		t.Fatalf("queue=%v up_next=%v, want [3 0] and [2]", resp.Queue, resp.UpNext)
++	}
++	if resp.Tracks[3].Queued != 1 || resp.Tracks[0].Queued != 2 || resp.Tracks[2].Queued != 0 {
++		t.Fatalf("queued = %d,%d,%d", resp.Tracks[3].Queued, resp.Tracks[0].Queued, resp.Tracks[2].Queued)
++	}
++	if resp.Gen != pl.Gen() || resp.Gen == 0 {
++		t.Fatalf("gen = %d, want %d", resp.Gen, pl.Gen())
++	}
++
++	if resp := PlaylistSnapshot(pl, 2); len(resp.Tracks) != 2 || resp.Total != 4 {
++		t.Fatalf("limit 2: %d tracks, total %d", len(resp.Tracks), resp.Total)
++	}
++	if resp := PlaylistSnapshot(playlist.New(), 0); !resp.OK || resp.Total != 0 || resp.Index != -1 || resp.Tracks != nil {
++		t.Fatalf("empty snapshot = %+v", resp)
++	}
++}
++
++func TestResponseOmitsGUIFieldsWhenUnset(t *testing.T) {
++	data, _ := json.Marshal(Response{OK: true})
++	if string(data) != `{"ok":true}` {
++		t.Fatalf("plain response = %s, want {\"ok\":true}", data)
++	}
++}
+diff --git a/ipc/protocol.go b/ipc/protocol.go
+index aac71fc..e6ade82 100644
+--- a/ipc/protocol.go
++++ b/ipc/protocol.go
+@@ -17,6 +17,19 @@ type Request struct {
+ 	Band     int      `json:"band,omitempty"`
+ 	Sub      string   `json:"sub,omitempty"`
+ 	Args     []string `json:"args,omitempty"`
++
++	// GUI 拡張 (gui.go)。index と to は 0 が有効値なのでポインタ。
++	Index    *int        `json:"index,omitempty"`
++	To       *int        `json:"to,omitempty"`
++	Provider string      `json:"provider,omitempty"`
++	ID       string      `json:"id,omitempty"`
++	Query    string      `json:"query,omitempty"`
++	Limit    int         `json:"limit,omitempty"`
++	Artist   string      `json:"artist,omitempty"`
++	Title    string      `json:"title,omitempty"`
++	Mode     string      `json:"mode,omitempty"`
++	Tracks   []TrackInfo `json:"tracks,omitempty"`
++	Source   *SourceInfo `json:"source,omitempty"`
+ }
+ 
+ // Response is the JSON response sent by the server.
+@@ -42,6 +55,24 @@ type Response struct {
+ 	Items      []string   `json:"items,omitempty"`
+ 	Theme      *ThemeInfo `json:"theme,omitempty"`
+ 	Bands      []float64  `json:"bands,omitempty"`
++
++	// GUI 拡張 (gui.go)。
++	API         int            `json:"api,omitempty"`
++	Commands    []string       `json:"commands,omitempty"`
++	EQPresets   []string       `json:"eq_presets,omitempty"`
++	EQ          []float64      `json:"eq,omitempty"`
++	Tracks      []TrackInfo    `json:"tracks,omitempty"`
++	Queue       []int          `json:"queue,omitempty"`
++	UpNext      []int          `json:"up_next,omitempty"`
++	Gen         uint64         `json:"gen,omitempty"`
++	Source      *SourceInfo    `json:"source,omitempty"`
++	StreamTitle string         `json:"stream_title,omitempty"`
++	Buffering   *bool          `json:"buffering,omitempty"`
++	Providers   []ProviderInfo `json:"providers,omitempty"`
++	Playlists   []PlaylistInfo `json:"playlists,omitempty"`
++	Lyrics      []LyricLine    `json:"lyrics,omitempty"`
++	Synced      *bool          `json:"synced,omitempty"`
++	NeedsAuth   bool           `json:"needs_auth,omitempty"`
+ }
+ 
+ // ThemeInfo carries the active theme name and its resolved hex colors.
+@@ -65,10 +96,27 @@ type PluginDispatcher interface {
+ }
+ 
+ // TrackInfo is the track metadata in a status response.
++//
++// Title/Artist/Path 以外は GUI 拡張 (gui.go)。NewTrackInfo と ToTrack で
++// playlist.Track と失わずに往復する。Queued と PlayedAt は応答だけに付く。
+ type TrackInfo struct {
+ 	Title  string `json:"title,omitempty"`
+ 	Artist string `json:"artist,omitempty"`
+ 	Path   string `json:"path"`
++
++	Album       string            `json:"album,omitempty"`
++	Genre       string            `json:"genre,omitempty"`
++	Year        int               `json:"year,omitempty"`
++	TrackNumber int               `json:"track_number,omitempty"`
++	Duration    int               `json:"duration,omitempty"`
++	Stream      bool              `json:"stream,omitempty"`
++	Live        bool              `json:"live,omitempty"`
++	Feed        bool              `json:"feed,omitempty"`
++	Unplayable  bool              `json:"unplayable,omitempty"`
++	Bookmark    bool              `json:"bookmark,omitempty"`
++	Meta        map[string]string `json:"meta,omitempty"`
++	Queued      int               `json:"queued,omitempty"`
++	PlayedAt    string            `json:"played_at,omitempty"`
+ }
+ 
+ // DispatcherFunc adapts a plain function to the Dispatcher interface.
+diff --git a/ipc/server.go b/ipc/server.go
+index e1c1f41..2387969 100644
+--- a/ipc/server.go
++++ b/ipc/server.go
+@@ -3,6 +3,7 @@ package ipc
+ import (
+ 	"bufio"
+ 	"encoding/json"
++	"errors"
+ 	"fmt"
+ 	"net"
+ 	"os"
+@@ -30,7 +31,12 @@ type Server struct {
+ 	disp     Dispatcher
+ 	plugins  PluginDispatcher
+ 	done     chan struct{}
+-	wg       sync.WaitGroup
++
++	// GUI 拡張 (gui.go)
++	catalog   Catalog
++	eqPresets []string
++
++	wg sync.WaitGroup
+ }
+ 
+ // SetPluginDispatcher wires in the Lua plugin manager after the server starts.
+@@ -119,6 +125,8 @@ func (s *Server) handleConn(conn net.Conn) {
+ 	defer conn.Close()
+ 
+ 	scanner := bufio.NewScanner(conn)
++	// GUI の replace は曲の一覧を 1 行で送るので、既定の 64 KiB では足りない。
++	scanner.Buffer(make([]byte, 0, 64*1024), MaxRequestBytes)
+ 
+ 	for {
+ 		// Per-request deadline so long-lived streaming clients (e.g. vis bands
+@@ -126,6 +134,11 @@ func (s *Server) handleConn(conn net.Conn) {
+ 		// time out.
+ 		conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+ 		if !scanner.Scan() {
++			if errors.Is(scanner.Err(), bufio.ErrTooLong) {
++				// 黙って切ると GUI には理由が分からないので、一言返してから閉じる。
++				conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
++				writeResponse(conn, Response{OK: false, Error: "request too large"})
++			}
+ 			return
+ 		}
+ 		line := scanner.Bytes()
+@@ -303,6 +316,9 @@ func (s *Server) dispatch(req Request) Response {
+ 		return Response{OK: true, Items: s.plugins.CommandList()}
+ 
+ 	default:
++		if resp, ok := s.dispatchGUI(req); ok {
++			return resp
++		}
+ 		return Response{OK: false, Error: "unknown command: " + req.Cmd}
+ 	}
+ }
+diff --git a/main.go b/main.go
+index daeb523..f97f6fe 100644
+--- a/main.go
++++ b/main.go
+@@ -246,7 +246,7 @@ func run(overrides config.Overrides, positional []string, daemon bool) error {
+ 	ui.SetPadding(cfg.PaddingH, cfg.PaddingV)
+ 
+ 	if daemon {
+-		return runDaemon(p, pl, localProv, cfg.AutoPlay)
++		return runDaemon(p, pl, localProv, cfg.AutoPlay, newGUICatalog(providers, localProv))
+ 	}
+ 
+ 	themes := theme.LoadAll()
+@@ -375,6 +375,7 @@ func run(overrides config.Overrides, positional []string, daemon bool) error {
+ 		if luaMgr != nil {
+ 			ipcSrv.SetPluginDispatcher(luaMgr)
+ 		}
++		installGUIIPC(ipcSrv, newGUICatalog(providers, localProv))
+ 	}
+ 
+ 	finalModel, err := mediactl.Run(prog, svc)
+diff --git a/playlist/gui.go b/playlist/gui.go
+new file mode 100644
+index 0000000..3de0b2b
+--- /dev/null
++++ b/playlist/gui.go
+@@ -0,0 +1,86 @@
++package playlist
++
++import "slices"
++
++// gui.go — GUI 向け拡張 IPC (ipc/gui.go) が使う読み取りと操作。
++//
++// Playlist には鍵が無いので、ここの関数も TUI では Update の goroutine、
++// daemon では d.mu を持った状態でだけ呼ぶこと。
++
++// Gen はリストの世代番号を返す。曲の追加・削除・並べ替え、待ち行列、
++// シャッフル、リピートが変わるたびに増える。再生位置が進んだだけでは
++// 増えない (位置は Index で分かるため)。
++func (p *Playlist) Gen() uint64 { return p.gen }
++
++// Epoch は Replace のたびに増える番号を返す。リストが丸ごと差し替わった
++// ことを、途中の追加や待ち行列の変化と区別して知るために使う。
++func (p *Playlist) Epoch() uint64 { return p.epoch }
++
++// QueueIndices は「次に再生」の待ち行列に入っている曲の添字を順に返す (写し)。
++func (p *Playlist) QueueIndices() []int { return slices.Clone(p.queue) }
++
++// Upcoming は、再生順でいまの曲の後に来る曲の添字を最大 n 個返す。
++// 待ち行列に入っている曲と再生できない曲は除く (待ち行列は QueueIndices で
++// 別に示すため)。リピートがすべてでシャッフルでないときは先頭へ回り込み、
++// いまの曲の手前で止める。シャッフル中の回り込みは次の混ぜ方がまだ
++// 決まっていないので含めない。1 曲リピートは見ない (「次へ」で進む先の
++// 並びを示すため)。
++func (p *Playlist) Upcoming(n int) []int {
++	if n <= 0 || len(p.order) == 0 {
++		return nil
++	}
++	queued := make(map[int]bool, len(p.queue))
++	for _, idx := range p.queue {
++		queued[idx] = true
++	}
++	var out []int
++	add := func(slot int) bool {
++		idx := p.order[slot]
++		if queued[idx] || !p.isPlayable(idx) {
++			return true
++		}
++		out = append(out, idx)
++		return len(out) < n
++	}
++	for slot := p.pos + 1; slot < len(p.order); slot++ {
++		if !add(slot) {
++			return out
++		}
++	}
++	if p.repeat == RepeatAll && !p.shuffle {
++		for slot := 0; slot < p.pos && slot < len(p.order); slot++ {
++			if !add(slot) {
++				return out
++			}
++		}
++	}
++	return out
++}
++
++// StartAt は添字 i の曲を選び、シャッフル中なら i を先頭にして残りを混ぜ直す。
++// Replace の直後に呼ぶと「この曲から再生し、残りはシャッフル」になる
++// (SetIndex だけでは i より前に混ざった曲が再生済み扱いになり、一周するまで
++// 出てこない)。
++func (p *Playlist) StartAt(i int) {
++	p.SetIndex(i)
++	if p.shuffle && len(p.order) > 0 {
++		p.doShuffle()
++		p.gen++
++	}
++}
++
++// MoveQueueTo は待ち行列の位置 from の曲を位置 to へ動かす (間の曲は詰める)。
++// MoveQueue は 2 つの位置の入れ替えなので、ドラッグでの移動にはこちらを使う。
++func (p *Playlist) MoveQueueTo(from, to int) bool {
++	if from < 0 || from >= len(p.queue) || to < 0 || to >= len(p.queue) {
++		return false
++	}
++	if from == to {
++		return true
++	}
++	idx := p.queue[from]
++	p.queue = slices.Delete(p.queue, from, from+1)
++	p.queue = slices.Insert(p.queue, to, idx)
++	p.gen++
++	return true
++}
+diff --git a/playlist/gui_test.go b/playlist/gui_test.go
+new file mode 100644
+index 0000000..ddec197
+--- /dev/null
++++ b/playlist/gui_test.go
+@@ -0,0 +1,234 @@
++package playlist
++
++import (
++	"slices"
++	"testing"
++)
++
++func guiTestTracks(n int) []Track {
++	out := make([]Track, n)
++	for i := range out {
++		out[i] = Track{Path: string(rune('a'+i)) + ".mp3", Title: string(rune('A' + i))}
++	}
++	return out
++}
++
++func TestGenIncrementsOnListChanges(t *testing.T) {
++	tests := []struct {
++		name   string
++		mutate func(p *Playlist)
++	}{
++		{"Replace", func(p *Playlist) { p.Replace(guiTestTracks(2)) }},
++		{"Add", func(p *Playlist) { p.Add(Track{Path: "x.mp3"}) }},
++		{"Remove", func(p *Playlist) { p.Remove(1) }},
++		{"Move", func(p *Playlist) { p.Move(0, 2) }},
++		{"SetTrack", func(p *Playlist) { p.SetTrack(0, Track{Path: "y.mp3"}) }},
++		{"ToggleBookmark", func(p *Playlist) { p.ToggleBookmark(0) }},
++		{"Queue", func(p *Playlist) { p.Queue(2) }},
++		{"ToggleShuffle", func(p *Playlist) { p.ToggleShuffle() }},
++		{"SetRepeat", func(p *Playlist) { p.SetRepeat(RepeatAll) }},
++		{"CycleRepeat", func(p *Playlist) { p.CycleRepeat() }},
++		{"StartAtShuffled", func(p *Playlist) { p.shuffle = true; p.StartAt(2) }},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			p := New()
++			p.Replace(guiTestTracks(4))
++			before := p.Gen()
++			tt.mutate(p)
++			if p.Gen() <= before {
++				t.Fatalf("Gen() = %d after %s, want > %d", p.Gen(), tt.name, before)
++			}
++		})
++	}
++}
++
++func TestGenIncrementsOnQueueChanges(t *testing.T) {
++	p := New()
++	p.Replace(guiTestTracks(4))
++	p.Queue(1)
++	p.Queue(2)
++	p.Queue(3)
++
++	steps := []struct {
++		name   string
++		mutate func()
++	}{
++		{"MoveQueue", func() { p.MoveQueue(0, 1) }},
++		{"MoveQueueTo", func() { p.MoveQueueTo(0, 2) }},
++		{"Dequeue", func() { p.Dequeue(3) }},
++		{"RemoveQueueAt", func() { p.RemoveQueueAt(0) }},
++		{"Next consumes queue", func() { p.Next() }},
++		{"ClearQueue", func() { p.Queue(0); p.ClearQueue() }},
++	}
++	for _, s := range steps {
++		before := p.Gen()
++		s.mutate()
++		if p.Gen() <= before {
++			t.Fatalf("Gen() did not increase after %s", s.name)
++		}
++	}
++}
++
++func TestGenUnchangedByNavigation(t *testing.T) {
++	p := New()
++	p.Replace(guiTestTracks(4))
++	before := p.Gen()
++
++	p.Next()
++	p.Next()
++	p.Prev()
++	p.SetIndex(3)
++	p.ActivateSelected()
++	p.PeekNext()
++	p.SetRepeat(RepeatOff) // 同じ値への設定は変化ではない
++	p.ClearQueue()         // 空の待ち行列を空にしても変化ではない
++	p.Dequeue(1)           // 入っていない曲
++	p.Remove(9)            // 範囲外
++	_ = p.QueueIndices()
++	_ = p.Upcoming(10)
++
++	if p.Gen() != before {
++		t.Fatalf("Gen() = %d, want unchanged %d", p.Gen(), before)
++	}
++}
++
++func TestEpochOnlyChangesOnReplace(t *testing.T) {
++	p := New()
++	if p.Epoch() != 0 {
++		t.Fatalf("Epoch() = %d on a new playlist, want 0", p.Epoch())
++	}
++	p.Add(guiTestTracks(3)...)
++	p.Queue(1)
++	p.ToggleShuffle()
++	if p.Epoch() != 0 {
++		t.Fatalf("Epoch() = %d after Add/Queue/Shuffle, want 0", p.Epoch())
++	}
++	p.Replace(guiTestTracks(2))
++	if p.Epoch() != 1 {
++		t.Fatalf("Epoch() = %d after Replace, want 1", p.Epoch())
++	}
++}
++
++func TestQueueIndicesIsACopy(t *testing.T) {
++	p := New()
++	p.Replace(guiTestTracks(3))
++	p.Queue(2)
++	p.Queue(0)
++	got := p.QueueIndices()
++	if !slices.Equal(got, []int{2, 0}) {
++		t.Fatalf("QueueIndices() = %v, want [2 0]", got)
++	}
++	got[0] = 99
++	if p.QueuePosition(2) != 1 {
++		t.Fatal("modifying QueueIndices() result changed the playlist")
++	}
++}
++
++func TestUpcomingSequential(t *testing.T) {
++	p := New()
++	p.Replace(guiTestTracks(5))
++	p.SetIndex(1)
++	if got := p.Upcoming(10); !slices.Equal(got, []int{2, 3, 4}) {
++		t.Fatalf("Upcoming = %v, want [2 3 4]", got)
++	}
++	if got := p.Upcoming(2); !slices.Equal(got, []int{2, 3}) {
++		t.Fatalf("Upcoming(2) = %v, want [2 3]", got)
++	}
++	if got := p.Upcoming(0); got != nil {
++		t.Fatalf("Upcoming(0) = %v, want nil", got)
++	}
++}
++
++func TestUpcomingExcludesQueuedAndUnplayable(t *testing.T) {
++	tracks := guiTestTracks(5)
++	tracks[3].Unplayable = true
++	p := New()
++	p.Replace(tracks)
++	p.Queue(2)
++	if got := p.Upcoming(10); !slices.Equal(got, []int{1, 4}) {
++		t.Fatalf("Upcoming = %v, want [1 4]", got)
++	}
++}
++
++func TestUpcomingWrapsWithRepeatAll(t *testing.T) {
++	p := New()
++	p.Replace(guiTestTracks(4))
++	p.SetIndex(2)
++	p.SetRepeat(RepeatAll)
++	if got := p.Upcoming(10); !slices.Equal(got, []int{3, 0, 1}) {
++		t.Fatalf("Upcoming = %v, want [3 0 1]", got)
++	}
++	// シャッフル中は回り込み先が決まっていないので出さない。
++	p.ToggleShuffle()
++	if got := p.Upcoming(10); len(got) != 3 || got[0] == 2 {
++		t.Fatalf("Upcoming (shuffle) = %v, want the 3 other tracks", got)
++	}
++}
++
++func TestUpcomingEmpty(t *testing.T) {
++	if got := New().Upcoming(5); got != nil {
++		t.Fatalf("Upcoming on empty playlist = %v, want nil", got)
++	}
++}
++
++func TestStartAtWithShuffleKeepsChosenTrackFirst(t *testing.T) {
++	for range 20 {
++		p := New()
++		p.ToggleShuffle()
++		p.Replace(guiTestTracks(8))
++		p.StartAt(5)
++		if cur, idx := p.Current(); idx != 5 || cur.Title != "F" {
++			t.Fatalf("Current() = (%q,%d), want (F,5)", cur.Title, idx)
++		}
++		rest := p.Upcoming(100)
++		if len(rest) != 7 || slices.Contains(rest, 5) {
++			t.Fatalf("Upcoming = %v, want the 7 other tracks", rest)
++		}
++		sorted := slices.Sorted(slices.Values(rest))
++		if !slices.Equal(sorted, []int{0, 1, 2, 3, 4, 6, 7}) {
++			t.Fatalf("Upcoming = %v, want each other track exactly once", rest)
++		}
++	}
++}
++
++func TestStartAtWithoutShuffle(t *testing.T) {
++	p := New()
++	p.Replace(guiTestTracks(4))
++	p.StartAt(2)
++	if _, idx := p.Current(); idx != 2 {
++		t.Fatalf("Current index = %d, want 2", idx)
++	}
++	if got := p.Upcoming(10); !slices.Equal(got, []int{3}) {
++		t.Fatalf("Upcoming = %v, want [3]", got)
++	}
++}
++
++func TestMoveQueueTo(t *testing.T) {
++	p := New()
++	p.Replace(guiTestTracks(5))
++	for _, i := range []int{0, 1, 2, 3} {
++		p.Queue(i)
++	}
++	if !p.MoveQueueTo(0, 3) {
++		t.Fatal("MoveQueueTo(0,3) = false")
++	}
++	if got := p.QueueIndices(); !slices.Equal(got, []int{1, 2, 3, 0}) {
++		t.Fatalf("queue = %v, want [1 2 3 0]", got)
++	}
++	if !p.MoveQueueTo(3, 1) {
++		t.Fatal("MoveQueueTo(3,1) = false")
++	}
++	if got := p.QueueIndices(); !slices.Equal(got, []int{1, 0, 2, 3}) {
++		t.Fatalf("queue = %v, want [1 0 2 3]", got)
++	}
++	before := p.Gen()
++	if !p.MoveQueueTo(2, 2) || p.Gen() != before {
++		t.Fatal("MoveQueueTo(2,2) should succeed without a change")
++	}
++	for _, c := range [][2]int{{-1, 0}, {0, 4}, {4, 0}} {
++		if p.MoveQueueTo(c[0], c[1]) {
++			t.Fatalf("MoveQueueTo(%d,%d) = true, want false", c[0], c[1])
++		}
++	}
++}
+diff --git a/playlist/playlist.go b/playlist/playlist.go
+index 57357b1..99bbca7 100644
+--- a/playlist/playlist.go
++++ b/playlist/playlist.go
+@@ -304,6 +304,11 @@ type Playlist struct {
+ 	repeat    RepeatMode
+ 	queue     []int // track indices queued to play next
+ 	queuedIdx int   // track index currently playing from queue, -1 if none
++
++	// GUI 拡張 IPC 用 (gui.go)。gen は曲・順番・待ち行列・リピートが変わる
++	// たびに、epoch は Replace のたびに増える。外から差分の有無を安く知るため。
++	gen   uint64
++	epoch uint64
+ }
+ 
+ // New creates an empty Playlist.
+@@ -314,6 +319,8 @@ func New() *Playlist {
+ // Replace clears the playlist and loads the given tracks, resetting
+ // position, queue, and shuffle order.
+ func (p *Playlist) Replace(tracks []Track) {
++	p.gen++
++	p.epoch++
+ 	p.tracks = tracks
+ 	p.order = make([]int, len(tracks))
+ 	for i := range tracks {
+@@ -331,6 +338,9 @@ func (p *Playlist) Replace(tracks []Track) {
+ func (p *Playlist) Add(tracks ...Track) {
+ 	start := len(p.tracks)
+ 	p.tracks = append(p.tracks, tracks...)
++	if len(tracks) > 0 {
++		p.gen++
++	}
+ 	for i := start; i < len(p.tracks); i++ {
+ 		p.order = append(p.order, i)
+ 	}
+@@ -423,6 +433,7 @@ func (p *Playlist) nextShuffleWrap() (orderPos int, trackIdx int, ok bool) {
+ 	origOrder := slices.Clone(p.order)
+ 	origPos := p.pos
+ 	p.doShuffle()
++	p.gen++
+ 	if orderPos, trackIdx, ok = p.firstPlayableOrderSlot(1, len(p.order)); ok {
+ 		return orderPos, trackIdx, true
+ 	}
+@@ -523,10 +534,12 @@ func (p *Playlist) Next() (Track, bool) {
+ 	if idx, remaining, ok := p.nextPlayableQueued(); ok {
+ 		p.queue = remaining
+ 		p.queuedIdx = idx
++		p.gen++
+ 		return p.tracks[idx], true
+ 	}
+ 	if len(p.queue) > 0 {
+ 		p.queue = nil
++		p.gen++
+ 	}
+ 	if p.repeat == RepeatOne {
+ 		idx := p.currentOrderTrackIndex()
+@@ -619,6 +632,7 @@ func (p *Playlist) SetIndex(i int) {
+ func (p *Playlist) Queue(trackIdx int) {
+ 	if trackIdx >= 0 && trackIdx < len(p.tracks) {
+ 		p.queue = append(p.queue, trackIdx)
++		p.gen++
+ 	}
+ }
+ 
+@@ -627,6 +641,7 @@ func (p *Playlist) Dequeue(trackIdx int) bool {
+ 	for i, idx := range p.queue {
+ 		if idx == trackIdx {
+ 			p.queue = slices.Delete(p.queue, i, i+1)
++			p.gen++
+ 			return true
+ 		}
+ 	}
+@@ -657,12 +672,18 @@ func (p *Playlist) QueueTracks() []Track {
+ }
+ 
+ // ClearQueue removes all entries from the play-next queue.
+-func (p *Playlist) ClearQueue() { p.queue = nil }
++func (p *Playlist) ClearQueue() {
++	if len(p.queue) > 0 {
++		p.gen++
++	}
++	p.queue = nil
++}
+ 
+ // RemoveQueueAt removes the entry at the given 0-based queue position.
+ func (p *Playlist) RemoveQueueAt(pos int) {
+ 	if pos >= 0 && pos < len(p.queue) {
+ 		p.queue = slices.Delete(p.queue, pos, pos+1)
++		p.gen++
+ 	}
+ }
+ 
+@@ -672,6 +693,7 @@ func (p *Playlist) MoveQueue(from, to int) bool {
+ 		return false
+ 	}
+ 	p.queue[from], p.queue[to] = p.queue[to], p.queue[from]
++	p.gen++
+ 	return true
+ }
+ 
+@@ -685,6 +707,7 @@ func (p *Playlist) Move(from, to int) bool {
+ 
+ 	// Swap in the tracks array (visual order).
+ 	p.tracks[from], p.tracks[to] = p.tracks[to], p.tracks[from]
++	p.gen++
+ 
+ 	// Update order: swap all references so they point at the moved tracks.
+ 	for i, idx := range p.order {
+@@ -732,6 +755,7 @@ func (p *Playlist) Remove(idx int) bool {
+ 	}
+ 
+ 	p.tracks = slices.Delete(p.tracks, idx, idx+1)
++	p.gen++
+ 
+ 	removedOrderPos := -1
+ 	newOrder := p.order[:0]
+@@ -783,6 +807,7 @@ func (p *Playlist) Remove(idx int) bool {
+ func (p *Playlist) SetTrack(i int, t Track) {
+ 	if i >= 0 && i < len(p.tracks) {
+ 		p.tracks[i] = t
++		p.gen++
+ 	}
+ }
+ 
+@@ -793,6 +818,7 @@ func (p *Playlist) Tracks() []Track { return p.tracks }
+ func (p *Playlist) ToggleBookmark(idx int) {
+ 	if idx >= 0 && idx < len(p.tracks) {
+ 		p.tracks[idx].Bookmark = !p.tracks[idx].Bookmark
++		p.gen++
+ 	}
+ }
+ 
+@@ -811,6 +837,7 @@ func (p *Playlist) BookmarkCount() int {
+ // Uses Fisher-Yates shuffle, preserving the current track at position 0.
+ func (p *Playlist) ToggleShuffle() {
+ 	p.shuffle = !p.shuffle
++	p.gen++
+ 	if len(p.tracks) == 0 {
+ 		return
+ 	}
+@@ -847,10 +874,14 @@ func (p *Playlist) doShuffle() {
+ // CycleRepeat cycles through Off -> All -> One.
+ func (p *Playlist) CycleRepeat() {
+ 	p.repeat = (p.repeat + 1) % 3
++	p.gen++
+ }
+ 
+ // SetRepeat sets the repeat mode directly.
+ func (p *Playlist) SetRepeat(mode RepeatMode) {
++	if p.repeat != mode {
++		p.gen++
++	}
+ 	p.repeat = mode
+ }
+ 
+diff --git a/ui/model/ipc_gui.go b/ui/model/ipc_gui.go
+new file mode 100644
+index 0000000..4fc1cf9
+--- /dev/null
++++ b/ui/model/ipc_gui.go
+@@ -0,0 +1,355 @@
++package model
++
++// ipc_gui.go — GUI 向け拡張 IPC (ipc/gui.go) の状態系コマンドを TUI で処理する。
++//
++// どの処理も Update の goroutine で走るので、I/O はしない (再生の開始は既存の
++// playTrack と同じく tea.Cmd に回る)。答えは ipc.SendReply で必ず 1 回返す。
++// TUI の画面 (オーバーレイやフォーカス) は動かさない。Open-Voice が tmux で
++// キーを打ち込んでいるため、見えない所で画面が変わるとキーが別の所へ落ちる。
++
++import (
++	"fmt"
++
++	tea "charm.land/bubbletea/v2"
++
++	"cliamp/ipc"
++	"cliamp/playlist"
++)
++
++// EQPresetNames は組み込み EQ プリセットの名前を表示順に返す
++// (IPC の capabilities 用)。
++func EQPresetNames() []string {
++	names := make([]string, len(eqPresets))
++	for i, p := range eqPresets {
++		names[i] = p.Name
++	}
++	return names
++}
++
++// ResolveWrapperURLs はラジオの .m3u / .pls の中継 URL を実体の URL へ展開する。
++// TUI がプロバイダーのリストを読むときと同じ処理を IPC のカタログからも使う。
++// ネットワークを待つので Update の中では呼ばないこと。
++func ResolveWrapperURLs(tracks []playlist.Track) []playlist.Track {
++	return resolveWrapperURLs(tracks)
++}
++
++// handleGUIIPC は拡張 IPC のメッセージを処理する。知らないメッセージなら ok=false。
++func (m *Model) handleGUIIPC(msg tea.Msg) (tea.Cmd, bool) {
++	switch msg := msg.(type) {
++	case ipc.PlaylistRequestMsg:
++		resp := ipc.PlaylistSnapshot(m.playlist, msg.Limit)
++		resp.Source = m.listSource()
++		ipc.SendReply(msg.Reply, resp)
++		return nil, true
++	case ipc.PlayIndexMsg:
++		return m.guiPlayIndex(msg), true
++	case ipc.ReplaceMsg:
++		return m.guiReplace(msg), true
++	case ipc.EnqueueMsg:
++		return m.guiEnqueue(msg), true
++	case ipc.QueueEditMsg:
++		return m.guiQueueEdit(msg), true
++	case ipc.RemoveMsg:
++		return m.guiRemove(msg), true
++	}
++	return nil, false
++}
++
++// extendStatus は status の応答に拡張のフィールドを足す (既存のフィールドは
++// 平文の `cliamp status` がそのまま使うので、意味を変えない)。
++func (m *Model) extendStatus(resp *ipc.Response) {
++	resp.API = ipc.APIVersion
++	if cur, idx := m.playlist.Current(); idx >= 0 && cur.Path != "" {
++		ti := ipc.NewTrackInfo(cur)
++		resp.Track = &ti
++	}
++	// yt-dlp のシーク待ちの間は、TUI のつまみと同じくシーク先を返す
++	// (待ちの間の生の位置は古い値のままで、GUI のつまみが跳ね戻るため)。
++	if m.seek.active {
++		resp.Position = m.seek.targetPos.Seconds()
++	}
++	bands := m.player.EQBands()
++	resp.EQ = bands[:]
++	resp.Gen = m.playlist.Gen()
++	resp.Source = m.listSource()
++	resp.StreamTitle = m.streamTitle
++	buffering := m.buffering || m.feedLoading
++	resp.Buffering = &buffering
++}
++
++// setListSource はいまのリストの出どころを覚える。リストが別の経路で
++// 差し替わったら (playlist の Epoch が変わったら) 自然に無効になる。
++func (m *Model) setListSource(src ipc.SourceInfo) {
++	m.guiSource = src
++	m.guiSourceEpoch = m.playlist.Epoch()
++}
++
++// setLocalListSource はローカルのプレイリスト name を出どころとして覚える。
++func (m *Model) setLocalListSource(name string) {
++	m.setListSource(ipc.SourceInfo{Provider: "local", ID: name, Name: name})
++}
++
++// setProviderListSource は TUI のプロバイダー欄から読み込んだリストの出どころを覚える。
++func (m *Model) setProviderListSource() {
++	key := m.providerKey(m.provider)
++	id := m.activeProviderPlaylistID
++	if key == "" || id == "" {
++		m.setListSource(ipc.SourceInfo{})
++		return
++	}
++	src := ipc.SourceInfo{Provider: key, ID: id}
++	for _, pl := range m.providerLists {
++		if pl.ID == id {
++			src.Name = pl.Name
++			break
++		}
++	}
++	m.setListSource(src)
++}
++
++func (m *Model) listSource() *ipc.SourceInfo {
++	if m.guiSourceEpoch != m.playlist.Epoch() || m.guiSource == (ipc.SourceInfo{}) {
++		return nil
++	}
++	src := m.guiSource
++	return &src
++}
++
++// providerKey は登録されたプロバイダーの設定キー ("spotify" など) を返す。
++func (m *Model) providerKey(p playlist.Provider) string {
++	if p == nil {
++		return ""
++	}
++	for _, e := range m.providers {
++		if e.Provider == p {
++			return e.Key
++		}
++	}
++	return ""
++}
++
++// peekNextPath は次に鳴る曲の path を返す。先読みのやり直しが要るかの判定用。
++func (m *Model) peekNextPath() (string, bool) {
++	t, ok := m.playlist.PeekNext()
++	return t.Path, ok
++}
++
++// repreloadIfNextChanged は、リストや待ち行列の変更で次に鳴る曲が変わったとき
++// だけ gapless の先読みを捨てて取り直す。捨てないと、先読みした古い曲が鳴るのに
++// 表示は新しい曲へ進んでしまう。
++func (m *Model) repreloadIfNextChanged(beforePath string, beforeOK bool) tea.Cmd {
++	after, ok := m.peekNextPath()
++	if after == beforePath && ok == beforeOK {
++		return nil
++	}
++	m.player.ClearPreload()
++	if !m.player.IsPlaying() || m.buffering {
++		return nil
++	}
++	return m.preloadNext()
++}
++
++// refreshPlaylistViews は曲の添字が変わったあと、TUI 側で添字を握っている
++// 表示を合わせる。開いている検索欄の結果は添字の一覧なので、作り直さないと
++// 描画で範囲外を引いて落ちる。画面やフォーカスは変えない。
++func (m *Model) refreshPlaylistViews() {
++	if n := m.playlist.Len(); m.plCursor >= n {
++		m.plCursor = max(n-1, 0)
++	}
++	if m.search.active {
++		m.updateSearch()
++	}
++	if q := m.playlist.QueueLen(); m.queue.cursor >= q {
++		m.queue.cursor = max(q-1, 0)
++	}
++	m.adjustScroll()
++}
++
++// guiPlayIndex は TUI の「行で Enter」と同じ (keys.go の enter)。
++func (m *Model) guiPlayIndex(msg ipc.PlayIndexMsg) tea.Cmd {
++	if msg.Index < 0 || msg.Index >= m.playlist.Len() {
++		ipc.SendReply(msg.Reply, ipc.Response{OK: false, Error: "index out of range"})
++		return nil
++	}
++	if m.buffering && msg.Index == m.playlist.Index() {
++		// その曲をいま読み込んでいる。Enter と同じく何もしない。
++		ipc.SendReply(msg.Reply, ipc.Response{OK: true})
++		return nil
++	}
++	m.scrobbleCurrent()
++	m.playlist.SetIndex(msg.Index)
++	cmd := m.playCurrentTrack()
++	m.notifyPlayback()
++	ipc.SendReply(msg.Reply, ipc.Response{OK: true})
++	return cmd
++}
++
++// guiReplace はリストを差し替えて Index の曲から再生する。プレイリスト管理の
++// plMgrLoadAndPlay と同じ順 (Stop・ClearPreload を先に。残った先読みが新しい
++// リストで GaplessAdvanced を起こさないように)。画面は切り替えない。
++func (m *Model) guiReplace(msg ipc.ReplaceMsg) tea.Cmd {
++	if len(msg.Tracks) == 0 || msg.Index < 0 || msg.Index >= len(msg.Tracks) {
++		ipc.SendReply(msg.Reply, ipc.Response{OK: false, Error: "index out of range"})
++		return nil
++	}
++	m.scrobbleCurrent()
++	m.player.Stop()
++	m.player.ClearPreload()
++	m.resetYTDLBatch()
++	m.playlist.Replace(msg.Tracks)
++	m.playlist.StartAt(msg.Index)
++	m.setInitialHeaderState(msg.Tracks)
++	m.setListSource(msg.Source)
++
++	// ブックマークの書き込み先と、プロバイダー欄の強調を合わせる。
++	m.loadedPlaylist = ""
++	if msg.Source.Provider == "local" {
++		m.loadedPlaylist = msg.Source.ID
++	}
++	m.activeProviderPlaylistID = ""
++	if msg.Source.Provider != "" && msg.Source.Provider == m.providerKey(m.provider) {
++		m.activeProviderPlaylistID = msg.Source.ID
++	}
++
++	m.plCursor = msg.Index
++	m.refreshPlaylistViews()
++	m.status.Showf(statusTTLDefault, "Loaded %d track(s)", len(msg.Tracks))
++	cmd := m.playCurrentTrack()
++	// YouTube のミックス (list=RD…) は最初の 20 曲だけなので、TUI で URL を
++	// 開いたときと同じく残りを裏で読み足す。
++	if msg.Source.Provider == "url" && msg.Source.ID != "" {
++		if batch := m.initYTDLBatch([]string{msg.Source.ID}); batch != nil {
++			cmd = tea.Batch(cmd, batch)
++		}
++	}
++	m.notifyAll()
++	ipc.SendReply(msg.Reply, ipc.Response{OK: true, Total: m.playlist.Len(), Gen: m.playlist.Gen()})
++	return cmd
++}
++
++// guiEnqueue は曲を足す。next は TUI の検索結果での q (queueTrackNext)、end は
++// a (appendTrack)、now は Enter (playTrackImmediate) にあたる。複数曲をまとめて
++// 扱うため、既存の 1 曲用の関数を繰り返し呼ばずに同じ手順を書いている
++// (繰り返すと、読み込み中に 2 曲目がまた再生を始めてしまう)。
++func (m *Model) guiEnqueue(msg ipc.EnqueueMsg) tea.Cmd {
++	if len(msg.Tracks) == 0 {
++		ipc.SendReply(msg.Reply, ipc.Response{OK: false, Error: "enqueue requires tracks"})
++		return nil
++	}
++	idle := !m.player.IsPlaying() && !m.buffering
++	beforePath, beforeOK := m.peekNextPath()
++	start := m.playlist.Len()
++	m.playlist.Add(msg.Tracks...)
++	first := msg.Tracks[0]
++	mode := msg.Mode
++	if mode == "next" && start == 0 {
++		// 空のリストに「次に再生」: 待ち行列に入れると、待ち行列で 1 度、
++		// リストの順でもう 1 度鳴る。末尾に足して先頭から鳴らすのと同じにする。
++		mode = "end"
++	}
++
++	var cmd tea.Cmd
++	switch mode {
++	case "now":
++		m.scrobbleCurrent()
++		m.player.Stop()
++		m.player.ClearPreload()
++		// 2 曲目以降は、シャッフルでなければ再生順でそのまま 1 曲目に続く。
++		// 待ち行列にも入れると 2 度鳴るので、混ざるシャッフルのときだけ入れる。
++		if m.playlist.Shuffled() {
++			for i := 1; i < len(msg.Tracks); i++ {
++				m.playlist.Queue(start + i)
++			}
++		}
++		m.playlist.SetIndex(start)
++		m.plCursor = start
++		m.status.Showf(statusTTLMedium, "Playing: %s", first.DisplayName())
++		cmd = m.playCurrentTrack()
++		m.notifyPlayback()
++	case "end":
++		m.status.Showf(statusTTLMedium, "Added: %s", first.DisplayName())
++		if idle {
++			m.playlist.SetIndex(start)
++			m.plCursor = start
++			cmd = m.playCurrentTrack()
++			m.notifyPlayback()
++		} else {
++			cmd = m.repreloadIfNextChanged(beforePath, beforeOK)
++		}
++	default: // "next"
++		for i := range msg.Tracks {
++			m.playlist.Queue(start + i)
++		}
++		m.status.Showf(statusTTLMedium, "Queued: %s", first.DisplayName())
++		if idle {
++			cmd = m.nextTrack()
++			m.notifyPlayback()
++		} else {
++			cmd = m.repreloadIfNextChanged(beforePath, beforeOK)
++		}
++	}
++	m.refreshPlaylistViews()
++	ipc.SendReply(msg.Reply, ipc.Response{OK: true, Total: m.playlist.Len(), Gen: m.playlist.Gen()})
++	return cmd
++}
++
++// guiQueueEdit は「次に再生」の待ち行列を編集する (TUI の a と A の画面にあたる)。
++func (m *Model) guiQueueEdit(msg ipc.QueueEditMsg) tea.Cmd {
++	beforePath, beforeOK := m.peekNextPath()
++	switch msg.Mode {
++	case "add":
++		if msg.Index < 0 || msg.Index >= m.playlist.Len() {
++			ipc.SendReply(msg.Reply, ipc.Response{OK: false, Error: "index out of range"})
++			return nil
++		}
++		if m.playlist.QueuePosition(msg.Index) == 0 {
++			m.playlist.Queue(msg.Index)
++		}
++	case "remove":
++		if msg.Index < 0 || msg.Index >= m.playlist.Len() {
++			ipc.SendReply(msg.Reply, ipc.Response{OK: false, Error: "index out of range"})
++			return nil
++		}
++		m.playlist.Dequeue(msg.Index)
++	case "move":
++		if !m.playlist.MoveQueueTo(msg.Index, msg.To) {
++			ipc.SendReply(msg.Reply, ipc.Response{OK: false, Error: "queue position out of range"})
++			return nil
++		}
++	case "clear":
++		m.playlist.ClearQueue()
++	default:
++		ipc.SendReply(msg.Reply, ipc.Response{OK: false, Error: fmt.Sprintf("queue_edit: unknown mode %q", msg.Mode)})
++		return nil
++	}
++	m.refreshPlaylistViews()
++	cmd := m.repreloadIfNextChanged(beforePath, beforeOK)
++	ipc.SendReply(msg.Reply, ipc.Response{OK: true, Queue: m.playlist.QueueIndices(), Gen: m.playlist.Gen()})
++	return cmd
++}
++
++// guiRemove はリストから 1 曲消す。再生中 (一時停止・読み込み中を含む) の曲は
++// 消さない。TUI の removeSelectedFromPlaylist は再生を止めてしまうが、GUI から
++// 誤って今の曲を消して音が途切れるのを避けるため。
++func (m *Model) guiRemove(msg ipc.RemoveMsg) tea.Cmd {
++	if msg.Index < 0 || msg.Index >= m.playlist.Len() {
++		ipc.SendReply(msg.Reply, ipc.Response{OK: false, Error: "index out of range"})
++		return nil
++	}
++	if msg.Index == m.playlist.Index() && (m.player.IsPlaying() || m.buffering) {
++		ipc.SendReply(msg.Reply, ipc.Response{OK: false, Error: "cannot remove the current track"})
++		return nil
++	}
++	beforePath, beforeOK := m.peekNextPath()
++	track := m.playlist.Tracks()[msg.Index]
++	m.playlist.Remove(msg.Index)
++	if m.plCursor > msg.Index {
++		m.plCursor--
++	}
++	m.refreshPlaylistViews()
++	m.status.Showf(statusTTLDefault, "Removed: %s", track.DisplayName())
++	cmd := m.repreloadIfNextChanged(beforePath, beforeOK)
++	m.notifyPlayback()
++	ipc.SendReply(msg.Reply, ipc.Response{OK: true, Total: m.playlist.Len(), Gen: m.playlist.Gen()})
++	return cmd
++}
+diff --git a/ui/model/ipc_gui_test.go b/ui/model/ipc_gui_test.go
+new file mode 100644
+index 0000000..588b768
+--- /dev/null
++++ b/ui/model/ipc_gui_test.go
+@@ -0,0 +1,470 @@
++package model
++
++import (
++	"slices"
++	"testing"
++	"time"
++
++	tea "charm.land/bubbletea/v2"
++
++	"cliamp/ipc"
++	"cliamp/playlist"
++	"cliamp/ui"
++)
++
++// guiFakeEngine は playbackFakeEngine に、止めた回数・先読みを捨てた回数・
++// EQ・位置を足したもの。
++type guiFakeEngine struct {
++	playbackFakeEngine
++	stops         int
++	clearPreloads int
++	eq            [10]float64
++	position      time.Duration
++}
++
++func (f *guiFakeEngine) Stop()                   { f.stops++; f.playing = false }
++func (f *guiFakeEngine) ClearPreload()           { f.clearPreloads++ }
++func (f *guiFakeEngine) EQBands() [10]float64    { return f.eq }
++func (f *guiFakeEngine) Position() time.Duration { return f.position }
++
++// guiFakeProvider は大きさのある構造体にしておく (大きさ 0 の値へのポインタは
++// 互いに等しくなりうるため、providerKey の比較の試験にならない)。
++type guiFakeProvider struct{ name string }
++
++func (p *guiFakeProvider) Name() string                                { return p.name }
++func (p *guiFakeProvider) Playlists() ([]playlist.PlaylistInfo, error) { return nil, nil }
++func (p *guiFakeProvider) Tracks(string) ([]playlist.Track, error)     { return nil, nil }
++
++func newGUITestTracks(names ...string) []playlist.Track {
++	out := make([]playlist.Track, len(names))
++	for i, n := range names {
++		out[i] = playlist.Track{Path: n + ".flac", Title: n}
++	}
++	return out
++}
++
++func newGUITestModel(tracks ...string) (Model, *guiFakeEngine) {
++	eng := &guiFakeEngine{}
++	pl := playlist.New()
++	if len(tracks) > 0 {
++		pl.Replace(newGUITestTracks(tracks...))
++	}
++	m := Model{
++		player:   eng,
++		playlist: pl,
++		vis:      ui.NewVisualizer(float64(eng.SampleRate())),
++		themeIdx: -1,
++	}
++	return m, eng
++}
++
++// sendGUI は msg を Update に通し、返った答えと新しいモデルを返す。
++func sendGUI(t *testing.T, m Model, build func(reply chan ipc.Response) tea.Msg) (Model, ipc.Response) {
++	t.Helper()
++	reply := make(chan ipc.Response, 1)
++	next, _ := m.Update(build(reply))
++	select {
++	case resp := <-reply:
++		return next.(Model), resp
++	default:
++		t.Fatal("no reply")
++	}
++	return Model{}, ipc.Response{}
++}
++
++func startPlaying(m *Model, idx int) {
++	m.playlist.SetIndex(idx)
++	m.playCurrentTrack()
++}
++
++func TestGUIPlayIndexPlaysRow(t *testing.T) {
++	m, eng := newGUITestModel("a", "b", "c")
++	startPlaying(&m, 0)
++
++	m, resp := sendGUI(t, m, func(r chan ipc.Response) tea.Msg { return ipc.PlayIndexMsg{Index: 2, Reply: r} })
++	if !resp.OK {
++		t.Fatalf("resp = %+v", resp)
++	}
++	if last := eng.playCalls[len(eng.playCalls)-1]; last != "c.flac" {
++		t.Fatalf("played %q, want c.flac", last)
++	}
++	if _, idx := m.playlist.Current(); idx != 2 || m.plCursor != 2 {
++		t.Fatalf("current=%d cursor=%d, want 2", idx, m.plCursor)
++	}
++
++	calls := len(eng.playCalls)
++	_, resp = sendGUI(t, m, func(r chan ipc.Response) tea.Msg { return ipc.PlayIndexMsg{Index: 3, Reply: r} })
++	if resp.OK || resp.Error != "index out of range" || len(eng.playCalls) != calls {
++		t.Fatalf("out of range: resp=%+v plays=%d", resp, len(eng.playCalls)-calls)
++	}
++}
++
++func TestGUIReplaceStartsAtIndexWithShuffle(t *testing.T) {
++	for range 10 {
++		m, eng := newGUITestModel("old1", "old2")
++		m.playlist.ToggleShuffle()
++		startPlaying(&m, 0)
++		stops, clears := eng.stops, eng.clearPreloads
++
++		tracks := newGUITestTracks("a", "b", "c", "d", "e", "f")
++		src := ipc.SourceInfo{Provider: "spotify", ID: "pl1", Name: "My list"}
++		m, resp := sendGUI(t, m, func(r chan ipc.Response) tea.Msg {
++			return ipc.ReplaceMsg{Tracks: tracks, Index: 4, Source: src, Reply: r}
++		})
++		if !resp.OK || resp.Total != 6 || resp.Gen != m.playlist.Gen() {
++			t.Fatalf("resp = %+v", resp)
++		}
++		if eng.stops <= stops || eng.clearPreloads <= clears {
++			t.Fatal("replace must Stop and ClearPreload before swapping the list")
++		}
++		if last := eng.playCalls[len(eng.playCalls)-1]; last != "e.flac" {
++			t.Fatalf("played %q, want e.flac", last)
++		}
++		if cur, idx := m.playlist.Current(); idx != 4 || cur.Title != "e" {
++			t.Fatalf("current = (%q,%d), want (e,4)", cur.Title, idx)
++		}
++		rest := slices.Sorted(slices.Values(m.playlist.Upcoming(100)))
++		if !slices.Equal(rest, []int{0, 1, 2, 3, 5}) {
++			t.Fatalf("up next = %v, want all other tracks once", rest)
++		}
++		if got := m.listSource(); got == nil || *got != src {
++			t.Fatalf("source = %v, want %v", got, src)
++		}
++		if m.loadedPlaylist != "" {
++			t.Fatalf("loadedPlaylist = %q, want empty for a non-local source", m.loadedPlaylist)
++		}
++	}
++}
++
++func TestGUIReplaceLocalSourceSetsLoadedPlaylist(t *testing.T) {
++	m, _ := newGUITestModel()
++	m, resp := sendGUI(t, m, func(r chan ipc.Response) tea.Msg {
++		return ipc.ReplaceMsg{Tracks: newGUITestTracks("a"), Source: ipc.SourceInfo{Provider: "local", ID: "朝", Name: "朝"}, Reply: r}
++	})
++	if !resp.OK || m.loadedPlaylist != "朝" {
++		t.Fatalf("resp=%+v loadedPlaylist=%q", resp, m.loadedPlaylist)
++	}
++}
++
++func TestGUIReplaceKeepsScreenAndRefreshesSearch(t *testing.T) {
++	m, _ := newGUITestModel("a1", "a2", "a3", "a4", "a5")
++	m.provider = &guiFakeProvider{name: "Radio"} // プロバイダー欄の見出しの描画に要る
++	m.focus = focusProvider
++	m.search = searchState{active: true, query: "a", results: []int{0, 1, 2, 3, 4}, cursor: 4}
++	m.plCursor = 4
++	screen := m.activeScreen()
++
++	m, resp := sendGUI(t, m, func(r chan ipc.Response) tea.Msg {
++		return ipc.ReplaceMsg{Tracks: newGUITestTracks("b", "ab"), Reply: r}
++	})
++	if !resp.OK {
++		t.Fatalf("resp = %+v", resp)
++	}
++	if m.focus != focusProvider || m.activeScreen() != screen || !m.search.active {
++		t.Fatalf("focus=%v screen=%v search=%v, want unchanged", m.focus, m.activeScreen(), m.search.active)
++	}
++	// 検索結果は新しいリストの添字で作り直される (古い添字のままだと描画で落ちる)。
++	if !slices.Equal(m.search.results, []int{1}) {
++		t.Fatalf("search results = %v, want [1]", m.search.results)
++	}
++	if m.plCursor != 0 {
++		t.Fatalf("plCursor = %d, want 0", m.plCursor)
++	}
++}
++
++func TestGUIReplaceRejectsBadIndex(t *testing.T) {
++	m, eng := newGUITestModel("a")
++	startPlaying(&m, 0)
++	stops := eng.stops
++	m, resp := sendGUI(t, m, func(r chan ipc.Response) tea.Msg {
++		return ipc.ReplaceMsg{Tracks: newGUITestTracks("x"), Index: 1, Reply: r}
++	})
++	if resp.OK || eng.stops != stops || m.playlist.Len() != 1 || m.playlist.Tracks()[0].Title != "a" {
++		t.Fatalf("bad index changed state: resp=%+v", resp)
++	}
++}
++
++func TestGUIEnqueueNextWhilePlaying(t *testing.T) {
++	m, eng := newGUITestModel("a", "b")
++	startPlaying(&m, 0)
++	calls, clears := len(eng.playCalls), eng.clearPreloads
++
++	m, resp := sendGUI(t, m, func(r chan ipc.Response) tea.Msg {
++		return ipc.EnqueueMsg{Tracks: newGUITestTracks("x", "y"), Mode: "next", Reply: r}
++	})
++	if !resp.OK || resp.Total != 4 {
++		t.Fatalf("resp = %+v", resp)
++	}
++	if got := m.playlist.QueueIndices(); !slices.Equal(got, []int{2, 3}) {
++		t.Fatalf("queue = %v, want [2 3]", got)
++	}
++	if len(eng.playCalls) != calls {
++		t.Fatal("enqueue next restarted playback")
++	}
++	// 次に鳴る曲が b から x に変わったので、先読みを取り直す。
++	if eng.clearPreloads <= clears {
++		t.Fatal("preload not refreshed although the next track changed")
++	}
++	if next, _ := m.playlist.PeekNext(); next.Title != "x" {
++		t.Fatalf("next = %q, want x", next.Title)
++	}
++}
++
++func TestGUIEnqueueNextWhenStoppedPlaysQueued(t *testing.T) {
++	m, eng := newGUITestModel("a", "b")
++	m, resp := sendGUI(t, m, func(r chan ipc.Response) tea.Msg {
++		return ipc.EnqueueMsg{Tracks: newGUITestTracks("x", "y"), Mode: "next", Reply: r}
++	})
++	if !resp.OK || len(eng.playCalls) != 1 || eng.playCalls[0] != "x.flac" {
++		t.Fatalf("resp=%+v plays=%v, want x played", resp, eng.playCalls)
++	}
++	if got := m.playlist.QueueIndices(); !slices.Equal(got, []int{3}) {
++		t.Fatalf("queue = %v, want [3]", got)
++	}
++}
++
++func TestGUIEnqueueNextIntoEmptyList(t *testing.T) {
++	m, eng := newGUITestModel()
++	m, _ = sendGUI(t, m, func(r chan ipc.Response) tea.Msg {
++		return ipc.EnqueueMsg{Tracks: newGUITestTracks("x", "y"), Mode: "next", Reply: r}
++	})
++	if len(eng.playCalls) != 1 || eng.playCalls[0] != "x.flac" || m.playlist.QueueLen() != 0 {
++		t.Fatalf("plays=%v queue=%v, want x played and nothing queued", eng.playCalls, m.playlist.QueueIndices())
++	}
++}
++
++func TestGUIEnqueueEnd(t *testing.T) {
++	m, eng := newGUITestModel("a")
++	startPlaying(&m, 0)
++	calls := len(eng.playCalls)
++	m, resp := sendGUI(t, m, func(r chan ipc.Response) tea.Msg {
++		return ipc.EnqueueMsg{Tracks: newGUITestTracks("x"), Mode: "end", Reply: r}
++	})
++	if !resp.OK || m.playlist.Len() != 2 || m.playlist.QueueLen() != 0 || len(eng.playCalls) != calls {
++		t.Fatalf("while playing: resp=%+v len=%d queue=%d", resp, m.playlist.Len(), m.playlist.QueueLen())
++	}
++
++	m2, eng2 := newGUITestModel("a")
++	_, _ = sendGUI(t, m2, func(r chan ipc.Response) tea.Msg {
++		return ipc.EnqueueMsg{Tracks: newGUITestTracks("x"), Mode: "end", Reply: r}
++	})
++	if len(eng2.playCalls) != 1 || eng2.playCalls[0] != "x.flac" {
++		t.Fatalf("when stopped: plays = %v, want [x.flac]", eng2.playCalls)
++	}
++}
++
++func TestGUIEnqueueNow(t *testing.T) {
++	m, eng := newGUITestModel("a", "b")
++	startPlaying(&m, 0)
++	stops := eng.stops
++	m, resp := sendGUI(t, m, func(r chan ipc.Response) tea.Msg {
++		return ipc.EnqueueMsg{Tracks: newGUITestTracks("x", "y"), Mode: "now", Reply: r}
++	})
++	if !resp.OK || eng.stops <= stops {
++		t.Fatalf("resp=%+v stops=%d", resp, eng.stops)
++	}
++	if cur, idx := m.playlist.Current(); cur.Title != "x" || idx != 2 {
++		t.Fatalf("current = (%q,%d), want (x,2)", cur.Title, idx)
++	}
++	// シャッフルでなければ y は並びのまま x に続く (待ち行列に入れると 2 度鳴る)。
++	if next, _ := m.playlist.PeekNext(); next.Title != "y" || m.playlist.QueueLen() != 0 {
++		t.Fatalf("next=%q queue=%v, want y and empty queue", next.Title, m.playlist.QueueIndices())
++	}
++
++	m, _ = newGUITestModel("a", "b")
++	m.playlist.ToggleShuffle()
++	startPlaying(&m, 0)
++	m, _ = sendGUI(t, m, func(r chan ipc.Response) tea.Msg {
++		return ipc.EnqueueMsg{Tracks: newGUITestTracks("x", "y"), Mode: "now", Reply: r}
++	})
++	if cur, _ := m.playlist.Current(); cur.Title != "x" || !slices.Equal(m.playlist.QueueIndices(), []int{3}) {
++		t.Fatalf("shuffle: current=%q queue=%v, want x and [3]", cur.Title, m.playlist.QueueIndices())
++	}
++}
++
++func TestGUIQueueEdit(t *testing.T) {
++	m, eng := newGUITestModel("a", "b", "c", "d")
++	startPlaying(&m, 0)
++
++	edit := func(mode string, index, to int) ipc.Response {
++		var resp ipc.Response
++		m, resp = sendGUI(t, m, func(r chan ipc.Response) tea.Msg {
++			return ipc.QueueEditMsg{Mode: mode, Index: index, To: to, Reply: r}
++		})
++		return resp
++	}
++	if resp := edit("add", 3, -1); !resp.OK || !slices.Equal(resp.Queue, []int{3}) {
++		t.Fatalf("add 3 = %+v", resp)
++	}
++	edit("add", 2, -1)
++	if resp := edit("add", 3, -1); !slices.Equal(resp.Queue, []int{3, 2}) {
++		t.Fatalf("adding twice = %v, want [3 2]", resp.Queue)
++	}
++	if resp := edit("move", 1, 0); !resp.OK || !slices.Equal(resp.Queue, []int{2, 3}) {
++		t.Fatalf("move = %+v", resp)
++	}
++	if next, _ := m.playlist.PeekNext(); next.Title != "c" {
++		t.Fatalf("next = %q, want c", next.Title)
++	}
++	if resp := edit("remove", 2, -1); !slices.Equal(resp.Queue, []int{3}) {
++		t.Fatalf("remove = %+v", resp)
++	}
++	clears := eng.clearPreloads
++	if resp := edit("clear", -1, -1); !resp.OK || len(resp.Queue) != 0 {
++		t.Fatalf("clear = %+v", resp)
++	}
++	if eng.clearPreloads <= clears {
++		t.Fatal("clearing the queue changed the next track but kept the preload")
++	}
++	for _, bad := range []struct {
++		mode      string
++		index, to int
++	}{{"add", 9, -1}, {"remove", -1, -1}, {"move", 0, 1}, {"shuffle", 0, 0}} {
++		if resp := edit(bad.mode, bad.index, bad.to); resp.OK {
++			t.Errorf("%+v = ok, want error", bad)
++		}
++	}
++}
++
++func TestGUIRemove(t *testing.T) {
++	m, _ := newGUITestModel("a", "b", "c")
++	startPlaying(&m, 1)
++	m.plCursor = 2
++
++	m, resp := sendGUI(t, m, func(r chan ipc.Response) tea.Msg { return ipc.RemoveMsg{Index: 1, Reply: r} })
++	if resp.OK || resp.Error != "cannot remove the current track" {
++		t.Fatalf("removing the playing track = %+v", resp)
++	}
++	gen := m.playlist.Gen()
++	m, resp = sendGUI(t, m, func(r chan ipc.Response) tea.Msg { return ipc.RemoveMsg{Index: 0, Reply: r} })
++	if !resp.OK || resp.Total != 2 || resp.Gen <= gen {
++		t.Fatalf("resp = %+v", resp)
++	}
++	if cur, idx := m.playlist.Current(); cur.Title != "b" || idx != 0 || m.plCursor != 1 {
++		t.Fatalf("current=(%q,%d) cursor=%d, want (b,0) and 1", cur.Title, idx, m.plCursor)
++	}
++	if _, resp = sendGUI(t, m, func(r chan ipc.Response) tea.Msg { return ipc.RemoveMsg{Index: 5, Reply: r} }); resp.OK {
++		t.Fatal("out of range remove succeeded")
++	}
++}
++
++func TestGUIPlaylistSnapshotIncludesSource(t *testing.T) {
++	m, _ := newGUITestModel()
++	src := ipc.SourceInfo{Provider: "url", ID: "https://example/list"}
++	m, _ = sendGUI(t, m, func(r chan ipc.Response) tea.Msg {
++		return ipc.ReplaceMsg{Tracks: newGUITestTracks("a", "b"), Source: src, Reply: r}
++	})
++	_, resp := sendGUI(t, m, func(r chan ipc.Response) tea.Msg { return ipc.PlaylistRequestMsg{Reply: r} })
++	if !resp.OK || resp.Total != 2 || resp.Source == nil || *resp.Source != src || resp.Gen != m.playlist.Gen() {
++		t.Fatalf("playlist = %+v", resp)
++	}
++	if !slices.Equal(resp.UpNext, []int{1}) {
++		t.Fatalf("up_next = %v, want [1]", resp.UpNext)
++	}
++}
++
++func TestGUIStatusIsExtended(t *testing.T) {
++	m, eng := newGUITestModel()
++	eng.eq = [10]float64{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}
++	tr := playlist.Track{
++		Path: "https://www.youtube.com/watch?v=abc", Title: "Song", Artist: "Artist", Album: "Album",
++		DurationSecs: 200, Stream: true, ProviderMeta: map[string]string{"art": "https://example/a.jpg"},
++	}
++	m.playlist.Replace([]playlist.Track{tr})
++	m.setListSource(ipc.SourceInfo{Provider: "youtube", Name: "検索"})
++	m.streamTitle = "ICY - Title"
++	m.buffering = true
++
++	m, resp := sendGUI(t, m, func(r chan ipc.Response) tea.Msg { return ipc.StatusRequestMsg{Reply: r} })
++	if resp.API != ipc.APIVersion || resp.Gen != m.playlist.Gen() || resp.StreamTitle != "ICY - Title" {
++		t.Fatalf("status = %+v", resp)
++	}
++	if resp.Track == nil || resp.Track.Title != "Song" || resp.Track.Album != "Album" || resp.Track.Duration != 200 || resp.Track.Meta["art"] == "" {
++		t.Fatalf("track = %+v", resp.Track)
++	}
++	if len(resp.EQ) != 10 || resp.EQ[9] != 10 {
++		t.Fatalf("eq = %v", resp.EQ)
++	}
++	if resp.Buffering == nil || !*resp.Buffering {
++		t.Fatalf("buffering = %v", resp.Buffering)
++	}
++	if resp.Source == nil || resp.Source.Name != "検索" {
++		t.Fatalf("source = %v", resp.Source)
++	}
++	// 既存のフィールドはそのまま (平文の `cliamp status` が使う)。
++	if resp.State != "stopped" || resp.Total != 1 || resp.Shuffle == nil || resp.Repeat != "Off" {
++		t.Fatalf("base fields = %+v", resp)
++	}
++
++	// yt-dlp のシーク待ちの間はシーク先を返す。
++	eng.position = 5 * time.Second
++	m.seek.active = true
++	m.seek.targetPos = 90 * time.Second
++	_, resp = sendGUI(t, m, func(r chan ipc.Response) tea.Msg { return ipc.StatusRequestMsg{Reply: r} })
++	if resp.Position != 90 {
++		t.Fatalf("position during seek = %v, want 90", resp.Position)
++	}
++}
++
++func TestGUISourceFollowsTUILoads(t *testing.T) {
++	prov := &guiFakeProvider{name: "Radio"}
++	m, _ := newGUITestModel("a")
++	m.providers = []ProviderEntry{{Key: "radio", Name: "Radio", Provider: prov}}
++	m.provider = prov
++	m.providerLists = []playlist.PlaylistInfo{{ID: "l:0", Name: "cliamp radio"}}
++	m.activeProviderPlaylistID = "l:0"
++
++	next, _ := m.Update(tracksLoadedMsg(newGUITestTracks("r")))
++	m = next.(Model)
++	want := ipc.SourceInfo{Provider: "radio", ID: "l:0", Name: "cliamp radio"}
++	if got := m.listSource(); got == nil || *got != want {
++		t.Fatalf("source after TUI load = %v, want %v", got, want)
++	}
++
++	// 出どころの分からない差し替え (ファイルを開くなど) では消える。
++	next, _ = m.Update(fbTracksResolvedMsg{tracks: newGUITestTracks("f"), replace: true})
++	m = next.(Model)
++	if got := m.listSource(); got != nil {
++		t.Fatalf("source after file load = %v, want nil", got)
++	}
++}
++
++func TestEQPresetNames(t *testing.T) {
++	names := EQPresetNames()
++	if len(names) != len(eqPresets) || names[0] != "Flat" {
++		t.Fatalf("EQPresetNames() = %v", names)
++	}
++}
++
++// recordingSaver は設定ファイルへ書かずに、保存された値を覚えておく。
++type recordingSaver map[string]string
++
++func (r recordingSaver) Save(key, value string) error {
++	r[key] = value
++	return nil
++}
++
++// IPC で 1 帯域だけ変えたら、TUI の EQ キーと同じくプリセットは Custom になる。
++// 前のプリセット名のまま保存すると、次の起動でそのプリセットが当て直され、
++// 手で変えた帯域が消えるため。
++func TestGUIEQBandSwitchesPresetToCustom(t *testing.T) {
++	m, _ := newGUITestModel("a")
++	saver := recordingSaver{}
++	m.configSaver = saver
++	m.SetEQPreset("Rock", nil)
++	if got := m.EQPresetName(); got != "Rock" {
++		t.Fatalf("preset = %q, want Rock", got)
++	}
++	m, resp := sendGUI(t, m, func(reply chan ipc.Response) tea.Msg {
++		return ipc.EQMsg{Band: 3, Value: 2.5, Reply: reply}
++	})
++	if !resp.OK || resp.EQPreset != "Custom" {
++		t.Fatalf("reply = %+v, want ok with preset Custom", resp)
++	}
++	if got := m.EQPresetName(); got != "Custom" {
++		t.Fatalf("preset after band edit = %q, want Custom", got)
++	}
++	if got := saver["eq_preset"]; got != `"Custom"` {
++		t.Fatalf("saved eq_preset = %q, want \"Custom\"", got)
++	}
++}
+diff --git a/ui/model/keys.go b/ui/model/keys.go
+index d41136f..97117e4 100644
+--- a/ui/model/keys.go
++++ b/ui/model/keys.go
+@@ -1645,6 +1645,7 @@ func (m *Model) plMgrLoadAndPlay(startIdx int) tea.Cmd {
+ 	m.player.ClearPreload()
+ 	m.resetYTDLBatch()
+ 	m.playlist.Replace(m.plManager.tracks)
++	m.setLocalListSource(m.plManager.selPlaylist)
+ 	m.setInitialHeaderState(m.plManager.tracks)
+ 	m.loadedPlaylist = m.plManager.selPlaylist
+ 	if startIdx < 0 || startIdx >= m.playlist.Len() {
+diff --git a/ui/model/model.go b/ui/model/model.go
+index e9ec48c..a243bc6 100644
+--- a/ui/model/model.go
++++ b/ui/model/model.go
+@@ -6,6 +6,7 @@ import (
+ 
+ 	"cliamp/history"
+ 	"cliamp/internal/playback"
++	"cliamp/ipc"
+ 	"cliamp/luaplugin"
+ 	"cliamp/player"
+ 	"cliamp/playlist"
+@@ -221,6 +222,11 @@ type Model struct {
+ 	// row in the provider browser. Empty when no provider playlist is active.
+ 	activeProviderPlaylistID string
+ 
++	// GUI 拡張 IPC (ipc_gui.go): いまのリストの出どころと、それを覚えたときの
++	// playlist の Epoch。Epoch が変われば別の経路で差し替わったとみなす。
++	guiSource      ipc.SourceInfo
++	guiSourceEpoch uint64
++
+ 	// exitResume holds the playback state captured just before player.Close()
+ 	// so ResumeState() can read it after the player is shut down.
+ 	exitResume struct {
+diff --git a/ui/model/update.go b/ui/model/update.go
+index e676be5..ffcfe89 100644
+--- a/ui/model/update.go
++++ b/ui/model/update.go
+@@ -309,6 +309,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+ 		}
+ 		m.resetYTDLBatch()
+ 		m.playlist.Replace(msg)
++		m.setProviderListSource()
+ 		m.setInitialHeaderState(msg)
+ 		m.plCursor = 0
+ 		m.plScroll = 0
+@@ -760,6 +761,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+ 			return m, nil
+ 		}
+ 		m.playlist.Replace(tracks)
++		m.setLocalListSource(msg.Playlist)
+ 		m.setInitialHeaderState(tracks)
+ 		m.loadedPlaylist = msg.Playlist
+ 		cmd := m.playCurrentTrack()
+@@ -891,6 +893,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+ 		if msg.Band > 0 || (msg.Band == 0 && msg.Name == "") {
+ 			// Set a specific band (0-9).
+ 			m.player.SetEQBand(msg.Band, msg.Value)
++			m.eqPresetIdx = -1 // manual tweak → custom (same as the EQ keys)
++			m.eqCustomLabel = ""
+ 			m.saveEQ()
+ 			if msg.Reply != nil {
+ 				msg.Reply <- ipc.Response{OK: true, EQPreset: m.EQPresetName()}
+@@ -992,6 +996,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+ 		} else {
+ 			resp.Theme = &ipc.ThemeInfo{Name: theme.DefaultName}
+ 		}
++		m.extendStatus(&resp)
+ 		if msg.Reply != nil {
+ 			msg.Reply <- resp
+ 		}
+@@ -1014,6 +1019,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+ 		return m, nil
+ 	}
+ 
++	if cmd, ok := m.handleGUIIPC(msg); ok {
++		return m, cmd
++	}
+ 	return m, nil
+ }
+ 

@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+/result
+/result-*
+# 撮影ハーネスの出力
+/shots/

@@ -1,0 +1,568 @@
+/*
+ * ミュージック — フルスクリーンプレーヤー・ミニプレーヤー・イコライザ
+ *
+ * base.css の後に USER + 1 で読む。すべての規則は window.music の下
+ * (フルスクリーンはメインの窓の中、ミニプレーヤーとイコライザは別の窓で
+ * どれもクラス music を持つ)。全体の ~/.config/gtk-4.0/gtk.css が USER (800) で
+ * button・menubutton・dropdown・headerbar・undershoot にガラスの地や青い
+ * フォーカスを当ててくるので、使う物の背景色・背景画像・枠・影・高さ・余白は
+ * ここで必ず上書きする。
+ *
+ * フルスクリーンとミニプレーヤーは、ぼかした絵の上に白い文字と白い記号を置く
+ * (Apple と同じ。赤は「ライブ」の印とつまみ以外に使わない)。ガラスは暗い面では
+ * なく、明るい半透明の面 (下の絵が既にぼけているので、それらしく見える)。
+ */
+
+/* ------------------------------------------------------------------
+ * 共通: 絵の上に置く部品
+ * ------------------------------------------------------------------ */
+
+window.music .music-fullscreen,
+window.music.music-mini {
+  --m-over-label: #ffffff;
+  --m-over-secondary: rgba(255, 255, 255, 0.62);
+  --m-over-tertiary: rgba(255, 255, 255, 0.42);
+  --m-over-glass: rgba(255, 255, 255, 0.13);
+  --m-over-glass-hover: rgba(255, 255, 255, 0.20);
+  --m-over-edge: rgba(255, 255, 255, 0.17);
+}
+
+/* 絵の上のガラスのカプセル (✕ / ミニプレーヤー、音量、切り替え、ミニプレーヤーの右上) */
+window.music .music-fullscreen .music-glass.music-fs-glass,
+window.music.music-mini .music-glass.music-mini-glass {
+  background-color: var(--m-over-glass);
+  background-image: linear-gradient(to bottom,
+    rgba(255, 255, 255, 0.10),
+    rgba(255, 255, 255, 0) 55%);
+  border: 1px solid var(--m-over-edge);
+  box-shadow:
+    inset 0 1px rgba(255, 255, 255, 0.16),
+    0 3px 9px rgba(0, 0, 0, 0.16);
+  color: var(--m-over-label);
+}
+
+window.music .music-fullscreen .music-fs-glass > button.music-circle,
+window.music.music-mini .music-mini-glass > button.music-circle {
+  color: var(--m-over-label);
+  background-color: transparent;
+  background-image: none;
+  border: none;
+  box-shadow: none;
+}
+
+window.music .music-fullscreen .music-fs-glass > button.music-circle:hover,
+window.music.music-mini .music-mini-glass > button.music-circle:hover {
+  background-color: rgba(255, 255, 255, 0.14);
+}
+
+window.music .music-fullscreen .music-fs-glass > button.music-circle:active,
+window.music.music-mini .music-mini-glass > button.music-circle:active {
+  background-color: rgba(255, 255, 255, 0.22);
+}
+
+/* 再生位置・音量の線。塗りは color、溝は同じ色を薄くしたもの (Scrubber が描く) */
+window.music .music-scrubber {
+  color: rgba(255, 255, 255, 0.80);
+  outline-offset: 2px;
+}
+
+window.music .music-scrubber.static { color: rgba(255, 255, 255, 0.45); }
+window.music .music-scrubber.volume { color: rgba(255, 255, 255, 0.92); }
+
+/* 操作の列 (TransportRow)。地を塗らない白い記号、押すと少し縮む */
+window.music button.music-transport {
+  min-width: 0;
+  min-height: 0;
+  padding: 0;
+  margin: 0;
+  border: none;
+  border-radius: 9999px;
+  background-color: transparent;
+  background-image: none;
+  box-shadow: none;
+  color: var(--m-over-label, #ffffff);
+  outline-offset: 1px;
+  transition: background-color 120ms ease, color 120ms ease, transform 120ms ease;
+}
+
+window.music button.music-transport:hover { background-color: rgba(255, 255, 255, 0.08); }
+window.music button.music-transport:active {
+  background-color: rgba(255, 255, 255, 0.13);
+  transform: scale(0.9);
+}
+
+window.music button.music-transport.side { color: var(--m-over-secondary, rgba(255, 255, 255, 0.62)); }
+window.music button.music-transport.side:hover { color: var(--m-over-label, #ffffff); }
+
+/* シャッフル・リピートが入っているとき: 明るい半透明の丸に白い記号 (Apple のフルスクリーン) */
+window.music button.music-transport.side.on {
+  color: #ffffff;
+  background-color: rgba(255, 255, 255, 0.22);
+}
+
+window.music button.music-transport.side.on:hover { background-color: rgba(255, 255, 255, 0.28); }
+window.music button.music-transport:disabled { color: rgba(255, 255, 255, 0.30); }
+
+/* 「…」(曲のメニュー)。絵の上の小さなガラスの丸 */
+window.music menubutton.music-fs-more > button,
+window.music menubutton.music-mini-more > button {
+  min-width: 28px;
+  min-height: 28px;
+  padding: 0;
+  margin: 0;
+  border: none;
+  border-radius: 9999px;
+  background-color: rgba(255, 255, 255, 0.15);
+  background-image: none;
+  box-shadow: inset 0 1px rgba(255, 255, 255, 0.12);
+  color: #ffffff;
+  transition: background-color 120ms ease;
+}
+
+window.music menubutton.music-fs-more > button:hover,
+window.music menubutton.music-mini-more > button:hover { background-color: rgba(255, 255, 255, 0.24); }
+
+window.music menubutton.music-fs-more > button:checked,
+window.music menubutton.music-mini-more > button:checked { background-color: rgba(255, 255, 255, 0.30); }
+
+window.music menubutton.music-fs-more > button:disabled,
+window.music menubutton.music-mini-more > button:disabled { color: rgba(255, 255, 255, 0.35); }
+
+/* ------------------------------------------------------------------
+ * フルスクリーン
+ * ------------------------------------------------------------------ */
+
+window.music .music-fullscreen {
+  background-color: rgb(20, 21, 25);
+  color: var(--m-over-label);
+  outline: none;
+}
+
+window.music .music-fs-title {
+  font-size: 22px;
+  font-weight: 700;
+  letter-spacing: -0.2px;
+  color: var(--m-over-label);
+}
+
+window.music .music-fs-subtitle {
+  font-size: 17px;
+  font-weight: 500;
+  color: var(--m-over-secondary);
+}
+
+window.music .music-fullscreen.medium .music-fs-title { font-size: 20px; }
+window.music .music-fullscreen.medium .music-fs-subtitle { font-size: 15px; }
+window.music .music-fullscreen.small .music-fs-title { font-size: 17px; }
+window.music .music-fullscreen.small .music-fs-subtitle { font-size: 14px; }
+
+window.music .music-fs-time {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--m-over-tertiary);
+  font-feature-settings: "tnum";
+}
+
+window.music .music-fs-badge,
+window.music .music-mini-badge {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--m-over-tertiary);
+}
+
+/* 「ライブ」の印: 赤い小さなカプセル */
+window.music .music-fs-badge.live,
+window.music .music-mini-badge.live {
+  padding: 1px 8px;
+  border-radius: 9999px;
+  background-color: var(--m-key);
+  color: #ffffff;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.4px;
+}
+
+/* 右上の音量: 出力先 | 線 | スピーカー */
+window.music .music-volume-capsule { padding: 2px 4px 2px 2px; }
+
+window.music menubutton.music-volume-output > button {
+  min-width: 30px;
+  min-height: 30px;
+  padding: 0;
+  margin: 0;
+  border: none;
+  border-radius: 9999px;
+  background-color: transparent;
+  background-image: none;
+  box-shadow: none;
+  color: var(--m-over-label);
+}
+
+window.music menubutton.music-volume-output > button:hover { background-color: rgba(255, 255, 255, 0.14); }
+window.music menubutton.music-volume-output > button:checked { background-color: rgba(255, 255, 255, 0.22); }
+window.music .music-volume-speaker { color: var(--m-over-secondary); }
+
+/* 右下の「歌詞 | 次に再生」の切り替え。選んだ方が白い丸 */
+window.music .music-fs-switch { padding: 2px; }
+
+window.music button.music-fs-switch-button {
+  min-width: 30px;
+  min-height: 30px;
+  padding: 0;
+  margin: 0;
+  border: none;
+  border-radius: 9999px;
+  background-color: transparent;
+  background-image: none;
+  box-shadow: none;
+  color: rgba(255, 255, 255, 0.86);
+  transition: background-color 140ms ease, color 140ms ease;
+}
+
+window.music button.music-fs-switch-button:hover { background-color: rgba(255, 255, 255, 0.14); }
+
+window.music button.music-fs-switch-button:checked {
+  background-color: rgba(255, 255, 255, 0.92);
+  color: rgb(28, 29, 33);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25);
+}
+
+/* 歌詞 (文字は LyricsView が自分で描く。大きさはコードが持つ) */
+window.music .music-fs-lyrics { font-weight: 800; }
+
+window.music .music-fs-lyrics-message {
+  font-size: 28px;
+  font-weight: 800;
+  color: rgba(255, 255, 255, 0.42);
+}
+
+window.music .music-fullscreen.small .music-fs-lyrics-message { font-size: 22px; }
+
+/* 次に再生 */
+window.music button.music-fs-pill {
+  min-width: 0;
+  min-height: 32px;
+  padding: 0 14px;
+  margin: 0;
+  border: 1px solid rgba(255, 255, 255, 0.10);
+  border-radius: 9999px;
+  background-color: rgba(255, 255, 255, 0.13);
+  background-image: none;
+  box-shadow: inset 0 1px rgba(255, 255, 255, 0.10);
+  color: #ffffff;
+  transition: background-color 140ms ease, color 140ms ease;
+}
+
+window.music button.music-fs-pill:hover { background-color: rgba(255, 255, 255, 0.20); }
+
+window.music button.music-fs-pill.on {
+  background-color: rgba(255, 255, 255, 0.90);
+  border-color: transparent;
+  color: rgb(28, 29, 33);
+}
+
+window.music button.music-fs-pill.on:hover { background-color: #ffffff; }
+window.music .music-fs-pill-label { font-size: 13px; font-weight: 600; }
+
+window.music .music-fs-queue .music-section-title {
+  font-size: 15px;
+  color: #ffffff;
+}
+
+window.music .music-fs-queue-subtitle {
+  font-size: 12px;
+  color: var(--m-over-secondary);
+}
+
+window.music button.music-fs-clear {
+  min-width: 0;
+  min-height: 24px;
+  padding: 0 4px;
+  margin: 0;
+  border: none;
+  border-radius: 6px;
+  background-color: transparent;
+  background-image: none;
+  box-shadow: none;
+  color: var(--m-key-text);
+  font-weight: 600;
+}
+
+window.music button.music-fs-clear:hover { background-color: rgba(255, 255, 255, 0.08); }
+
+window.music .music-fs-queue list.music-track-list > row.music-track-row:hover {
+  background-color: rgba(255, 255, 255, 0.08);
+}
+
+window.music .music-fs-queue list.music-track-list > row.music-track-row:selected {
+  background-color: rgba(255, 255, 255, 0.15);
+}
+
+window.music .music-fs-queue row.music-track-row .music-track-main {
+  border-bottom-color: rgba(255, 255, 255, 0.10);
+}
+
+window.music .music-fs-queue .music-track-title { color: #ffffff; }
+window.music .music-fs-queue .music-track-subtitle { color: var(--m-over-secondary); }
+window.music .music-fs-queue .music-empty-icon { color: var(--m-over-tertiary); }
+window.music .music-fs-queue .music-empty-description { color: var(--m-over-secondary); }
+
+/* 全体の CSS がスクロールの端に暗い帯を描くので消す (絵の上では帯に見える) */
+window.music scrolledwindow.music-fs-queue-scroller > undershoot.top,
+window.music scrolledwindow.music-fs-queue-scroller > undershoot.bottom {
+  background: none;
+  box-shadow: none;
+}
+
+/* ------------------------------------------------------------------
+ * ミニプレーヤー
+ * ------------------------------------------------------------------ */
+
+window.music.music-mini {
+  background-color: rgb(20, 21, 25);
+  color: #ffffff;
+}
+
+window.music.music-mini .music-mini-title {
+  font-size: 15px;
+  font-weight: 700;
+  letter-spacing: -0.1px;
+  color: #ffffff;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.25);
+}
+
+window.music.music-mini .music-mini-subtitle {
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.74);
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.25);
+}
+
+window.music.music-mini .music-mini-time {
+  font-size: 10px;
+  font-weight: 600;
+  color: rgba(255, 255, 255, 0.66);
+  font-feature-settings: "tnum";
+}
+
+window.music.music-mini .music-mini-badge { font-size: 10px; }
+
+window.music.music-mini .music-mini-compact-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: #ffffff;
+}
+
+window.music.music-mini .music-mini-compact-subtitle {
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.66);
+}
+
+window.music.music-mini .music-mini-compact menubutton.music-mini-more > button {
+  min-width: 24px;
+  min-height: 24px;
+  background-color: rgba(255, 255, 255, 0.12);
+}
+
+window.music.music-mini .music-mini-compact menubutton.music-mini-more > button:hover {
+  background-color: rgba(255, 255, 255, 0.22);
+}
+
+/* 閉じるボタン (左上)。テーマの丸をそのまま使い、絵の上で沈まないよう影だけ足す。
+ * 利用者のテーマはボタンの箱を角 0 の四角にして丸を背景の絵で描くので、角を丸めて
+ * おかないと影が四角く出る */
+window.music.music-mini windowcontrols.music-mini-window-controls button {
+  border-radius: 50%;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.30);
+}
+
+/* ------------------------------------------------------------------
+ * イコライザ
+ * ------------------------------------------------------------------ */
+
+window.music.music-eq {
+  background-color: rgb(36, 37, 43);
+  color: var(--m-label);
+}
+
+window.music.music-eq toolbarview > .top-bar {
+  background-color: transparent;
+  background-image: none;
+  box-shadow: none;
+}
+
+window.music.music-eq headerbar {
+  min-height: 38px;
+  background-color: transparent;
+  background-image: none;
+  border: none;
+  box-shadow: none;
+}
+
+window.music.music-eq .music-eq-caption {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--m-secondary);
+}
+
+window.music.music-eq dropdown.music-eq-preset > button {
+  min-height: 28px;
+  padding: 0 10px;
+  margin: 0;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 8px;
+  background-color: var(--m-fill);
+  background-image: none;
+  box-shadow: inset 0 1px rgba(255, 255, 255, 0.06);
+  color: var(--m-label);
+  font-weight: 500;
+}
+
+window.music.music-eq dropdown.music-eq-preset > button:hover { background-color: var(--m-fill-hover); }
+
+window.music.music-eq dropdown.music-eq-preset > button:focus-visible {
+  border-color: rgba(250, 88, 106, 0.85);
+  box-shadow: 0 0 0 3px rgba(250, 45, 72, 0.28);
+}
+
+window.music.music-eq button.music-eq-flat {
+  min-width: 0;
+  min-height: 28px;
+  padding: 0 14px;
+  margin: 0;
+  border: none;
+  border-radius: 9999px;
+  background-color: var(--m-fill);
+  background-image: none;
+  box-shadow: none;
+  color: var(--m-key-text);
+  font-weight: 600;
+}
+
+window.music.music-eq button.music-eq-flat:hover { background-color: var(--m-fill-hover); }
+window.music.music-eq button.music-eq-flat:active { background-color: var(--m-fill-active); }
+window.music.music-eq button.music-eq-flat:disabled { color: var(--m-tertiary); }
+
+window.music.music-eq .music-eq-band {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--m-secondary);
+  font-feature-settings: "tnum";
+}
+
+window.music.music-eq .music-eq-note {
+  font-size: 12px;
+  color: var(--m-secondary);
+}
+
+window.music.music-eq separator.music-eq-separator { background-color: var(--m-separator); }
+
+/* 帯域のつまみ。溝と塗りは _Fader が描く。値の位置を溝の中で線形にするため、
+ * 溝と丸の余白・枠は 0 にする (丸の大きさだけが位置の計算に入る) */
+window.music scale.music-eq-fader {
+  min-width: 22px;
+  padding: 0;
+  margin: 0;
+}
+
+window.music scale.music-eq-fader > trough {
+  min-width: 22px;
+  min-height: 0;
+  padding: 0;
+  margin: 0;
+  border: none;
+  border-radius: 0;
+  background-color: transparent;
+  background-image: none;
+  box-shadow: none;
+  outline: none;
+}
+
+window.music scale.music-eq-fader > trough > highlight {
+  min-width: 0;
+  min-height: 0;
+  border: none;
+  background-color: transparent;
+  background-image: none;
+  box-shadow: none;
+}
+
+window.music scale.music-eq-fader > trough > slider {
+  min-width: 20px;
+  min-height: 20px;
+  padding: 0;
+  margin: 0;
+  border: none;
+  border-radius: 9999px;
+  background-color: #f2f2f5;
+  background-image: radial-gradient(circle closest-side, #fa2d48 0%, #fa2d48 60%, transparent 70%);
+  background-size: 9px 9px;
+  background-repeat: no-repeat;
+  background-position: center;
+  box-shadow:
+    0 1px 3px rgba(0, 0, 0, 0.45),
+    0 0 0 1px rgba(0, 0, 0, 0.18);
+  outline-offset: 2px;
+}
+
+window.music scale.music-eq-fader > trough > slider:hover { background-color: #ffffff; }
+window.music scale.music-eq-fader:disabled > trough > slider { background-color: rgba(242, 242, 245, 0.45); }
+
+window.music scale.music-eq-fader marks,
+window.music scale.music-eq-fader mark,
+window.music scale.music-eq-fader mark > indicator {
+  min-width: 0;
+  min-height: 0;
+  margin: 0;
+  padding: 0;
+  background: none;
+  border: none;
+  box-shadow: none;
+}
+
+/* 再生速度 */
+window.music.music-eq scale.music-eq-speed-scale > trough {
+  min-height: 4px;
+  border: none;
+  border-radius: 9999px;
+  background-color: rgba(255, 255, 255, 0.14);
+  background-image: none;
+  box-shadow: none;
+}
+
+window.music.music-eq scale.music-eq-speed-scale > trough > highlight {
+  border: none;
+  border-radius: 9999px;
+  background-color: var(--m-key);
+  background-image: none;
+  box-shadow: none;
+}
+
+window.music.music-eq scale.music-eq-speed-scale > trough > slider {
+  min-width: 18px;
+  min-height: 18px;
+  margin: -7px;
+  border: none;
+  border-radius: 9999px;
+  background-color: #f2f2f5;
+  background-image: none;
+  box-shadow:
+    0 1px 3px rgba(0, 0, 0, 0.45),
+    0 0 0 1px rgba(0, 0, 0, 0.18);
+}
+
+window.music.music-eq scale.music-eq-speed-scale mark > indicator {
+  background-color: rgba(255, 255, 255, 0.28);
+}
+
+window.music.music-eq scale.music-eq-speed-scale mark > label {
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--m-secondary);
+}
+
+window.music.music-eq .music-eq-speed-value {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--m-label);
+  font-feature-settings: "tnum";
+}

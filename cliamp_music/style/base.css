@@ -1,0 +1,722 @@
+/*
+ * ミュージック — 色・文字・共通部品 (widgets.py の見た目)
+ *
+ * 読み込みは Gtk.STYLE_PROVIDER_PRIORITY_USER + 1。全体の
+ * ~/.config/gtk-4.0/gtk.css が USER (800) で button・entry・popover に
+ * ガラスの地や青いフォーカスを当ててくる。GTK は選択子の詳しさより先に
+ * 読み込みの優先度で決めるので、ここで同じ性質を必ず上書きする
+ * (背景色・背景画像・枠・影・高さ・余白・角)。書き漏らした性質はテーマの
+ * ものが残る。
+ *
+ * すべての規則はアプリの窓 (window.music) の下に閉じ込める。
+ * 数値は macOS 27 のミュージックの画面写真からの実測を GTK 向けに丸めた
+ * 調整値 (DESIGN.md §5)。暗色だけを持つ (FORCE_DARK)。
+ */
+
+/* ------------------------------------------------------------------
+ * 変数
+ * ------------------------------------------------------------------ */
+
+window.music {
+  --m-canvas: rgb(28, 29, 33);
+  --m-sidebar: rgb(41, 43, 50);
+  --m-key: #fa2d48;
+  --m-key-text: #fa586a;
+  --m-label: rgba(255, 255, 255, 0.92);
+  --m-secondary: rgba(235, 235, 245, 0.60);
+  --m-tertiary: rgba(235, 235, 245, 0.32);
+  --m-fill: rgba(118, 118, 128, 0.24);
+  --m-separator: rgba(255, 255, 255, 0.09);
+  --m-selected: rgba(255, 255, 255, 0.115);
+  --m-hover: rgba(255, 255, 255, 0.05);
+  --m-glass: rgba(46, 47, 54, 0.90);
+
+  /* 上の表から派生させたもの */
+  --m-fill-hover: rgba(118, 118, 128, 0.34);
+  --m-fill-active: rgba(118, 118, 128, 0.46);
+  --m-key-soft: rgba(250, 45, 72, 0.20);       /* 入っている丸の地 (シャッフルなど) */
+  --m-key-soft-hover: rgba(250, 45, 72, 0.28);
+  --m-key-hover: #ff4560;                       /* 赤で塗ったボタンに乗せたとき */
+  --m-popover: rgba(40, 41, 48, 0.97);          /* メニュー・トースト。文字が透けない濃さ */
+  --m-glass-edge: rgba(255, 255, 255, 0.10);
+  --m-shadow: rgba(0, 0, 0, 0.34);
+
+  /* libadwaita の強調色もアプリの中では Music の赤にする
+   * (リンク・スイッチ・選択・フォーカスの輪がこれを読む) */
+  --accent-bg-color: #fa2d48;
+  --accent-color: #fa586a;
+  --accent-fg-color: #ffffff;
+
+  background-color: var(--m-canvas);
+  color: var(--m-label);
+  font-size: 13px;
+}
+
+/* ------------------------------------------------------------------
+ * 文字
+ * ------------------------------------------------------------------ */
+
+window.music .music-page-title {
+  font-size: 34px;
+  font-weight: 700;
+  letter-spacing: -0.4px;
+  color: var(--m-label);
+}
+
+window.music .music-detail-title {
+  font-size: 26px;
+  font-weight: 700;
+  letter-spacing: -0.2px;
+  color: var(--m-label);
+}
+
+window.music .music-detail-subtitle {
+  font-size: 26px;
+  font-weight: 400;
+  letter-spacing: -0.2px;
+  color: var(--m-key-text);
+}
+
+window.music .music-section-title {
+  font-size: 17px;
+  font-weight: 700;
+  color: var(--m-label);
+}
+
+window.music .music-body { font-size: 13px; }
+
+window.music .music-subtitle {
+  font-size: 12px;
+  color: var(--m-secondary);
+}
+
+window.music .music-info {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--m-secondary);
+}
+
+window.music .music-overline {
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--m-secondary);
+}
+
+window.music .music-secondary { color: var(--m-secondary); }
+window.music .music-tertiary { color: var(--m-tertiary); }
+window.music .music-key-text { color: var(--m-key-text); }
+window.music .music-numeric { font-feature-settings: "tnum"; }
+
+/* ------------------------------------------------------------------
+ * ガラス
+ *
+ * GTK に backdrop-filter は無い。ほぼ不透明な面 + 上端の明るい線 +
+ * 下端の影 + 外側の影で厚みを出す。外側の影のぼかしは角丸の半径より
+ * 小さく (大きいと角の影が四角くはみ出す)。角は既定でカプセル。
+ * ------------------------------------------------------------------ */
+
+window.music .music-glass {
+  background-color: var(--m-glass);
+  background-image: linear-gradient(to bottom,
+    rgba(255, 255, 255, 0.075),
+    rgba(255, 255, 255, 0) 45%,
+    rgba(0, 0, 0, 0.07));
+  border: 1px solid var(--m-glass-edge);
+  border-radius: 9999px;
+  box-shadow:
+    inset 0 1px rgba(255, 255, 255, 0.14),
+    inset 0 -1px rgba(0, 0, 0, 0.28),
+    0 5px 12px rgba(0, 0, 0, 0.30);
+}
+
+window.music .music-glass-capsule {
+  padding: 2px;
+  border-spacing: 0;
+}
+
+/* ------------------------------------------------------------------
+ * 丸いボタン (CircleButton)
+ * ------------------------------------------------------------------ */
+
+window.music button.music-circle {
+  min-width: 0;
+  min-height: 0;
+  padding: 0;
+  margin: 0;
+  border: none;
+  border-radius: 9999px;
+  background-color: var(--m-fill);
+  background-image: none;
+  box-shadow: none;
+  color: var(--m-label);
+  outline-offset: 1px;
+  transition: background-color 120ms ease, color 120ms ease, opacity 120ms ease;
+}
+
+window.music button.music-circle:hover { background-color: var(--m-fill-hover); }
+window.music button.music-circle:active { background-color: var(--m-fill-active); }
+window.music button.music-circle.accent { color: var(--m-key-text); }
+window.music button.music-circle:disabled { color: var(--m-tertiary); background-color: rgba(118, 118, 128, 0.14); }
+
+window.music button.music-circle.flat { background-color: transparent; }
+window.music button.music-circle.flat:hover { background-color: rgba(255, 255, 255, 0.08); }
+window.music button.music-circle.flat:active { background-color: rgba(255, 255, 255, 0.14); }
+window.music button.music-circle.flat:disabled { background-color: transparent; }
+
+/* 内容の上に浮かべるガラスの丸 (ページ左上の「‹」など) */
+window.music button.music-circle.music-glass {
+  background-color: var(--m-glass);
+  background-image: linear-gradient(to bottom,
+    rgba(255, 255, 255, 0.08),
+    rgba(255, 255, 255, 0) 50%,
+    rgba(0, 0, 0, 0.06));
+  border: 1px solid var(--m-glass-edge);
+  box-shadow:
+    inset 0 1px rgba(255, 255, 255, 0.14),
+    inset 0 -1px rgba(0, 0, 0, 0.26),
+    0 3px 8px rgba(0, 0, 0, 0.28);
+}
+
+window.music button.music-circle.music-glass:hover { background-color: rgba(58, 59, 67, 0.94); }
+window.music button.music-circle.music-glass:active { background-color: rgba(70, 71, 80, 0.96); }
+
+/* カプセルの中の丸は地を塗らない (カプセルが面になる) */
+window.music .music-glass-capsule > button.music-circle,
+window.music .music-glass-capsule > menubutton > button {
+  background-color: transparent;
+  background-image: none;
+  border: none;
+  box-shadow: none;
+}
+
+window.music .music-glass-capsule > button.music-circle:hover,
+window.music .music-glass-capsule > menubutton > button:hover { background-color: rgba(255, 255, 255, 0.09); }
+window.music .music-glass-capsule > button.music-circle:active,
+window.music .music-glass-capsule > menubutton > button:active { background-color: rgba(255, 255, 255, 0.15); }
+
+/* ------------------------------------------------------------------
+ * 入り切りの丸 (ToggleCircle)。入 = 薄い赤の丸に赤い記号
+ * ------------------------------------------------------------------ */
+
+window.music button.music-toggle-circle {
+  min-width: 0;
+  min-height: 0;
+  padding: 0;
+  margin: 0;
+  border: none;
+  border-radius: 9999px;
+  background-color: transparent;
+  background-image: none;
+  box-shadow: none;
+  color: var(--m-label);
+  outline-offset: 1px;
+  transition: background-color 120ms ease, color 120ms ease;
+}
+
+window.music button.music-toggle-circle:hover { background-color: rgba(255, 255, 255, 0.08); }
+window.music button.music-toggle-circle:active { background-color: rgba(255, 255, 255, 0.14); }
+
+window.music button.music-toggle-circle:checked {
+  background-color: var(--m-key-soft);
+  color: var(--m-key-text);
+}
+
+window.music button.music-toggle-circle:checked:hover { background-color: var(--m-key-soft-hover); }
+window.music button.music-toggle-circle:disabled { color: var(--m-tertiary); }
+
+/* ------------------------------------------------------------------
+ * カプセル (「▶ 再生」)
+ * ------------------------------------------------------------------ */
+
+window.music button.music-capsule {
+  min-width: 84px;
+  min-height: 34px;
+  padding: 0 18px;
+  margin: 0;
+  border: none;
+  border-radius: 9999px;
+  background-color: var(--m-fill);
+  background-image: none;
+  box-shadow: none;
+  color: var(--m-label);
+  font-size: 13px;
+  font-weight: 600;
+  outline-offset: 1px;
+  transition: background-color 120ms ease, color 120ms ease;
+}
+
+window.music button.music-capsule:hover { background-color: var(--m-fill-hover); }
+window.music button.music-capsule:active { background-color: var(--m-fill-active); }
+window.music button.music-capsule.accent { color: var(--m-key-text); }
+window.music button.music-capsule:disabled { color: var(--m-tertiary); }
+
+window.music button.music-capsule.filled {
+  background-color: var(--m-key);
+  color: #ffffff;
+}
+
+window.music button.music-capsule.filled:hover { background-color: var(--m-key-hover); }
+window.music button.music-capsule.filled:active { background-color: #e0223b; }
+
+/* ------------------------------------------------------------------
+ * チップ (最近の検索)
+ * ------------------------------------------------------------------ */
+
+window.music button.music-chip {
+  min-width: 0;
+  min-height: 28px;
+  padding: 0 13px;
+  margin: 0;
+  border: none;
+  border-radius: 9999px;
+  background-color: var(--m-fill);
+  background-image: none;
+  box-shadow: none;
+  color: var(--m-label);
+  font-size: 13px;
+  font-weight: 500;
+  transition: background-color 120ms ease;
+}
+
+window.music button.music-chip:hover { background-color: var(--m-fill-hover); }
+window.music button.music-chip:active { background-color: var(--m-fill-active); }
+window.music button.music-chip image { color: var(--m-secondary); }
+
+/* ------------------------------------------------------------------
+ * 見出しと棚
+ * ------------------------------------------------------------------ */
+
+window.music .music-section-header { min-height: 24px; }
+
+window.music button.music-section-link {
+  min-width: 0;
+  min-height: 0;
+  padding: 0;
+  margin: 0;
+  border: none;
+  border-radius: 6px;
+  background-color: transparent;
+  background-image: none;
+  box-shadow: none;
+  color: var(--m-label);
+}
+
+window.music button.music-section-link:hover { background-color: transparent; opacity: 0.78; }
+window.music button.music-section-link:active { opacity: 0.6; }
+window.music .music-section-chevron { color: var(--m-secondary); }
+
+/* 左右の送り。乗せたときだけ現れる縦長のガラスのカプセル */
+window.music button.music-pager {
+  min-width: 26px;
+  min-height: 52px;
+  padding: 0;
+  margin: 0;
+  border: 1px solid var(--m-glass-edge);
+  border-radius: 9999px;
+  background-color: var(--m-glass);
+  background-image: linear-gradient(to bottom,
+    rgba(255, 255, 255, 0.08),
+    rgba(255, 255, 255, 0) 50%,
+    rgba(0, 0, 0, 0.06));
+  box-shadow:
+    inset 0 1px rgba(255, 255, 255, 0.14),
+    0 3px 8px rgba(0, 0, 0, 0.30);
+  color: var(--m-key-text);
+  opacity: 0;
+  transition: opacity 160ms ease, background-color 120ms ease;
+}
+
+window.music button.music-pager.shown { opacity: 1; }
+window.music button.music-pager:hover { background-color: rgba(58, 59, 67, 0.95); }
+window.music button.music-pager:active { background-color: rgba(70, 71, 80, 0.97); }
+
+/* 格子 (カテゴリー・プレイリスト・局)。flowboxchild の余白と選択の地を消し、
+ * 間隔は FlowBox の row/column-spacing だけで決める */
+window.music flowbox.music-grid > flowboxchild {
+  padding: 0;
+  margin: 0;
+  border-radius: 8px;
+  background-color: transparent;
+  background-image: none;
+  box-shadow: none;
+}
+
+window.music flowbox.music-grid > flowboxchild:focus-visible { outline-offset: 2px; }
+
+window.music scrolledwindow.music-shelf-scroller > undershoot.left,
+window.music scrolledwindow.music-shelf-scroller > undershoot.right {
+  background: none;
+  box-shadow: none;
+}
+
+/* ------------------------------------------------------------------
+ * カード・タイル
+ * ------------------------------------------------------------------ */
+
+window.music button.music-card {
+  min-width: 0;
+  min-height: 0;
+  padding: 0;
+  margin: 0;
+  border: none;
+  border-radius: 7px;
+  background-color: transparent;
+  background-image: none;
+  box-shadow: none;
+  color: var(--m-label);
+  outline-offset: 3px;
+}
+
+window.music button.music-card:hover,
+window.music button.music-card:active {
+  background-color: transparent;
+  box-shadow: none;
+}
+
+window.music button.music-tall-card { border-radius: 12px; }
+window.music button.music-category-tile { border-radius: 8px; }
+
+/* 乗せると絵を少し暗く、押すともう少し暗く */
+window.music .music-card-scrim {
+  border-radius: 7px;
+  background-color: transparent;
+  transition: background-color 140ms ease;
+}
+
+window.music .music-card-scrim.tall { border-radius: 12px; }
+window.music button.music-card:hover .music-card-scrim { background-color: rgba(0, 0, 0, 0.16); }
+window.music button.music-card:active .music-card-scrim { background-color: rgba(0, 0, 0, 0.28); }
+
+window.music .music-card-title {
+  margin-top: 7px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--m-label);
+}
+
+window.music .music-card-subtitle {
+  margin-top: 1px;
+  font-size: 13px;
+  color: var(--m-secondary);
+}
+
+/* 縦長のカード。絵の下半分を暗くして白い字を読ませる */
+window.music .music-tall-card-shade {
+  border-radius: 12px;
+  background-image: linear-gradient(to bottom,
+    rgba(0, 0, 0, 0) 40%,
+    rgba(0, 0, 0, 0.30) 64%,
+    rgba(0, 0, 0, 0.66));
+}
+
+window.music .music-tall-card-overline {
+  font-size: 11px;
+  font-weight: 600;
+  color: rgba(255, 255, 255, 0.74);
+}
+
+window.music .music-tall-card-title {
+  font-size: 15px;
+  font-weight: 700;
+  color: #ffffff;
+}
+
+window.music .music-category-label {
+  font-size: 13px;
+  font-weight: 700;
+  color: #ffffff;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.28);
+}
+
+/* ------------------------------------------------------------------
+ * 曲の行 (TrackList / TrackRow)
+ * ------------------------------------------------------------------ */
+
+window.music list.music-track-list {
+  background-color: transparent;
+  background-image: none;
+  border: none;
+  box-shadow: none;
+  color: var(--m-label);
+}
+
+window.music list.music-track-list > row.music-track-row {
+  min-height: 0;
+  padding: 0 8px 0 4px;
+  margin: 0;
+  border: none;
+  border-radius: 8px;
+  background-color: transparent;
+  background-image: none;
+  box-shadow: none;
+  outline-offset: -2px;
+}
+
+window.music list.music-track-list > row.music-track-row:hover { background-color: var(--m-hover); }
+window.music list.music-track-list > row.music-track-row:selected { background-color: var(--m-selected); }
+window.music list.music-track-list > row.music-track-row:selected:hover { background-color: rgba(255, 255, 255, 0.14); }
+
+/* 区切り線は曲名の列から引く (番号や絵の下には引かない) */
+window.music row.music-track-row .music-track-main {
+  border-bottom: 1px solid var(--m-separator);
+}
+
+window.music row.music-track-row.album .music-track-main { min-height: 42px; }
+window.music row.music-track-row.list .music-track-main { min-height: 51px; }
+window.music row.music-track-row.queue .music-track-main { min-height: 47px; }
+
+window.music list.music-track-list > row.music-track-row:last-child .music-track-main,
+window.music list.music-track-list > row.music-track-row:selected .music-track-main {
+  border-bottom-color: transparent;
+}
+
+window.music .music-track-number {
+  font-size: 13px;
+  color: var(--m-secondary);
+  font-feature-settings: "tnum";
+}
+
+window.music .music-track-favorite { color: var(--m-key-text); }
+
+window.music .music-track-title {
+  font-size: 13px;
+  color: var(--m-label);
+}
+
+window.music row.music-track-row.list .music-track-subtitle { font-size: 12px; }
+window.music row.music-track-row.queue .music-track-subtitle { font-size: 11px; }
+window.music .music-track-subtitle { font-size: 13px; color: var(--m-secondary); }
+
+window.music .music-track-extra,
+window.music .music-track-duration {
+  font-size: 12px;
+  color: var(--m-secondary);
+  font-feature-settings: "tnum";
+}
+
+window.music row.music-track-row.album .music-track-duration { font-size: 13px; }
+
+/* 再生中の曲: 曲名を赤く (番号の代わりの動く棒は PlayingIndicator) */
+window.music row.music-track-row.current .music-track-title {
+  color: var(--m-key-text);
+  font-weight: 600;
+}
+
+window.music row.music-track-row.unplayable .music-track-title,
+window.music row.music-track-row.unplayable .music-track-subtitle,
+window.music row.music-track-row.unplayable .music-track-duration {
+  color: var(--m-tertiary);
+}
+
+window.music .music-track-art-scrim {
+  border-radius: 4px;
+  background-color: rgba(0, 0, 0, 0.52);
+}
+
+window.music .music-playing-indicator { color: var(--m-key-text); }
+
+/* 行の「…」: 乗せたとき・選んだとき・開いているときだけ見せる */
+window.music menubutton.music-row-more > button {
+  min-width: 26px;
+  min-height: 26px;
+  padding: 0;
+  margin: 0;
+  border: none;
+  border-radius: 9999px;
+  background-color: transparent;
+  background-image: none;
+  box-shadow: none;
+  color: var(--m-label);
+  opacity: 0;
+  transition: opacity 100ms ease, background-color 100ms ease, color 100ms ease;
+}
+
+window.music row:hover menubutton.music-row-more > button,
+window.music row:selected menubutton.music-row-more > button,
+window.music row:focus-within menubutton.music-row-more > button,
+window.music menubutton.music-row-more > button:checked {
+  opacity: 1;
+}
+
+window.music menubutton.music-row-more > button:hover { color: var(--m-key-text); background-color: rgba(255, 255, 255, 0.08); }
+window.music menubutton.music-row-more > button:checked { color: var(--m-key-text); background-color: rgba(255, 255, 255, 0.12); }
+
+/* ------------------------------------------------------------------
+ * 空・読み込み中
+ * ------------------------------------------------------------------ */
+
+window.music .music-empty { padding: 24px; }
+window.music .music-empty-icon { color: var(--m-tertiary); }
+
+window.music .music-empty-title {
+  font-size: 20px;
+  font-weight: 700;
+  color: var(--m-label);
+}
+
+window.music .music-empty-description {
+  font-size: 13px;
+  color: var(--m-secondary);
+}
+
+window.music .music-loading { padding: 24px; color: var(--m-secondary); }
+window.music .music-loading-label { font-size: 13px; color: var(--m-secondary); }
+
+/* ------------------------------------------------------------------
+ * 入力欄。検索はカプセルに赤いフォーカスの輪
+ * ------------------------------------------------------------------ */
+
+window.music entry {
+  caret-color: var(--m-key-text);
+  outline-color: transparent;
+}
+
+window.music entry > text > selection,
+window.music label > selection {
+  background-color: rgba(250, 45, 72, 0.38);
+  color: #ffffff;
+}
+
+window.music entry:focus-within {
+  border-color: rgba(250, 88, 106, 0.85);
+  box-shadow: 0 0 0 3px rgba(250, 45, 72, 0.28);
+}
+
+window.music entry.search {
+  min-height: 30px;
+  padding: 0 10px;
+  border: 1px solid rgba(255, 255, 255, 0.07);
+  border-radius: 9999px;
+  background-color: var(--m-fill);
+  background-image: none;
+  box-shadow: none;
+  color: var(--m-label);
+}
+
+window.music entry.search:focus-within {
+  border-color: rgba(250, 88, 106, 0.90);
+  box-shadow: 0 0 0 3px rgba(250, 45, 72, 0.30);
+}
+
+window.music entry.search > image { color: var(--m-secondary); }
+window.music entry.search > text > placeholder { color: var(--m-tertiary); }
+
+/* ------------------------------------------------------------------
+ * 切り替え (Adw.ToggleGroup。検索の範囲など)。カプセルの中で選んだものが
+ * 一段明るいカプセルになる
+ * ------------------------------------------------------------------ */
+
+window.music toggle-group {
+  padding: 2px;
+  border-radius: 9999px;
+  background-color: var(--m-fill);
+  background-image: none;
+  box-shadow: none;
+}
+
+window.music toggle-group > toggle {
+  min-height: 26px;
+  border-radius: 9999px;
+  color: var(--m-label);
+  font-weight: 500;
+}
+
+window.music toggle-group > toggle:hover { background-color: rgba(255, 255, 255, 0.06); }
+
+window.music toggle-group > toggle:checked {
+  background-color: rgba(255, 255, 255, 0.17);
+  color: var(--m-label);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.28);
+}
+
+/* ------------------------------------------------------------------
+ * メニュー・ポップオーバー。暗いガラス、角 12
+ * ------------------------------------------------------------------ */
+
+window.music popover > contents {
+  padding: 5px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 12px;
+  background-color: var(--m-popover);
+  background-image: linear-gradient(to bottom,
+    rgba(255, 255, 255, 0.05),
+    rgba(255, 255, 255, 0) 40%);
+  box-shadow:
+    inset 0 1px rgba(255, 255, 255, 0.10),
+    0 8px 11px rgba(0, 0, 0, 0.36);
+  color: var(--m-label);
+}
+
+window.music popover > arrow {
+  background-color: var(--m-popover);
+  border-color: rgba(255, 255, 255, 0.12);
+}
+
+window.music popover.menu modelbutton {
+  min-height: 24px;
+  padding: 0 10px;
+  border-radius: 6px;
+  color: var(--m-label);
+}
+
+window.music popover.menu modelbutton:hover,
+window.music popover.menu modelbutton:selected {
+  background-color: var(--m-key);
+  color: #ffffff;
+}
+
+window.music popover.menu modelbutton:disabled { color: var(--m-tertiary); }
+window.music popover.menu modelbutton arrow { color: inherit; }
+
+window.music popover.menu separator {
+  margin: 4px 8px;
+  background-color: rgba(255, 255, 255, 0.10);
+}
+
+window.music popover.menu label.title {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--m-secondary);
+}
+
+/* ------------------------------------------------------------------
+ * トースト。濃いガラスのカプセル
+ * ------------------------------------------------------------------ */
+
+window.music toast {
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 9999px;
+  background-color: var(--m-popover);
+  background-image: none;
+  box-shadow:
+    inset 0 1px rgba(255, 255, 255, 0.10),
+    0 6px 13px rgba(0, 0, 0, 0.36);
+  color: var(--m-label);
+}
+
+window.music toast button {
+  background-color: transparent;
+  background-image: none;
+  border: none;
+  box-shadow: none;
+  color: var(--m-key-text);
+}
+
+window.music toast button:hover { background-color: rgba(255, 255, 255, 0.08); }
+window.music toast button.circular { color: var(--m-secondary); }
+
+/* ------------------------------------------------------------------
+ * スクロールバー。細く、内容の上に重ねる
+ * ------------------------------------------------------------------ */
+
+window.music scrollbar {
+  background-color: transparent;
+  background-image: none;
+  box-shadow: none;
+}
+
+/* つまみの太さと余白は libadwaita のまま (負の余白で細く見せているので、
+ * ここで枠や最小寸法を変えると大きさが負になり警告が出る)。色だけ替える。 */
+window.music scrollbar slider { background-color: rgba(255, 255, 255, 0.30); }
+window.music scrollbar slider:hover { background-color: rgba(255, 255, 255, 0.45); }
+window.music scrollbar slider:active { background-color: rgba(255, 255, 255, 0.55); }
