@@ -4,13 +4,15 @@
 使い方 (開発用の Xvfb の画面番号は他と重ならないものを選ぶ):
 
     nix develop path:. -c xvfb-run -n 93 -s "-screen 0 2400x2400x24" \\
-        python3 scripts/gallery.py --out /tmp/gallery
+        python3 scripts/gallery.py --out /tmp/gallery [--scheme light|dark]
 
 - 親のプロセスが子 (--child) を dbus-run-session の下で起こし、子の標準エラーを
   見張る。「Theme parser error」「Gtk-CRITICAL」「Gtk-WARNING」「markup」
   「Traceback」(シグナルの中の Python の例外は落ちずに印字だけされる) などの
   行が 1 つでも出たら失敗 (終了コード 1) にする。
 - CSS (style/base.css) は USER + 1 で読み、parsing-error が 1 つでも出たら失敗。
+- 外観は --scheme (既定 dark) で選ぶ (子に ADW_DEBUG_COLOR_SCHEME を渡す。CSS の provider は
+  アプリと同じく gtk-interface-color-scheme に束ねる)。
 - 自作の記号アイコンがアイコンテーマから引けなければ失敗。
 - アプリ本体 (MusicApp) には触れない。アプリ ID は別 (…Gallery)、NON_UNIQUE。
 - 他の部品 (protocol / artwork) は読めれば本物を使い、無ければここの小さな
@@ -61,6 +63,8 @@ def run_parent(args: argparse.Namespace) -> int:
         "PYTHONDONTWRITEBYTECODE": "1",
         # 専用のバスで gvfsd が起きて、終わりぎわに雑音を出すのを避ける
         "GIO_USE_VFS": "local",
+        # 外観 (アプリは OS に従うので、ここで libadwaita に選ばせる)
+        "ADW_DEBUG_COLOR_SCHEME": f"prefer-{args.scheme}",
     })
     cmd = [sys.executable, str(Path(__file__).resolve()), "--child", "--out", args.out]
     for sheet in args.sheet or []:
@@ -165,7 +169,7 @@ def child_main(args: argparse.Namespace) -> int:
     gi.require_version("Adw", "1")
     gi.require_version("Gsk", "4.0")
     gi.require_version("Graphene", "1.0")
-    from gi.repository import Adw, Gdk, Gio, GLib, Graphene, Gtk, Pango
+    from gi.repository import Adw, Gdk, Gio, GLib, GObject, Graphene, Gtk, Pango
     import cairo
 
     from cliamp_music import widgets as W
@@ -744,6 +748,9 @@ def child_main(args: argparse.Namespace) -> int:
 
     def load_css(display: Gdk.Display) -> None:
         provider = Gtk.CssProvider()
+        # アプリ (app.follow_color_scheme) と同じく外観に束ねる。束ねないとダークの @media が当たらない
+        Gtk.Settings.get_for_display(display).bind_property(
+            "gtk-interface-color-scheme", provider, "prefers-color-scheme", GObject.BindingFlags.SYNC_CREATE)
 
         def on_error(_provider, section, error):
             css_errors.append(f"{section.to_string()}: {error.message}")
@@ -755,7 +762,7 @@ def child_main(args: argparse.Namespace) -> int:
         extra = Gtk.CssProvider()
         extra.connect("parsing-error", on_error)
         extra.load_from_string(
-            "window.music .gallery-frame { border: 1px dashed rgba(255,255,255,0.12); border-radius: 12px; }"
+            "window.music .gallery-frame { border: 1px dashed var(--m-popover-edge); border-radius: 12px; }"
             "window.music .gallery-panel { background-color: var(--m-sidebar); padding: 18px 12px 24px 12px; }"
             "window.music button.gallery-queue-toggle { min-height: 34px; border-radius: 9999px; border: none;"
             " background-image: none; box-shadow: none; background-color: var(--m-fill); color: var(--m-label); }"
@@ -846,7 +853,6 @@ def child_main(args: argparse.Namespace) -> int:
         return GLib.SOURCE_REMOVE
 
     def on_startup(application) -> None:
-        Adw.StyleManager.get_default().set_color_scheme(Adw.ColorScheme.FORCE_DARK)
         display = Gdk.Display.get_default()
         load_css(display)
         theme = Gtk.IconTheme.get_for_display(display)
@@ -874,6 +880,7 @@ def main() -> int:
                         help="PNG を置くディレクトリ")
     parser.add_argument("--sheet", action="append", choices=SHEETS, help="撮る面 (複数可。省くと全部)")
     parser.add_argument("--timeout", type=int, default=120, help="子を待つ秒数")
+    parser.add_argument("--scheme", choices=("light", "dark"), default="dark", help="外観 (既定 dark)")
     parser.add_argument("--child", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.child:

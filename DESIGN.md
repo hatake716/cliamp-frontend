@@ -14,10 +14,19 @@ cliamp が行い、アプリを閉じても音楽は止まらない。
 - アプリ ID `org.nixos.Music`、表示名「ミュージック」、実行ファイル `cliamp-music`。
 - Python パッケージ `cliamp_music` (`python -m cliamp_music`)。文字列・ログ・
   コメントは日本語 (gettext は使わない)。ログは `print("cliamp-music: …", file=sys.stderr)`。
-- 配色は暗色のみ (`Adw.ColorScheme.FORCE_DARK`)。このデスクトップは暗色固定で、
+- 配色は OS の外観 (ライト / ダーク) に従う (Apple のミュージックと同じ。2026-09-27 までは
+  `Adw.ColorScheme.FORCE_DARK` の暗色だけだった)。`Adw.StyleManager` は既定 (DEFAULT) のまま触らない。
   全体の `~/.config/gtk-4.0/gtk.css` が USER 優先度 (800) で上書きしてくるため、
   アプリの CSS は **`Gtk.STYLE_PROVIDER_PRIORITY_USER + 1`** で読み、すべての
   規則をアプリの窓のクラス (`window.music`) の下に閉じ込める。
+- 外観の仕組み (§5): CSS はライトを既定に、ダークを `@media (prefers-color-scheme: dark)` に持つ。
+  色は `style/base.css` の変数だけが持ち、規則には直に書かない (外観で変わらない所を除く。
+  `tests/test_style.py` が確かめる)。アプリが作った `Gtk.CssProvider` は GTK も libadwaita も外観に
+  束ねないので、`app.load_css` が各 provider の `prefers-color-scheme` を GtkSettings の
+  `gtk-interface-color-scheme` に束ねる (束ねないとダークの `@media` が決して当たらない)。
+  フルスクリーンプレーヤーとミニプレーヤーは外観によらず暗い (ぼかした絵の上に白)。
+  自分で描く線 (`widgets.Artwork` のふち、再生バーの線) は CSS の `color` を読み、イコライザの線は
+  `equalizer.EQ_COLORS` を外観で選ぶ。
 - アプリの窓 (メイン・ミニプレーヤー・イコライザ) はすべて CSS クラス `music` を持つ。
 - GTK の罠 (このリポジトリの利用者の環境で実際に踏んだもの):
   - `Adw.HeaderBar` の `pack_start`/`pack_end` は縮まずに重なる。伸縮させたい
@@ -76,7 +85,7 @@ cliamp_music/
   miniplayer.py    MiniPlayer
   equalizer.py     EqualizerWindow
   style/
-    base.css       色・文字・共通部品 (widgets.py の見た目)
+    base.css       色の変数 (ライト・ダーク・外観によらず暗いところ)・文字・共通部品 (widgets.py の見た目)
     shell.css      サイドバー・再生バー・右パネル
     pages.css      各ページ
     player.css     フルスクリーン・ミニプレーヤー・イコライザ
@@ -732,20 +741,35 @@ Enter と欄を離れたときは出さずにおいた形の誤りも言う。�
 
 ## 5. 見た目の基準値 (style/base.css の変数)
 
-| 変数 | 値 | 用途 |
-|---|---|---|
-| `--m-canvas` | `rgb(28, 29, 33)` | 本文の地 (App Store の自作テーマと同じ) |
-| `--m-sidebar` | `rgb(41, 43, 50)` | サイドバーと右パネルの地 |
-| `--m-key` | `#fa2d48` | Music の赤 (塗り) |
-| `--m-key-text` | `#fa586a` | 暗い地の上の赤い文字・記号 |
-| `--m-label` | `rgba(255,255,255,0.92)` | 本文 |
-| `--m-secondary` | `rgba(235,235,245,0.60)` | 副次 |
-| `--m-tertiary` | `rgba(235,235,245,0.32)` | 3 次 |
-| `--m-fill` | `rgba(118,118,128,0.24)` | 丸ボタン・「再生」カプセルの地 |
-| `--m-separator` | `rgba(255,255,255,0.09)` | 区切り線 |
-| `--m-selected` | `rgba(255,255,255,0.115)` | サイドバーの選択 |
-| `--m-hover` | `rgba(255,255,255,0.05)` | 行のホバー |
-| `--m-glass` | `rgba(46,47,54,0.90)` | 再生バーなどのガラス面 |
+変数は 3 つの塊に置く: ライト (既定の `window.music`)、ダーク (`@media (prefers-color-scheme: dark)`
+の中の `window.music`)、外観によらず暗いところ (`window.music .music-fullscreen, window.music.music-mini`。
+中身はダークと同じで、`tests/test_style.py` が一致を確かめる)。ダークの値は暗色固定だったときの値そのまま。
+ライトの文字・線・入力欄・ポップオーバーは /etc/nixos の `desktop/APPEARANCE.md` §5 (macOS の
+NSColor の実測と macOS 26/27 の見積り) と同じ値。
+
+| 変数 | ライト | ダーク | 用途 |
+|---|---|---|---|
+| `--m-canvas` | `#ffffff` | `rgb(28, 29, 33)` | 本文の地 (ダークは App Store の自作テーマと同じ) |
+| `--m-sidebar` | `rgba(242,242,246,0.92)` | `rgb(41, 43, 50)` | サイドバーと右パネルの地 |
+| `--m-sidebar-over` | `rgb(242,242,246)` | `rgb(41, 43, 50)` | 内容の上に重ねたサイドバー・右パネル (下の文字が透けない) |
+| `--m-key` | `#fa2d48` | (同じ) | Music の赤 (塗り) |
+| `--m-key-text` | `#e0223b` | `#fa586a` | 赤い文字・記号 (ライトは白の上で 4.7:1 に届く濃さ) |
+| `--m-label` | `rgba(0,0,0,0.85)` | `rgba(255,255,255,0.92)` | 本文 |
+| `--m-secondary` | `rgba(0,0,0,0.50)` | `rgba(235,235,245,0.60)` | 副次 |
+| `--m-tertiary` | `rgba(0,0,0,0.26)` | `rgba(235,235,245,0.32)` | 3 次 |
+| `--m-fill` | `rgba(118,118,128,0.12)` | `rgba(118,118,128,0.24)` | 丸ボタン・「再生」カプセルの地 |
+| `--m-separator` | `rgba(0,0,0,0.10)` | `rgba(255,255,255,0.09)` | 区切り線 |
+| `--m-selected` | `rgba(0,0,0,0.07)` | `rgba(255,255,255,0.115)` | サイドバーの選択 |
+| `--m-hover` | `rgba(0,0,0,0.04)` | `rgba(255,255,255,0.05)` | 行のホバー |
+| `--m-wash-NN` | 黒 (白 NN% のおよそ 0.6 倍) | 白 NN% | 乗せた・押した・入っている丸や行の地 (06〜15) |
+| `--m-glass` | `rgba(255,255,255,0.78)` | `rgba(46,47,54,0.90)` | ページの上に浮かべるガラスの丸・カプセル |
+| `--m-bar` | `rgba(250,250,252,0.94)` | `rgba(48,49,57,0.94)` | 再生バー |
+| `--m-popover` | `rgba(250,250,252,0.96)` | `rgba(40,41,48,0.97)` | メニュー・トースト (縁 `--m-popover-edge`) |
+| `--m-warning` | `#b35c00` | `#ffb340` | 再生できなかった理由 (琥珀。ライトは白の上で 4.7:1) |
+| `--m-art-edge` | `rgba(0,0,0,0.08)` | `rgba(255,255,255,0.07)` | 絵のふちの線 (`widgets.Artwork` が `color` として読む) |
+
+ほかの変数 (影・縁・帯・線など) は base.css の塊にある。影やグラデーションは値ごと変数にする
+(`--m-glass-shadow` など。ダークの白い上端の光や濃い影を、ライトでは薄い影に替える)。
 
 文字: 大見出し 34px/700、詳細の題 26px/700、棚の見出し 17px/700、本文 13px、
 副題 12px、情報 11px/600、上見出し 10px/600 大文字。数字は `font-feature-settings: "tnum"`。
@@ -753,7 +777,8 @@ Enter と欄を離れたときは出さずにおいた形の誤りも言う。�
 
 角: 詳細の絵 10、格子の絵 7、行の絵 4、タイル 8、カード 12、ボタンはカプセルか円。
 
-アクセント: libadwaita の `--accent-bg-color` / `--accent-color` もアプリの中では赤にする。
+アクセント: libadwaita の `--accent-bg-color` / `--accent-color` もアプリの中では赤にする
+(`--accent-color` はライトで `#e0223b`、ダークで `#fa586a`)。
 
 ## 6. キー操作 (Command → Ctrl)
 

@@ -40,7 +40,7 @@ window.music overlay-split-view.music-split > widget.background {
   background-color: var(--m-sidebar);
   background-image: none;
   border: none;
-  box-shadow: inset -1px 0 rgba(0, 0, 0, 0.42);
+  box-shadow: inset -1px 0 var(--m-pane-edge);
   color: var(--m-label);
 }
 
@@ -49,23 +49,26 @@ window.music overlay-split-view.music-panel-split > widget.background {
   background-color: var(--m-sidebar);
   background-image: none;
   border: none;
-  box-shadow: inset 1px 0 rgba(0, 0, 0, 0.42);
+  box-shadow: inset 1px 0 var(--m-pane-edge);
   color: var(--m-label);
 }
 
-/* 畳んだとき (内容の上に重ねたとき) は浮いた影 */
+/* 畳んだとき (内容の上に重ねたとき) は浮いた影。地は透けない色 (ライトのサイドバーは
+ * 半透明なので、そのまま重ねると下の文字が透けて見える。ダークは同じ色) */
 window.music overlay-split-view.music-split.collapsed > .sidebar-pane,
 window.music overlay-split-view.music-split > widget.background {
-  box-shadow: 1px 0 rgba(0, 0, 0, 0.50), 10px 0 26px rgba(0, 0, 0, 0.36);
+  background-color: var(--m-sidebar-over);
+  box-shadow: 1px 0 var(--m-float-edge), 10px 0 26px var(--m-float-shadow);
 }
 
 window.music overlay-split-view.music-panel-split > widget.background {
-  box-shadow: -1px 0 rgba(0, 0, 0, 0.50), -10px 0 26px rgba(0, 0, 0, 0.36);
+  background-color: var(--m-sidebar-over);
+  box-shadow: -1px 0 var(--m-float-edge), -10px 0 26px var(--m-float-shadow);
 }
 
 window.music overlay-split-view.music-split > dimming,
 window.music overlay-split-view.music-panel-split > dimming {
-  background-color: rgba(0, 0, 0, 0.18);
+  background-color: var(--m-dimming);
 }
 
 window.music overlay-split-view.music-split > .content-pane,
@@ -162,11 +165,11 @@ window.music list.music-sidebar-list > row.music-sidebar-row.with-art {
 }
 
 window.music list.music-sidebar-list > row.music-sidebar-row:hover {
-  background-color: rgba(255, 255, 255, 0.05);
+  background-color: var(--m-hover);
 }
 
 window.music list.music-sidebar-list > row.music-sidebar-row:active {
-  background-color: rgba(255, 255, 255, 0.08);
+  background-color: var(--m-wash-08);
 }
 
 window.music list.music-sidebar-list > row.music-sidebar-row:selected,
@@ -202,7 +205,7 @@ window.music list.music-sidebar-list label.music-sidebar-section {
   margin: 14px 18px 5px 20px;
   font-size: 11px;
   font-weight: 600;
-  color: rgba(235, 235, 245, 0.40);
+  color: var(--m-section-label);
 }
 
 /* 下端の状態「● cliamp · 再生中」 */
@@ -226,14 +229,14 @@ window.music menubutton.music-sidebar-status > button:backdrop {
 }
 
 window.music menubutton.music-sidebar-status > button:hover {
-  background-color: rgba(255, 255, 255, 0.05);
+  background-color: var(--m-hover);
   border: none;
   box-shadow: none;
 }
 
 window.music menubutton.music-sidebar-status > button:active,
 window.music menubutton.music-sidebar-status > button:checked {
-  background-color: rgba(255, 255, 255, 0.09);
+  background-color: var(--m-wash-09);
   border: none;
   box-shadow: none;
 }
@@ -245,11 +248,11 @@ window.music .music-status-dot {
   background-color: var(--m-tertiary);
 }
 
-window.music .music-status-dot.playing { background-color: #32d74b; box-shadow: 0 0 0 3px rgba(50, 215, 75, 0.16); }
+window.music .music-status-dot.playing { background-color: var(--m-green); box-shadow: 0 0 0 3px var(--m-green-glow); }
 window.music .music-status-dot.paused,
-window.music .music-status-dot.stopped { background-color: #32d74b; }
-window.music .music-status-dot.loading { background-color: #ffd60a; }
-window.music .music-status-dot.offline { background-color: rgba(235, 235, 245, 0.30); }
+window.music .music-status-dot.stopped { background-color: var(--m-green); }
+window.music .music-status-dot.loading { background-color: var(--m-yellow); }
+window.music .music-status-dot.offline { background-color: var(--m-dot-off); }
 
 window.music .music-status-title {
   font-size: 12px;
@@ -319,10 +322,7 @@ window.music button.music-link-button:active {
 
 /* 後ろの内容を地の色へ溶かす帯 */
 window.music .music-bar-fade {
-  background-image: linear-gradient(to bottom,
-    rgba(28, 29, 33, 0),
-    rgba(28, 29, 33, 0.55) 45%,
-    rgba(28, 29, 33, 0.86));
+  background-image: var(--m-bar-fade);
 }
 
 window.music.fullscreen-player .music-bar-fade { background-image: none; }
@@ -331,27 +331,20 @@ window.music box.music-player-bar {
   min-height: 54px;
   padding: 0 8px 0 10px;
   border-radius: 9999px;
-  background-color: rgba(48, 49, 57, 0.94);
-  background-image: linear-gradient(to bottom,
-    rgba(255, 255, 255, 0.085),
-    rgba(255, 255, 255, 0.015) 48%,
-    rgba(0, 0, 0, 0.06));
-  border: 1px solid rgba(255, 255, 255, 0.11);
-  box-shadow:
-    inset 0 1px rgba(255, 255, 255, 0.13),
-    inset 0 -1px rgba(0, 0, 0, 0.30),
-    0 6px 14px rgba(0, 0, 0, 0.38),
-    0 1px 3px rgba(0, 0, 0, 0.30);
+  background-color: var(--m-bar);
+  background-image: var(--m-bar-shine);
+  border: 1px solid var(--m-bar-edge);
+  box-shadow: var(--m-bar-shadow);
   color: var(--m-label);
 }
 
-/* 操作の丸 (前へ・再生・次へ) は地なし。記号は明るい白 */
+/* 操作の丸 (前へ・再生・次へ) は地なし。記号は本文の色 */
 window.music box.music-player-bar button.music-circle.flat {
   color: var(--m-label);
 }
 
 window.music box.music-player-bar button.music-circle.flat:hover {
-  background-color: rgba(255, 255, 255, 0.08);
+  background-color: var(--m-wash-08);
 }
 
 window.music box.music-player-bar button.music-circle.flat:disabled {
@@ -403,14 +396,14 @@ window.music box.music-player-bar menubutton.music-bar-icon > button:backdrop {
 }
 
 window.music box.music-player-bar menubutton.music-bar-icon > button:hover {
-  background-color: rgba(255, 255, 255, 0.08);
+  background-color: var(--m-wash-08);
   border: none;
   box-shadow: none;
 }
 
 window.music box.music-player-bar menubutton.music-bar-icon > button:active,
 window.music box.music-player-bar menubutton.music-bar-icon > button:checked {
-  background-color: rgba(255, 255, 255, 0.13);
+  background-color: var(--m-wash-13);
   border: none;
   box-shadow: none;
 }
@@ -509,11 +502,11 @@ window.music box.music-player-bar .music-bar-idle {
 
 /* 再生位置の線 (color = 塗った部分。地の線はその色を薄くして描く) */
 window.music box.music-player-bar .music-progress {
-  color: rgba(255, 255, 255, 0.62);
+  color: var(--m-progress);
 }
 
 window.music box.music-player-bar .music-progress:hover {
-  color: rgba(255, 255, 255, 0.80);
+  color: var(--m-progress-hover);
 }
 
 /* 未接続: 全体を薄く */
@@ -542,7 +535,7 @@ window.music scale.music-volume-scale {
 window.music scale.music-volume-scale > trough {
   min-height: 4px;
   border-radius: 9999px;
-  background-color: rgba(255, 255, 255, 0.18);
+  background-color: var(--m-volume-track);
   background-image: none;
   border: none;
   box-shadow: none;
@@ -552,7 +545,7 @@ window.music scale.music-volume-scale > trough {
 window.music scale.music-volume-scale > trough > highlight {
   min-height: 4px;
   border-radius: 9999px;
-  background-color: rgba(255, 255, 255, 0.86);
+  background-color: var(--m-volume-fill);
   background-image: none;
   border: none;
   box-shadow: none;
@@ -592,16 +585,16 @@ window.music banner.music-banner > revealer > widget {
   min-height: 30px;
   padding: 3px 14px;
   border: none;
-  background-color: rgba(255, 159, 10, 0.16);
+  background-color: var(--m-banner);
   background-image: none;
-  box-shadow: inset 0 -1px rgba(255, 159, 10, 0.22);
-  color: #ffd28a;
+  box-shadow: inset 0 -1px var(--m-banner-edge);
+  color: var(--m-banner-text);
 }
 
 window.music banner.music-banner > revealer > widget > label {
   font-size: 12px;
   font-weight: 600;
-  color: #ffd28a;
+  color: var(--m-banner-text);
 }
 
 /* ------------------------------------------------------------------
@@ -678,13 +671,13 @@ window.music button.music-lyric-line:backdrop {
 }
 
 window.music button.music-lyric-line:hover {
-  background-color: rgba(255, 255, 255, 0.05);
+  background-color: var(--m-hover);
   border: none;
   box-shadow: none;
 }
 
 window.music button.music-lyric-line:active {
-  background-color: rgba(255, 255, 255, 0.09);
+  background-color: var(--m-wash-09);
   border: none;
   box-shadow: none;
 }
@@ -696,7 +689,7 @@ window.music button.music-lyric-line .music-lyric-text {
   color: inherit;
 }
 
-window.music button.music-lyric-line.past { color: rgba(235, 235, 245, 0.26); }
+window.music button.music-lyric-line.past { color: var(--m-lyric-past); }
 window.music button.music-lyric-line.current { color: var(--m-label); }
 window.music .music-lyrics.unsynced button.music-lyric-line { color: var(--m-label); }
 window.music .music-lyrics.unsynced button.music-lyric-line .music-lyric-text { font-size: 20px; }
@@ -714,7 +707,7 @@ window.music button.music-panel-toggle:backdrop {
   margin: 0;
   border: none;
   border-radius: 9999px;
-  background-color: rgba(118, 118, 128, 0.28);
+  background-color: var(--m-pill);
   background-image: none;
   box-shadow: none;
   color: var(--m-label);
@@ -722,7 +715,7 @@ window.music button.music-panel-toggle:backdrop {
 }
 
 window.music button.music-panel-toggle:hover {
-  background-color: rgba(118, 118, 128, 0.38);
+  background-color: var(--m-pill-hover);
   border: none;
   box-shadow: none;
 }
@@ -736,7 +729,7 @@ window.music button.music-panel-toggle:checked:backdrop {
 }
 
 window.music button.music-panel-toggle:checked:hover { background-color: var(--m-key-hover); }
-window.music button.music-panel-toggle:disabled { color: var(--m-tertiary); background-color: rgba(118, 118, 128, 0.16); }
+window.music button.music-panel-toggle:disabled { color: var(--m-tertiary); background-color: var(--m-pill-disabled); }
 
 window.music .music-panel-toggle-label {
   font-size: 13px;

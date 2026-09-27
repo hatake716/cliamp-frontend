@@ -33,10 +33,7 @@ window.music headerbar.music-page-header {
 }
 
 window.music headerbar.music-page-header.scrolled {
-  background-image: linear-gradient(to bottom,
-    rgba(28, 29, 33, 0.97),
-    rgba(28, 29, 33, 0.90) 62%,
-    rgba(28, 29, 33, 0));
+  background-image: var(--m-header-fade);
 }
 
 window.music .music-header-title {
@@ -205,7 +202,7 @@ window.music button.music-top-result {
   margin: 0;
   border: none;
   border-radius: 12px;
-  background-color: rgba(255, 255, 255, 0.05);
+  background-color: var(--m-card);
   background-image: none;
   box-shadow: none;
   color: var(--m-label);
@@ -213,8 +210,8 @@ window.music button.music-top-result {
   transition: background-color 140ms ease;
 }
 
-window.music button.music-top-result:hover { background-color: rgba(255, 255, 255, 0.08); }
-window.music button.music-top-result:active { background-color: rgba(255, 255, 255, 0.11); }
+window.music button.music-top-result:hover { background-color: var(--m-wash-08); }
+window.music button.music-top-result:active { background-color: var(--m-wash-11); }
 
 window.music .music-top-result-title {
   font-size: 22px;
@@ -283,9 +280,9 @@ window.music .music-import-form { margin-top: 2px; }
 window.music .music-import-dialog entry.music-import-entry {
   min-height: 34px;
   padding: 0 10px;
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  border: 1px solid var(--m-control-edge);
   border-radius: 8px;
-  background-color: rgba(118, 118, 128, 0.20);
+  background-color: var(--m-dialog-field);
   background-image: none;
   box-shadow: none;
   color: var(--m-label);
@@ -309,24 +306,24 @@ window.music .music-import-hint.problem { color: var(--m-warning); }
 window.music .music-import-well {
   margin-top: 12px;
   padding: 10px 12px 10px 10px;
-  border: 1px solid rgba(255, 255, 255, 0.06);
+  border: 1px solid var(--m-card-edge);
   border-radius: 12px;
-  background-color: rgba(255, 255, 255, 0.05);
+  background-color: var(--m-card);
 }
 
 /* 誤りのときは縁を琥珀色に */
-window.music .music-import-well.problem { border-color: rgba(255, 179, 64, 0.30); }
+window.music .music-import-well.problem { border-color: var(--m-warning-edge); }
 
 /* どの頁も同じ高さ (窓が上下に動かない)。絵 56px と、3 行までの誤り + 「もう一度読む」が入る */
 window.music .music-import-well-page { min-height: 60px; }
 
 window.music .music-import-tile {
   border-radius: 6px;
-  background-color: rgba(255, 255, 255, 0.06);
+  background-color: var(--m-wash-06);
 }
 
 window.music .music-import-tile.placeholder image { color: var(--m-tertiary); }
-window.music .music-import-tile.problem { background-color: rgba(255, 179, 64, 0.12); }
+window.music .music-import-tile.problem { background-color: var(--m-warning-soft); }
 window.music .music-import-tile.problem image { color: var(--m-warning); }
 
 window.music .music-import-placeholder-label,

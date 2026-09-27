@@ -4,7 +4,7 @@
 使い方 (Xvfb の画面番号は他と重ならない私用のものを選ぶ。:10 以上でないと動かない):
 
     nix develop path:. -c xvfb-run -n 97 -s "-screen 0 1600x1100x24" \\
-        python3 scripts/shoot.py [--out DIR] [--only NAME ...] [--keys] [--no-user-theme]
+        python3 scripts/shoot.py [--out DIR] [--only NAME ...] [--keys] [--no-user-theme] [--scheme light|dark]
 
 何をするか:
 - 親: 一時ディレクトリに曲の絵を描く (色の違うグラデーションの正方形と、YouTube の
@@ -25,6 +25,9 @@
   一時的な XDG_CONFIG_HOME に写して使う (実際のデスクトップと同じ上書きの中で見るため。
   --no-user-theme で使わない)。
 - --keys: xdotool があれば本物のキーを送ってショートカット (DESIGN.md §6) を確かめる。
+- --scheme: 外観 (既定 dark。README の画面写真と同じ)。アプリは OS の外観に従うので、子に
+  ADW_DEBUG_COLOR_SCHEME=prefer-light / prefer-dark を渡して libadwaita に選ばせる。
+  フルスクリーンとミニプレーヤーはどちらでも暗い。
 
 撮る画面 (NAME): home, search, search-results, radio, recent, playlists, playlist,
 nowplaying, lyrics, queue, fullscreen-lyrics, fullscreen-queue, mini-square, mini-compact,
@@ -349,6 +352,8 @@ def run_parent(args: argparse.Namespace) -> int:
             "CLIAMP_MUSIC_NON_UNIQUE": "1",
             # 「cliamp を起動」で本物のサービスに触れない
             "CLIAMP_MUSIC_START_COMMAND": "false",
+            # 外観 (アプリは OS に従う。ポータルを切っているので libadwaita に直接選ばせる)
+            "ADW_DEBUG_COLOR_SCHEME": f"prefer-{args.scheme}",
         })
         cmd = [sys.executable, str(Path(__file__).resolve()), "--child", "--out", str(out),
                "--work", str(work)]
@@ -1558,6 +1563,8 @@ def main() -> int:
     parser.add_argument("--no-user-theme", action="store_true", help="利用者の gtk.css を写さない")
     parser.add_argument("--keys", action="store_true", help="xdotool で本物のキーを確かめる")
     parser.add_argument("--only", action="append", help="この画面だけ保存する (複数可。手順はすべて通す)")
+    parser.add_argument("--scheme", choices=("light", "dark"), default="dark",
+                        help="外観 (既定 dark。フルスクリーンとミニプレーヤーはどちらでも暗い)")
     parser.add_argument("--child", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--work", help=argparse.SUPPRESS)
     args = parser.parse_args()

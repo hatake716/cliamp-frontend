@@ -11,6 +11,9 @@
  * フルスクリーンとミニプレーヤーは、ぼかした絵の上に白い文字と白い記号を置く
  * (Apple と同じ。赤は「ライブ」の印とつまみ以外に使わない)。ガラスは暗い面では
  * なく、明るい半透明の面 (下の絵が既にぼけているので、それらしく見える)。
+ * この 2 つは外観 (ライト / ダーク) によらず暗いまま: 中の部品 (曲の行・メニュー・
+ * 丸いボタン) が読む --m-… は、base.css の 3 つ目の塊がダークの値に固定する。
+ * イコライザは外観に従う (色は base.css の変数、自分で描く線は equalizer.EQ_COLORS)。
  */
 
 /* ------------------------------------------------------------------
@@ -400,7 +403,7 @@ window.music.music-mini windowcontrols.music-mini-window-controls button {
  * ------------------------------------------------------------------ */
 
 window.music.music-eq {
-  background-color: rgb(36, 37, 43);
+  background-color: var(--m-eq-ground);
   color: var(--m-label);
 }
 
@@ -428,11 +431,11 @@ window.music.music-eq dropdown.music-eq-preset > button {
   min-height: 28px;
   padding: 0 10px;
   margin: 0;
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  border: 1px solid var(--m-control-edge);
   border-radius: 8px;
   background-color: var(--m-fill);
   background-image: none;
-  box-shadow: inset 0 1px rgba(255, 255, 255, 0.06);
+  box-shadow: inset 0 1px var(--m-control-shine);
   color: var(--m-label);
   font-weight: 500;
 }
@@ -544,7 +547,7 @@ window.music.music-eq scale.music-eq-speed-scale > trough {
   min-height: 4px;
   border: none;
   border-radius: 9999px;
-  background-color: rgba(255, 255, 255, 0.14);
+  background-color: var(--m-track);
   background-image: none;
   box-shadow: none;
 }
@@ -571,7 +574,7 @@ window.music.music-eq scale.music-eq-speed-scale > trough > slider {
 }
 
 window.music.music-eq scale.music-eq-speed-scale mark > indicator {
-  background-color: rgba(255, 255, 255, 0.28);
+  background-color: var(--m-mark);
 }
 
 window.music.music-eq scale.music-eq-speed-scale mark > label {

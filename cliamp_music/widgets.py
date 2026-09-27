@@ -288,7 +288,8 @@ class Artwork(Gtk.Widget):
       (hexpand など) はその大きさで描き、足りなくなった解像度を取り直す。
     - 絵は中央を基準に覆うように拡大して切り抜く (正方形でない枠でも歪めない)。
     - shadow: 下に柔らかい影を落とす。ぼかしは角丸の半径より小さくする。
-    - outline: 暗い絵が地に沈まないよう、ふちに薄い光の線を引く。
+    - outline: 絵が地に沈まないよう、ふちに細い線を引く (ダークでは薄い光、ライトでは
+      薄い影。色は CSS の color = style/base.css の --m-art-edge)。
 
     `set_subject(loader, subject, key_for_placeholder=None, kind="track")`
       代わりの絵をすぐに出し、倍率 (scale factor) を掛けた画素数で本物を頼む。
@@ -605,7 +606,9 @@ class Artwork(Gtk.Widget):
         snapshot.append_outset_shadow(rounded, _rgba("rgba(0,0,0,0.34)"), 0, blur * 0.55, 0, blur)
 
     def _append_outline(self, snapshot: Gtk.Snapshot, rounded: Gsk.RoundedRect) -> None:
-        color = _rgba("rgba(255,255,255,0.07)")
+        # 線の色は CSS の color (.music-artwork の --m-art-edge)。ダークは薄い光、ライトは薄い影で、
+        # フルスクリーンの中では外観によらずダークの色になる。色が変われば GTK が描き直す
+        color = self.get_color()
         snapshot.append_border(rounded, [1, 1, 1, 1], [color, color, color, color])
 
     def do_snapshot(self, snapshot: Gtk.Snapshot) -> None:

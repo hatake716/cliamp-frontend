@@ -1,6 +1,6 @@
 """イコライザ (EqualizerWindow、Ctrl+Alt+E)。
 
-macOS のミュージックのイコライザを暗色に写したもの。上にプリセットの選択
+macOS のミュージックのイコライザを写したもの (外観のライト / ダークに従う)。上にプリセットの選択
 (cliamp の eq_presets + 「カスタム」) と「フラットに戻す」、中央に 10 本の縦の
 つまみ (−12〜+12 dB、赤い丸)。後ろに目盛りの線と dB の見出しを描く。
 下に再生速度 (0.5〜2.0 倍)。
@@ -28,6 +28,23 @@ from .protocol import EQ_BANDS, EQ_MAX_DB, EQ_MIN_DB  # noqa: E402
 from .widgets import install_space_toggle  # noqa: E402
 
 __all__ = ["EqualizerWindow", "band_label", "preset_label", "FALLBACK_PRESETS", "CUSTOM_LABEL"]
+
+# 自分で描く線と文字の色 (ダーク, ライト): 帯域の溝、目盛りの線 (0 dB とそれ以外)、dB の見出し。
+# ダークは暗色固定だったときの値のまま、ライトは style/base.css の --m-track・--m-secondary と
+# 同じ考えの黒。CSS の変数は描く側から読めないので、ここで外観を見て選ぶ (イコライザの窓は
+# フルスクリーンと違い外観に従うので、アプリ全体の外観 = Adw.StyleManager の dark でよい)
+EQ_COLORS = {
+    "track": ("rgba(255,255,255,0.14)", "rgba(0,0,0,0.10)"),
+    "line-zero": ("rgba(255,255,255,0.20)", "rgba(0,0,0,0.16)"),
+    "line": ("rgba(255,255,255,0.075)", "rgba(0,0,0,0.06)"),
+    "label": ("rgba(235,235,245,0.55)", "rgba(0,0,0,0.45)"),
+}
+
+
+def eq_color(name: str) -> Gdk.RGBA:
+    """EQ_COLORS の今の外観の色。"""
+    dark = Adw.StyleManager.get_default().get_dark()
+    return _rgba(EQ_COLORS[name][0 if dark else 1])
 
 CUSTOM_LABEL = "カスタム"
 # 拡張の無い cliamp (capabilities が無い) のときに出すプリセット (cliamp 1.50.0 の eq_presets.go の並び)。
@@ -112,8 +129,8 @@ class _Fader(Gtk.Scale):
             rounded = Gsk.RoundedRect()
             rounded.init_from_rect(_rect(cx - track_w / 2, top - 2, track_w, bottom - top + 4), track_w / 2)
             snapshot.push_rounded_clip(rounded)
-            snapshot.append_color(_rgba("rgba(255,255,255,0.14)"), _rect(cx - track_w / 2, top - 2, track_w,
-                                                                          bottom - top + 4))
+            snapshot.append_color(eq_color("track"), _rect(cx - track_w / 2, top - 2, track_w,
+                                                            bottom - top + 4))
             snapshot.pop()
             zero = self.value_y(0.0)
             here = self.value_y(self.get_value())
@@ -172,7 +189,7 @@ class _EqBoard(Gtk.Box):
                     continue
                 y = round(point.y) + 0.5
                 strong = abs(db) < 0.01
-                color = _rgba("rgba(255,255,255,0.20)" if strong else "rgba(255,255,255,0.075)")
+                color = eq_color("line-zero" if strong else "line")
                 snapshot.append_color(color, _rect(x0 + 4, y - 0.5, x1 - x0 - 8, 1))
                 text = self.LABELED.get(db)
                 if text:
@@ -183,7 +200,7 @@ class _EqBoard(Gtk.Box):
                     _ink, logical = layout.get_pixel_extents()
                     snapshot.save()
                     snapshot.translate(Graphene.Point().init(x0 - 8 - logical.width, y - logical.height / 2))
-                    snapshot.append_layout(layout, _rgba("rgba(235,235,245,0.55)"))
+                    snapshot.append_layout(layout, eq_color("label"))
                     snapshot.restore()
         Gtk.Box.do_snapshot(self, snapshot)
 
@@ -221,6 +238,7 @@ class EqualizerWindow(Adw.Window):
         install_space_toggle(self)
 
         self._handlers: list[int] = []
+        self._scheme_handler = 0
         self._syncing = False
         self._pending: dict[int, float] = {}
         self._send_timer = 0
@@ -334,6 +352,9 @@ class EqualizerWindow(Adw.Window):
         if not self._handlers:
             for name in ("status-changed", "connection-changed"):
                 self._handlers.append(store.connect(name, self._on_store))
+        if not self._scheme_handler:
+            # 自分で描く線 (EQ_COLORS) は CSS の読み直しでは変わらないので、外観が変われば描き直す
+            self._scheme_handler = Adw.StyleManager.get_default().connect("notify::dark", self._on_scheme)
         self._sync()
 
     def _on_unmap(self, *_args) -> None:
@@ -341,7 +362,15 @@ class EqualizerWindow(Adw.Window):
         for handler in self._handlers:
             store.disconnect(handler)
         self._handlers = []
+        if self._scheme_handler:
+            Adw.StyleManager.get_default().disconnect(self._scheme_handler)
+            self._scheme_handler = 0
         self._flush()
+
+    def _on_scheme(self, *_args) -> None:
+        self.board.queue_draw()
+        for fader in self.faders:
+            fader.queue_draw()
 
     def _on_store(self, _store) -> None:
         self._sync()

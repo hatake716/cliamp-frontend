@@ -10,17 +10,259 @@
  *
  * すべての規則はアプリの窓 (window.music) の下に閉じ込める。
  * 数値は macOS 27 のミュージックの画面写真からの実測を GTK 向けに丸めた
- * 調整値 (DESIGN.md §5)。暗色だけを持つ (FORCE_DARK)。
+ * 調整値 (DESIGN.md §5)。
+ *
+ * 外観 (ライト / ダーク) は OS に従う (2026-09-27 に FORCE_DARK をやめた)。
+ * 色は下の変数だけが持ち、規則には色を直に書かない (絵の上の白い文字・赤の上の
+ * 白など、外観で変わらないものを除く。tests/test_style.py が確かめる)。
  */
 
 /* ------------------------------------------------------------------
  * 変数
+ *
+ * 既定 (1 つ目の塊) がライト、@media (prefers-color-scheme: dark) の中
+ * (2 つ目) がダーク。ダークの値は暗色固定だったときの値そのまま。
+ * @media が外観を見るのは、app.py が CssProvider の prefers-color-scheme を
+ * GtkSettings の gtk-interface-color-scheme に束ねているから (アプリが作った
+ * CssProvider は GTK も libadwaita も束ねない。束ねるのはテーマと利用者の
+ * gtk.css だけ: gtk-4.22.4 gtk/gtksettings.c:1118-1139)。
+ *
+ * ライトの値: 文字・線・入力欄・ポップオーバー・スクロールバーは /etc/nixos の
+ * desktop/APPEARANCE.md §5 (macOS 12 の NSColor の実測と macOS 26/27 の見積り)
+ * と同じ。赤い文字は白の上で 4.5:1 に届くよう暗くした赤 (#e0223b、4.7:1)、
+ * それ以外は Apple のミュージック (ライト) の画面写真からの見積り。
+ * 重ね (--m-wash-NN) は、ダークでは白を NN% 重ね、ライトではおよそ 0.6 倍の
+ * 濃さの黒を重ねる (白い地の上の黒は、暗い地の上の白より強く見えるため。
+ * APPEARANCE.md のメニューの項目も白 12% ↔ 黒 7%)。
+ *
+ * フルスクリーンとミニプレーヤーは Apple と同じく外観によらず暗い (ぼかした
+ * 絵の上に白い文字と記号)。その下ではダークの変数をもう一度置く (3 つ目の塊。
+ * 2 つ目と同じ中身であることは tests/test_style.py が確かめる)。
+ * 外観で変わらない変数 (Music の赤など) は 1 つ目の塊にだけ置く。
  * ------------------------------------------------------------------ */
 
 window.music {
+  /* 外観で変わらないもの */
+  --m-key: #fa2d48;
+  --m-key-hover: #ff4560;                       /* 赤で塗ったボタンに乗せたとき */
+
+  /* libadwaita の強調色もアプリの中では Music の赤にする
+   * (リンク・スイッチ・選択・フォーカスの輪がこれを読む) */
+  --accent-bg-color: #fa2d48;
+  --accent-fg-color: #ffffff;
+
+  /* ---- ライト ---- */
+  --m-canvas: #ffffff;
+  --m-sidebar: rgba(242, 242, 246, 0.92);
+  --m-key-text: #e0223b;
+  --m-label: rgba(0, 0, 0, 0.85);
+  --m-secondary: rgba(0, 0, 0, 0.50);
+  --m-tertiary: rgba(0, 0, 0, 0.26);
+  --m-fill: rgba(118, 118, 128, 0.12);
+  --m-separator: rgba(0, 0, 0, 0.10);
+  --m-selected: rgba(0, 0, 0, 0.07);
+  --m-hover: rgba(0, 0, 0, 0.04);
+  --m-glass: rgba(255, 255, 255, 0.78);
+
+  /* 上の表から派生させたもの */
+  --m-fill-hover: rgba(118, 118, 128, 0.20);
+  --m-fill-active: rgba(118, 118, 128, 0.28);
+  --m-fill-disabled: rgba(118, 118, 128, 0.07);
+  --m-key-soft: rgba(250, 45, 72, 0.12);       /* 入っている丸の地 (シャッフルなど) */
+  --m-key-soft-hover: rgba(250, 45, 72, 0.18);
+  --m-popover: rgba(250, 250, 252, 0.96);       /* メニュー・トースト。文字が透けない濃さ */
+  --m-glass-edge: rgba(0, 0, 0, 0.08);
+  --m-warning: #b35c00;                         /* 再生できなかった曲の理由 (赤は操作の色なので使わない。白の上で 4.7:1) */
+  --accent-color: #e0223b;
+
+  /* 重ね (乗せた・押した・入っている丸や行の地) */
+  --m-wash-06: rgba(0, 0, 0, 0.04);
+  --m-wash-08: rgba(0, 0, 0, 0.05);
+  --m-wash-09: rgba(0, 0, 0, 0.06);
+  --m-wash-11: rgba(0, 0, 0, 0.07);
+  --m-wash-12: rgba(0, 0, 0, 0.08);
+  --m-wash-13: rgba(0, 0, 0, 0.08);
+  --m-wash-14: rgba(0, 0, 0, 0.09);
+  --m-wash-15: rgba(0, 0, 0, 0.10);
+
+  /* ガラス (ページの上に浮かべる丸・カプセル・送り) */
+  --m-glass-shine: none;
+  --m-glass-shadow: inset 0 1px rgba(255, 255, 255, 0.70), 0 1px 3px rgba(0, 0, 0, 0.10), 0 4px 10px rgba(0, 0, 0, 0.06);
+  --m-glass-small-shine: none;
+  --m-glass-small-shadow: inset 0 1px rgba(255, 255, 255, 0.70), 0 1px 3px rgba(0, 0, 0, 0.10), 0 3px 8px rgba(0, 0, 0, 0.06);
+  --m-glass-hover: rgba(242, 242, 245, 0.92);
+  --m-glass-active: rgba(228, 228, 233, 0.94);
+  --m-pager-shadow: inset 0 1px rgba(255, 255, 255, 0.70), 0 1px 3px rgba(0, 0, 0, 0.10), 0 3px 8px rgba(0, 0, 0, 0.06);
+  --m-pager-hover: rgba(242, 242, 245, 0.92);
+  --m-pager-active: rgba(228, 228, 233, 0.94);
+
+  /* 面と縁 */
+  --m-card: rgba(0, 0, 0, 0.035);               /* トップの結果・取り込みの窓の升 */
+  --m-card-edge: rgba(0, 0, 0, 0.06);
+  --m-field: rgba(0, 0, 0, 0.05);               /* 検索欄 */
+  --m-field-edge: rgba(0, 0, 0, 0.10);
+  --m-dialog-field: rgba(0, 0, 0, 0.05);        /* 取り込みの窓のリンクの欄 */
+  --m-control-edge: rgba(0, 0, 0, 0.10);        /* 取り込みの窓の欄・イコライザのプリセット */
+  --m-control-shine: rgba(255, 255, 255, 0.50);
+  --m-segment: #ffffff;                         /* 切り替え (検索の範囲) の選んだ側 */
+  --m-segment-shadow: 0 1px 2px rgba(0, 0, 0, 0.14), 0 0 0 1px rgba(0, 0, 0, 0.04);
+  --m-popover-edge: rgba(0, 0, 0, 0.12);
+  --m-popover-shine: none;
+  --m-popover-shadow: 0 8px 11px rgba(0, 0, 0, 0.16);
+  --m-toast-shadow: 0 6px 13px rgba(0, 0, 0, 0.16);
+  --m-menu-separator: rgba(0, 0, 0, 0.10);
+  --m-selection: rgba(250, 45, 72, 0.22);       /* 選んだ文字の地と文字 */
+  --m-selection-text: rgba(0, 0, 0, 0.85);
+  --m-scrollbar: rgba(0, 0, 0, 0.40);
+  --m-scrollbar-hover: rgba(0, 0, 0, 0.55);
+  --m-scrollbar-active: rgba(0, 0, 0, 0.65);
+  --m-art-edge: rgba(0, 0, 0, 0.08);            /* 絵のふちの線 (widgets.Artwork が color として読む) */
+  --m-warning-soft: rgba(179, 92, 0, 0.10);
+  --m-warning-edge: rgba(179, 92, 0, 0.28);
+
+  /* 骨格 (shell.css) */
+  --m-sidebar-over: rgb(242, 242, 246);         /* 内容の上に重ねたサイドバー・右パネル (下の文字が透けない) */
+  --m-pane-edge: rgba(0, 0, 0, 0.10);
+  --m-float-edge: rgba(0, 0, 0, 0.12);
+  --m-float-shadow: rgba(0, 0, 0, 0.14);
+  --m-dimming: rgba(0, 0, 0, 0.10);
+  --m-section-label: rgba(0, 0, 0, 0.40);       /* サイドバーの節の見出し */
+  --m-green: #34c759;                           /* cliamp の状態の点 */
+  --m-green-glow: rgba(52, 199, 89, 0.18);
+  --m-yellow: #ffcc00;
+  --m-dot-off: rgba(0, 0, 0, 0.20);
+  --m-bar: rgba(250, 250, 252, 0.94);           /* 再生バー */
+  --m-bar-shine: none;
+  --m-bar-edge: rgba(0, 0, 0, 0.08);
+  /* 外側の影は近くだけ。再生バーの外側の影はバーの四角い枠で切られ (ダークの 0 6px 14px も
+   * バーの下には出ていない。2026-09-27 に Xvfb の画素で確かめた)、白い地の上では丸い端の外の
+   * 四隅だけが灰色に染まって四角く見えるため */
+  --m-bar-shadow: inset 0 1px rgba(255, 255, 255, 0.80), 0 1px 2px rgba(0, 0, 0, 0.10);
+  --m-bar-fade: linear-gradient(to bottom, rgba(255, 255, 255, 0), rgba(255, 255, 255, 0.55) 45%, rgba(255, 255, 255, 0.86));
+  --m-header-fade: linear-gradient(to bottom, rgba(255, 255, 255, 0.97), rgba(255, 255, 255, 0.90) 62%, rgba(255, 255, 255, 0));
+  --m-progress: rgba(0, 0, 0, 0.45);            /* 再生位置の線 (溝はこの色を薄くして描く) */
+  --m-progress-hover: rgba(0, 0, 0, 0.62);
+  --m-volume-track: rgba(0, 0, 0, 0.10);
+  --m-volume-fill: rgba(0, 0, 0, 0.55);
+  --m-banner: rgba(255, 141, 40, 0.14);         /* 拡張の無い cliamp のときの帯 */
+  --m-banner-edge: rgba(255, 141, 40, 0.30);
+  --m-banner-text: #8f4a00;
+  --m-lyric-past: rgba(0, 0, 0, 0.20);
+  --m-pill: rgba(118, 118, 128, 0.14);          /* 右パネルの「歌詞 | 次に再生」 */
+  --m-pill-hover: rgba(118, 118, 128, 0.22);
+  --m-pill-disabled: rgba(118, 118, 128, 0.08);
+
+  /* イコライザ (player.css) */
+  --m-eq-ground: #f5f5f7;
+  --m-track: rgba(0, 0, 0, 0.10);
+  --m-mark: rgba(0, 0, 0, 0.22);
+}
+
+@media (prefers-color-scheme: dark) {
+  window.music {
+    --m-canvas: rgb(28, 29, 33);
+    --m-sidebar: rgb(41, 43, 50);
+    --m-key-text: #fa586a;
+    --m-label: rgba(255, 255, 255, 0.92);
+    --m-secondary: rgba(235, 235, 245, 0.60);
+    --m-tertiary: rgba(235, 235, 245, 0.32);
+    --m-fill: rgba(118, 118, 128, 0.24);
+    --m-separator: rgba(255, 255, 255, 0.09);
+    --m-selected: rgba(255, 255, 255, 0.115);
+    --m-hover: rgba(255, 255, 255, 0.05);
+    --m-glass: rgba(46, 47, 54, 0.90);
+
+    --m-fill-hover: rgba(118, 118, 128, 0.34);
+    --m-fill-active: rgba(118, 118, 128, 0.46);
+    --m-fill-disabled: rgba(118, 118, 128, 0.14);
+    --m-key-soft: rgba(250, 45, 72, 0.20);
+    --m-key-soft-hover: rgba(250, 45, 72, 0.28);
+    --m-popover: rgba(40, 41, 48, 0.97);
+    --m-glass-edge: rgba(255, 255, 255, 0.10);
+    --m-warning: #ffb340;
+    --accent-color: #fa586a;
+
+    --m-wash-06: rgba(255, 255, 255, 0.06);
+    --m-wash-08: rgba(255, 255, 255, 0.08);
+    --m-wash-09: rgba(255, 255, 255, 0.09);
+    --m-wash-11: rgba(255, 255, 255, 0.11);
+    --m-wash-12: rgba(255, 255, 255, 0.12);
+    --m-wash-13: rgba(255, 255, 255, 0.13);
+    --m-wash-14: rgba(255, 255, 255, 0.14);
+    --m-wash-15: rgba(255, 255, 255, 0.15);
+
+    --m-glass-shine: linear-gradient(to bottom, rgba(255, 255, 255, 0.075), rgba(255, 255, 255, 0) 45%, rgba(0, 0, 0, 0.07));
+    --m-glass-shadow: inset 0 1px rgba(255, 255, 255, 0.14), inset 0 -1px rgba(0, 0, 0, 0.28), 0 5px 12px rgba(0, 0, 0, 0.30);
+    --m-glass-small-shine: linear-gradient(to bottom, rgba(255, 255, 255, 0.08), rgba(255, 255, 255, 0) 50%, rgba(0, 0, 0, 0.06));
+    --m-glass-small-shadow: inset 0 1px rgba(255, 255, 255, 0.14), inset 0 -1px rgba(0, 0, 0, 0.26), 0 3px 8px rgba(0, 0, 0, 0.28);
+    --m-glass-hover: rgba(58, 59, 67, 0.94);
+    --m-glass-active: rgba(70, 71, 80, 0.96);
+    --m-pager-shadow: inset 0 1px rgba(255, 255, 255, 0.14), 0 3px 8px rgba(0, 0, 0, 0.30);
+    --m-pager-hover: rgba(58, 59, 67, 0.95);
+    --m-pager-active: rgba(70, 71, 80, 0.97);
+
+    --m-card: rgba(255, 255, 255, 0.05);
+    --m-card-edge: rgba(255, 255, 255, 0.06);
+    --m-field: rgba(118, 118, 128, 0.24);
+    --m-field-edge: rgba(255, 255, 255, 0.07);
+    --m-dialog-field: rgba(118, 118, 128, 0.20);
+    --m-control-edge: rgba(255, 255, 255, 0.08);
+    --m-control-shine: rgba(255, 255, 255, 0.06);
+    --m-segment: rgba(255, 255, 255, 0.17);
+    --m-segment-shadow: 0 1px 2px rgba(0, 0, 0, 0.28);
+    --m-popover-edge: rgba(255, 255, 255, 0.12);
+    --m-popover-shine: linear-gradient(to bottom, rgba(255, 255, 255, 0.05), rgba(255, 255, 255, 0) 40%);
+    --m-popover-shadow: inset 0 1px rgba(255, 255, 255, 0.10), 0 8px 11px rgba(0, 0, 0, 0.36);
+    --m-toast-shadow: inset 0 1px rgba(255, 255, 255, 0.10), 0 6px 13px rgba(0, 0, 0, 0.36);
+    --m-menu-separator: rgba(255, 255, 255, 0.10);
+    --m-selection: rgba(250, 45, 72, 0.38);
+    --m-selection-text: #ffffff;
+    --m-scrollbar: rgba(255, 255, 255, 0.30);
+    --m-scrollbar-hover: rgba(255, 255, 255, 0.45);
+    --m-scrollbar-active: rgba(255, 255, 255, 0.55);
+    --m-art-edge: rgba(255, 255, 255, 0.07);
+    --m-warning-soft: rgba(255, 179, 64, 0.12);
+    --m-warning-edge: rgba(255, 179, 64, 0.30);
+
+    --m-sidebar-over: rgb(41, 43, 50);
+    --m-pane-edge: rgba(0, 0, 0, 0.42);
+    --m-float-edge: rgba(0, 0, 0, 0.50);
+    --m-float-shadow: rgba(0, 0, 0, 0.36);
+    --m-dimming: rgba(0, 0, 0, 0.18);
+    --m-section-label: rgba(235, 235, 245, 0.40);
+    --m-green: #32d74b;
+    --m-green-glow: rgba(50, 215, 75, 0.16);
+    --m-yellow: #ffd60a;
+    --m-dot-off: rgba(235, 235, 245, 0.30);
+    --m-bar: rgba(48, 49, 57, 0.94);
+    --m-bar-shine: linear-gradient(to bottom, rgba(255, 255, 255, 0.085), rgba(255, 255, 255, 0.015) 48%, rgba(0, 0, 0, 0.06));
+    --m-bar-edge: rgba(255, 255, 255, 0.11);
+    --m-bar-shadow: inset 0 1px rgba(255, 255, 255, 0.13), inset 0 -1px rgba(0, 0, 0, 0.30), 0 6px 14px rgba(0, 0, 0, 0.38), 0 1px 3px rgba(0, 0, 0, 0.30);
+    --m-bar-fade: linear-gradient(to bottom, rgba(28, 29, 33, 0), rgba(28, 29, 33, 0.55) 45%, rgba(28, 29, 33, 0.86));
+    --m-header-fade: linear-gradient(to bottom, rgba(28, 29, 33, 0.97), rgba(28, 29, 33, 0.90) 62%, rgba(28, 29, 33, 0));
+    --m-progress: rgba(255, 255, 255, 0.62);
+    --m-progress-hover: rgba(255, 255, 255, 0.80);
+    --m-volume-track: rgba(255, 255, 255, 0.18);
+    --m-volume-fill: rgba(255, 255, 255, 0.86);
+    --m-banner: rgba(255, 159, 10, 0.16);
+    --m-banner-edge: rgba(255, 159, 10, 0.22);
+    --m-banner-text: #ffd28a;
+    --m-lyric-past: rgba(235, 235, 245, 0.26);
+    --m-pill: rgba(118, 118, 128, 0.28);
+    --m-pill-hover: rgba(118, 118, 128, 0.38);
+    --m-pill-disabled: rgba(118, 118, 128, 0.16);
+
+    --m-eq-ground: rgb(36, 37, 43);
+    --m-track: rgba(255, 255, 255, 0.14);
+    --m-mark: rgba(255, 255, 255, 0.28);
+  }
+}
+
+/* 外観によらず暗いところ (フルスクリーン・ミニプレーヤー)。中身は上の @media と同じ */
+window.music .music-fullscreen,
+window.music.music-mini {
   --m-canvas: rgb(28, 29, 33);
   --m-sidebar: rgb(41, 43, 50);
-  --m-key: #fa2d48;
   --m-key-text: #fa586a;
   --m-label: rgba(255, 255, 255, 0.92);
   --m-secondary: rgba(235, 235, 245, 0.60);
@@ -31,23 +273,92 @@ window.music {
   --m-hover: rgba(255, 255, 255, 0.05);
   --m-glass: rgba(46, 47, 54, 0.90);
 
-  /* 上の表から派生させたもの */
   --m-fill-hover: rgba(118, 118, 128, 0.34);
   --m-fill-active: rgba(118, 118, 128, 0.46);
-  --m-key-soft: rgba(250, 45, 72, 0.20);       /* 入っている丸の地 (シャッフルなど) */
+  --m-fill-disabled: rgba(118, 118, 128, 0.14);
+  --m-key-soft: rgba(250, 45, 72, 0.20);
   --m-key-soft-hover: rgba(250, 45, 72, 0.28);
-  --m-key-hover: #ff4560;                       /* 赤で塗ったボタンに乗せたとき */
-  --m-popover: rgba(40, 41, 48, 0.97);          /* メニュー・トースト。文字が透けない濃さ */
+  --m-popover: rgba(40, 41, 48, 0.97);
   --m-glass-edge: rgba(255, 255, 255, 0.10);
-  --m-shadow: rgba(0, 0, 0, 0.34);
-  --m-warning: #ffb340;                         /* 再生できなかった曲の理由 (赤は操作の色なので使わない) */
-
-  /* libadwaita の強調色もアプリの中では Music の赤にする
-   * (リンク・スイッチ・選択・フォーカスの輪がこれを読む) */
-  --accent-bg-color: #fa2d48;
+  --m-warning: #ffb340;
   --accent-color: #fa586a;
-  --accent-fg-color: #ffffff;
 
+  --m-wash-06: rgba(255, 255, 255, 0.06);
+  --m-wash-08: rgba(255, 255, 255, 0.08);
+  --m-wash-09: rgba(255, 255, 255, 0.09);
+  --m-wash-11: rgba(255, 255, 255, 0.11);
+  --m-wash-12: rgba(255, 255, 255, 0.12);
+  --m-wash-13: rgba(255, 255, 255, 0.13);
+  --m-wash-14: rgba(255, 255, 255, 0.14);
+  --m-wash-15: rgba(255, 255, 255, 0.15);
+
+  --m-glass-shine: linear-gradient(to bottom, rgba(255, 255, 255, 0.075), rgba(255, 255, 255, 0) 45%, rgba(0, 0, 0, 0.07));
+  --m-glass-shadow: inset 0 1px rgba(255, 255, 255, 0.14), inset 0 -1px rgba(0, 0, 0, 0.28), 0 5px 12px rgba(0, 0, 0, 0.30);
+  --m-glass-small-shine: linear-gradient(to bottom, rgba(255, 255, 255, 0.08), rgba(255, 255, 255, 0) 50%, rgba(0, 0, 0, 0.06));
+  --m-glass-small-shadow: inset 0 1px rgba(255, 255, 255, 0.14), inset 0 -1px rgba(0, 0, 0, 0.26), 0 3px 8px rgba(0, 0, 0, 0.28);
+  --m-glass-hover: rgba(58, 59, 67, 0.94);
+  --m-glass-active: rgba(70, 71, 80, 0.96);
+  --m-pager-shadow: inset 0 1px rgba(255, 255, 255, 0.14), 0 3px 8px rgba(0, 0, 0, 0.30);
+  --m-pager-hover: rgba(58, 59, 67, 0.95);
+  --m-pager-active: rgba(70, 71, 80, 0.97);
+
+  --m-card: rgba(255, 255, 255, 0.05);
+  --m-card-edge: rgba(255, 255, 255, 0.06);
+  --m-field: rgba(118, 118, 128, 0.24);
+  --m-field-edge: rgba(255, 255, 255, 0.07);
+  --m-dialog-field: rgba(118, 118, 128, 0.20);
+  --m-control-edge: rgba(255, 255, 255, 0.08);
+  --m-control-shine: rgba(255, 255, 255, 0.06);
+  --m-segment: rgba(255, 255, 255, 0.17);
+  --m-segment-shadow: 0 1px 2px rgba(0, 0, 0, 0.28);
+  --m-popover-edge: rgba(255, 255, 255, 0.12);
+  --m-popover-shine: linear-gradient(to bottom, rgba(255, 255, 255, 0.05), rgba(255, 255, 255, 0) 40%);
+  --m-popover-shadow: inset 0 1px rgba(255, 255, 255, 0.10), 0 8px 11px rgba(0, 0, 0, 0.36);
+  --m-toast-shadow: inset 0 1px rgba(255, 255, 255, 0.10), 0 6px 13px rgba(0, 0, 0, 0.36);
+  --m-menu-separator: rgba(255, 255, 255, 0.10);
+  --m-selection: rgba(250, 45, 72, 0.38);
+  --m-selection-text: #ffffff;
+  --m-scrollbar: rgba(255, 255, 255, 0.30);
+  --m-scrollbar-hover: rgba(255, 255, 255, 0.45);
+  --m-scrollbar-active: rgba(255, 255, 255, 0.55);
+  --m-art-edge: rgba(255, 255, 255, 0.07);
+  --m-warning-soft: rgba(255, 179, 64, 0.12);
+  --m-warning-edge: rgba(255, 179, 64, 0.30);
+
+  --m-sidebar-over: rgb(41, 43, 50);
+  --m-pane-edge: rgba(0, 0, 0, 0.42);
+  --m-float-edge: rgba(0, 0, 0, 0.50);
+  --m-float-shadow: rgba(0, 0, 0, 0.36);
+  --m-dimming: rgba(0, 0, 0, 0.18);
+  --m-section-label: rgba(235, 235, 245, 0.40);
+  --m-green: #32d74b;
+  --m-green-glow: rgba(50, 215, 75, 0.16);
+  --m-yellow: #ffd60a;
+  --m-dot-off: rgba(235, 235, 245, 0.30);
+  --m-bar: rgba(48, 49, 57, 0.94);
+  --m-bar-shine: linear-gradient(to bottom, rgba(255, 255, 255, 0.085), rgba(255, 255, 255, 0.015) 48%, rgba(0, 0, 0, 0.06));
+  --m-bar-edge: rgba(255, 255, 255, 0.11);
+  --m-bar-shadow: inset 0 1px rgba(255, 255, 255, 0.13), inset 0 -1px rgba(0, 0, 0, 0.30), 0 6px 14px rgba(0, 0, 0, 0.38), 0 1px 3px rgba(0, 0, 0, 0.30);
+  --m-bar-fade: linear-gradient(to bottom, rgba(28, 29, 33, 0), rgba(28, 29, 33, 0.55) 45%, rgba(28, 29, 33, 0.86));
+  --m-header-fade: linear-gradient(to bottom, rgba(28, 29, 33, 0.97), rgba(28, 29, 33, 0.90) 62%, rgba(28, 29, 33, 0));
+  --m-progress: rgba(255, 255, 255, 0.62);
+  --m-progress-hover: rgba(255, 255, 255, 0.80);
+  --m-volume-track: rgba(255, 255, 255, 0.18);
+  --m-volume-fill: rgba(255, 255, 255, 0.86);
+  --m-banner: rgba(255, 159, 10, 0.16);
+  --m-banner-edge: rgba(255, 159, 10, 0.22);
+  --m-banner-text: #ffd28a;
+  --m-lyric-past: rgba(235, 235, 245, 0.26);
+  --m-pill: rgba(118, 118, 128, 0.28);
+  --m-pill-hover: rgba(118, 118, 128, 0.38);
+  --m-pill-disabled: rgba(118, 118, 128, 0.16);
+
+  --m-eq-ground: rgb(36, 37, 43);
+  --m-track: rgba(255, 255, 255, 0.14);
+  --m-mark: rgba(255, 255, 255, 0.28);
+}
+
+window.music {
   background-color: var(--m-canvas);
   color: var(--m-label);
   font-size: 13px;
@@ -118,16 +429,10 @@ window.music .music-numeric { font-feature-settings: "tnum"; }
 
 window.music .music-glass {
   background-color: var(--m-glass);
-  background-image: linear-gradient(to bottom,
-    rgba(255, 255, 255, 0.075),
-    rgba(255, 255, 255, 0) 45%,
-    rgba(0, 0, 0, 0.07));
+  background-image: var(--m-glass-shine);
   border: 1px solid var(--m-glass-edge);
   border-radius: 9999px;
-  box-shadow:
-    inset 0 1px rgba(255, 255, 255, 0.14),
-    inset 0 -1px rgba(0, 0, 0, 0.28),
-    0 5px 12px rgba(0, 0, 0, 0.30);
+  box-shadow: var(--m-glass-shadow);
 }
 
 window.music .music-glass-capsule {
@@ -157,29 +462,23 @@ window.music button.music-circle {
 window.music button.music-circle:hover { background-color: var(--m-fill-hover); }
 window.music button.music-circle:active { background-color: var(--m-fill-active); }
 window.music button.music-circle.accent { color: var(--m-key-text); }
-window.music button.music-circle:disabled { color: var(--m-tertiary); background-color: rgba(118, 118, 128, 0.14); }
+window.music button.music-circle:disabled { color: var(--m-tertiary); background-color: var(--m-fill-disabled); }
 
 window.music button.music-circle.flat { background-color: transparent; }
-window.music button.music-circle.flat:hover { background-color: rgba(255, 255, 255, 0.08); }
-window.music button.music-circle.flat:active { background-color: rgba(255, 255, 255, 0.14); }
+window.music button.music-circle.flat:hover { background-color: var(--m-wash-08); }
+window.music button.music-circle.flat:active { background-color: var(--m-wash-14); }
 window.music button.music-circle.flat:disabled { background-color: transparent; }
 
 /* 内容の上に浮かべるガラスの丸 (ページ左上の「‹」など) */
 window.music button.music-circle.music-glass {
   background-color: var(--m-glass);
-  background-image: linear-gradient(to bottom,
-    rgba(255, 255, 255, 0.08),
-    rgba(255, 255, 255, 0) 50%,
-    rgba(0, 0, 0, 0.06));
+  background-image: var(--m-glass-small-shine);
   border: 1px solid var(--m-glass-edge);
-  box-shadow:
-    inset 0 1px rgba(255, 255, 255, 0.14),
-    inset 0 -1px rgba(0, 0, 0, 0.26),
-    0 3px 8px rgba(0, 0, 0, 0.28);
+  box-shadow: var(--m-glass-small-shadow);
 }
 
-window.music button.music-circle.music-glass:hover { background-color: rgba(58, 59, 67, 0.94); }
-window.music button.music-circle.music-glass:active { background-color: rgba(70, 71, 80, 0.96); }
+window.music button.music-circle.music-glass:hover { background-color: var(--m-glass-hover); }
+window.music button.music-circle.music-glass:active { background-color: var(--m-glass-active); }
 
 /* カプセルの中の丸は地を塗らない (カプセルが面になる) */
 window.music .music-glass-capsule > button.music-circle,
@@ -191,9 +490,9 @@ window.music .music-glass-capsule > menubutton > button {
 }
 
 window.music .music-glass-capsule > button.music-circle:hover,
-window.music .music-glass-capsule > menubutton > button:hover { background-color: rgba(255, 255, 255, 0.09); }
+window.music .music-glass-capsule > menubutton > button:hover { background-color: var(--m-wash-09); }
 window.music .music-glass-capsule > button.music-circle:active,
-window.music .music-glass-capsule > menubutton > button:active { background-color: rgba(255, 255, 255, 0.15); }
+window.music .music-glass-capsule > menubutton > button:active { background-color: var(--m-wash-15); }
 
 /* ------------------------------------------------------------------
  * ガラスのカプセルのボタン (GlassButton)。ページの上に浮かべる操作
@@ -215,8 +514,8 @@ window.music button.music-glass-button {
 
 window.music button.music-glass-button.compact { min-width: 34px; padding: 0; }
 window.music button.music-glass-button image { color: var(--m-key-text); }
-window.music button.music-glass-button:hover { background-color: rgba(58, 59, 67, 0.94); }
-window.music button.music-glass-button:active { background-color: rgba(70, 71, 80, 0.96); }
+window.music button.music-glass-button:hover { background-color: var(--m-glass-hover); }
+window.music button.music-glass-button:active { background-color: var(--m-glass-active); }
 window.music button.music-glass-button:disabled,
 window.music button.music-glass-button:disabled image { color: var(--m-tertiary); }
 
@@ -239,8 +538,8 @@ window.music button.music-toggle-circle {
   transition: background-color 120ms ease, color 120ms ease;
 }
 
-window.music button.music-toggle-circle:hover { background-color: rgba(255, 255, 255, 0.08); }
-window.music button.music-toggle-circle:active { background-color: rgba(255, 255, 255, 0.14); }
+window.music button.music-toggle-circle:hover { background-color: var(--m-wash-08); }
+window.music button.music-toggle-circle:active { background-color: var(--m-wash-14); }
 
 window.music button.music-toggle-circle:checked {
   background-color: var(--m-key-soft);
@@ -340,21 +639,16 @@ window.music button.music-pager {
   border: 1px solid var(--m-glass-edge);
   border-radius: 9999px;
   background-color: var(--m-glass);
-  background-image: linear-gradient(to bottom,
-    rgba(255, 255, 255, 0.08),
-    rgba(255, 255, 255, 0) 50%,
-    rgba(0, 0, 0, 0.06));
-  box-shadow:
-    inset 0 1px rgba(255, 255, 255, 0.14),
-    0 3px 8px rgba(0, 0, 0, 0.30);
+  background-image: var(--m-glass-small-shine);
+  box-shadow: var(--m-pager-shadow);
   color: var(--m-key-text);
   opacity: 0;
   transition: opacity 160ms ease, background-color 120ms ease;
 }
 
 window.music button.music-pager.shown { opacity: 1; }
-window.music button.music-pager:hover { background-color: rgba(58, 59, 67, 0.95); }
-window.music button.music-pager:active { background-color: rgba(70, 71, 80, 0.97); }
+window.music button.music-pager:hover { background-color: var(--m-pager-hover); }
+window.music button.music-pager:active { background-color: var(--m-pager-active); }
 
 /* 格子 (カテゴリー・プレイリスト・局)。flowboxchild の余白と選択の地を消し、
  * 間隔は FlowBox の row/column-spacing だけで決める */
@@ -374,6 +668,13 @@ window.music scrolledwindow.music-shelf-scroller > undershoot.right {
   background: none;
   box-shadow: none;
 }
+
+/* ------------------------------------------------------------------
+ * アートワーク (widgets.Artwork)。color はふちの線の色として読まれる
+ * (Artwork は自分で描く部品で、文字を持たない)
+ * ------------------------------------------------------------------ */
+
+window.music .music-artwork { color: var(--m-art-edge); }
 
 /* ------------------------------------------------------------------
  * カード・タイル
@@ -480,7 +781,7 @@ window.music list.music-track-list > row.music-track-row {
 
 window.music list.music-track-list > row.music-track-row:hover { background-color: var(--m-hover); }
 window.music list.music-track-list > row.music-track-row:selected { background-color: var(--m-selected); }
-window.music list.music-track-list > row.music-track-row:selected:hover { background-color: rgba(255, 255, 255, 0.14); }
+window.music list.music-track-list > row.music-track-row:selected:hover { background-color: var(--m-wash-14); }
 
 /* 区切り線は曲名の列から引く (番号や絵の下には引かない) */
 window.music row.music-track-row .music-track-main {
@@ -564,8 +865,8 @@ window.music menubutton.music-row-more > button:checked {
   opacity: 1;
 }
 
-window.music menubutton.music-row-more > button:hover { color: var(--m-key-text); background-color: rgba(255, 255, 255, 0.08); }
-window.music menubutton.music-row-more > button:checked { color: var(--m-key-text); background-color: rgba(255, 255, 255, 0.12); }
+window.music menubutton.music-row-more > button:hover { color: var(--m-key-text); background-color: var(--m-wash-08); }
+window.music menubutton.music-row-more > button:checked { color: var(--m-key-text); background-color: var(--m-wash-12); }
 
 /* ------------------------------------------------------------------
  * 空・読み込み中
@@ -599,8 +900,8 @@ window.music entry {
 
 window.music entry > text > selection,
 window.music label > selection {
-  background-color: rgba(250, 45, 72, 0.38);
-  color: #ffffff;
+  background-color: var(--m-selection);
+  color: var(--m-selection-text);
 }
 
 window.music entry:focus-within {
@@ -611,9 +912,9 @@ window.music entry:focus-within {
 window.music entry.search {
   min-height: 30px;
   padding: 0 10px;
-  border: 1px solid rgba(255, 255, 255, 0.07);
+  border: 1px solid var(--m-field-edge);
   border-radius: 9999px;
-  background-color: var(--m-fill);
+  background-color: var(--m-field);
   background-image: none;
   box-shadow: none;
   color: var(--m-label);
@@ -647,35 +948,31 @@ window.music toggle-group > toggle {
   font-weight: 500;
 }
 
-window.music toggle-group > toggle:hover { background-color: rgba(255, 255, 255, 0.06); }
+window.music toggle-group > toggle:hover { background-color: var(--m-wash-06); }
 
 window.music toggle-group > toggle:checked {
-  background-color: rgba(255, 255, 255, 0.17);
+  background-color: var(--m-segment);
   color: var(--m-label);
-  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.28);
+  box-shadow: var(--m-segment-shadow);
 }
 
 /* ------------------------------------------------------------------
- * メニュー・ポップオーバー。暗いガラス、角 12
+ * メニュー・ポップオーバー。ほぼ不透明なガラス (ライトは白、ダークは暗い)、角 12
  * ------------------------------------------------------------------ */
 
 window.music popover > contents {
   padding: 5px;
-  border: 1px solid rgba(255, 255, 255, 0.12);
+  border: 1px solid var(--m-popover-edge);
   border-radius: 12px;
   background-color: var(--m-popover);
-  background-image: linear-gradient(to bottom,
-    rgba(255, 255, 255, 0.05),
-    rgba(255, 255, 255, 0) 40%);
-  box-shadow:
-    inset 0 1px rgba(255, 255, 255, 0.10),
-    0 8px 11px rgba(0, 0, 0, 0.36);
+  background-image: var(--m-popover-shine);
+  box-shadow: var(--m-popover-shadow);
   color: var(--m-label);
 }
 
 window.music popover > arrow {
   background-color: var(--m-popover);
-  border-color: rgba(255, 255, 255, 0.12);
+  border-color: var(--m-popover-edge);
 }
 
 window.music popover.menu modelbutton {
@@ -696,7 +993,7 @@ window.music popover.menu modelbutton arrow { color: inherit; }
 
 window.music popover.menu separator {
   margin: 4px 8px;
-  background-color: rgba(255, 255, 255, 0.10);
+  background-color: var(--m-menu-separator);
 }
 
 window.music popover.menu label.title {
@@ -706,17 +1003,15 @@ window.music popover.menu label.title {
 }
 
 /* ------------------------------------------------------------------
- * トースト。濃いガラスのカプセル
+ * トースト。ポップオーバーと同じ地のカプセル
  * ------------------------------------------------------------------ */
 
 window.music toast {
-  border: 1px solid rgba(255, 255, 255, 0.12);
+  border: 1px solid var(--m-popover-edge);
   border-radius: 9999px;
   background-color: var(--m-popover);
   background-image: none;
-  box-shadow:
-    inset 0 1px rgba(255, 255, 255, 0.10),
-    0 6px 13px rgba(0, 0, 0, 0.36);
+  box-shadow: var(--m-toast-shadow);
   color: var(--m-label);
 }
 
@@ -728,7 +1023,7 @@ window.music toast button {
   color: var(--m-key-text);
 }
 
-window.music toast button:hover { background-color: rgba(255, 255, 255, 0.08); }
+window.music toast button:hover { background-color: var(--m-wash-08); }
 window.music toast button.circular { color: var(--m-secondary); }
 
 /* ------------------------------------------------------------------
@@ -743,6 +1038,6 @@ window.music scrollbar {
 
 /* つまみの太さと余白は libadwaita のまま (負の余白で細く見せているので、
  * ここで枠や最小寸法を変えると大きさが負になり警告が出る)。色だけ替える。 */
-window.music scrollbar slider { background-color: rgba(255, 255, 255, 0.30); }
-window.music scrollbar slider:hover { background-color: rgba(255, 255, 255, 0.45); }
-window.music scrollbar slider:active { background-color: rgba(255, 255, 255, 0.55); }
+window.music scrollbar slider { background-color: var(--m-scrollbar); }
+window.music scrollbar slider:hover { background-color: var(--m-scrollbar-hover); }
+window.music scrollbar slider:active { background-color: var(--m-scrollbar-active); }

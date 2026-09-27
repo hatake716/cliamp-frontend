@@ -5,9 +5,14 @@
 - --socket PATH: cliamp の IPC ソケット (無ければ環境変数 CLIAMP_MUSIC_SOCKET、
   それも無ければ ~/.config/cliamp/cliamp.sock)。
 - --page ID: 最初に開くページ (撮影・試験用。ページ ID は pages/__init__.py)。
-- --self-check: 窓を出さずに、全モジュールの読み込み・4 つの CSS の解析・
-  icons/ のすべての絵の読み込み・gdk-pixbuf の読み込み口 (png / jpeg / svg / webp) を
+- --self-check: 窓を出さずに、全モジュールの読み込み・4 つの CSS の解析と外観の切り替えに
+  要る GTK の性質・icons/ のすべての絵の読み込み・gdk-pixbuf の読み込み口 (png / jpeg / svg / webp) を
   確かめ、標準エラーに "self-check: ok" か "self-check: <理由>" を書く (画面が無くても動く)。
+
+外観 (ライト / ダーク) は OS に従う (Adw.StyleManager の既定。2026-09-27 に FORCE_DARK を
+やめた)。CSS はライトを既定に、ダークを @media (prefers-color-scheme: dark) に持ち、
+読み込んだ CssProvider を GtkSettings の gtk-interface-color-scheme に束ねて切り替える
+(load_css)。フルスクリーンとミニプレーヤーは外観によらず暗い (style/base.css)。
 
 環境変数 (撮影・試験用): CLIAMP_MUSIC_APP_ID (アプリ ID を差し替える)、
 CLIAMP_MUSIC_NON_UNIQUE=1 (NON_UNIQUE にして既に動いているアプリと繋がない)、
@@ -41,7 +46,7 @@ import gi
 gi.require_version("Gdk", "4.0")
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
-from gi.repository import Adw, Gdk, Gio, GLib, Gtk  # noqa: E402
+from gi.repository import Adw, Gdk, Gio, GLib, GObject, Gtk  # noqa: E402
 
 from . import APP_ID, APP_NAME, HERE, VERSION, log  # noqa: E402
 
@@ -130,11 +135,14 @@ class MusicApp(Adw.Application):
 
     def do_startup(self) -> None:
         Adw.Application.do_startup(self)
-        Adw.StyleManager.get_default().set_color_scheme(Adw.ColorScheme.FORCE_DARK)
+        # 外観は OS に従う (Adw.ColorScheme.DEFAULT のまま。以前は FORCE_DARK)。libadwaita が
+        # 実際の外観を GtkSettings の gtk-interface-color-scheme へ書き、load_css がアプリの
+        # CssProvider をそこへ束ねる (Apple のミュージックと同じく、システム設定の外観で変わる)
         display = Gdk.Display.get_default()
         if display is not None:
             Gtk.IconTheme.get_for_display(display).add_search_path(os.path.join(HERE, "icons"))
-            for provider, _name in load_css(self.css_errors):
+            settings = Gtk.Settings.get_for_display(display)
+            for provider, _name in load_css(self.css_errors, settings=settings):
                 Gtk.StyleContext.add_provider_for_display(
                     display, provider, Gtk.STYLE_PROVIDER_PRIORITY_USER + 1)
 
@@ -457,14 +465,56 @@ def css_paths() -> list[tuple[str, str]]:
     return [(name, os.path.join(HERE, "style", f"{name}.css")) for name in CSS_FILES]
 
 
-def load_css(errors: list[str] | None = None) -> list[tuple[Gtk.CssProvider, str]]:
-    """style/ の CSS を順に読む (無いものは飛ばしてログに書く)。解析の誤りは errors に足す。"""
+def follow_color_scheme(provider: Gtk.CssProvider, settings: Gtk.Settings) -> None:
+    """provider の @media (prefers-color-scheme) を、settings の外観に従わせる。
+
+    アプリが作った Gtk.CssProvider の prefers-color-scheme は既定 (DEFAULT) のままで、
+    GTK はこれをライトとして扱う。GTK が gtk-interface-color-scheme に束ねるのはテーマと
+    利用者の gtk.css の provider だけ (gtk-4.22.4 gtk/gtksettings.c:1118-1139)、
+    AdwApplication も自分が読む resource の style.css だけ (libadwaita 1.9.3
+    src/adw-application.c:159-190)。束ねないとダークの @media が決して当たらない。
+    束ねは source (settings) と target (provider) が持つので、戻り値を持っておく必要は
+    無い (tests/test_style.py が gc の後も切り替わることを確かめる)。
+    """
+    settings.bind_property("gtk-interface-color-scheme", provider, "prefers-color-scheme",
+                           GObject.BindingFlags.SYNC_CREATE)
+
+
+def color_scheme_problems(provider_class=Gtk.CssProvider, settings_class=Gtk.Settings) -> list[str]:
+    """外観の切り替えに要る性質が GTK に無ければ、その理由 (自己診断用)。
+
+    ダークは @media (prefers-color-scheme: dark) で、CssProvider:prefers-color-scheme と
+    GtkSettings:gtk-interface-color-scheme (どちらも GTK 4.20 から) に頼る。無い GTK では
+    束ねられず、ダークの規則が黙って当たらない (窓はライトのまま) ので、ここで止める。
+    """
+    problems = []
+    for owner, prop in ((provider_class, "prefers_color_scheme"),
+                        (settings_class, "gtk_interface_color_scheme")):
+        if not hasattr(owner.props, prop):
+            problems.append(f"この GTK ({Gtk.get_major_version()}.{Gtk.get_minor_version()}) の "
+                            f"{owner.__name__} に {prop} がありません (外観が切り替わりません)")
+    return problems
+
+
+def load_css(errors: list[str] | None = None, settings: Gtk.Settings | None = None,
+             scheme: Gtk.InterfaceColorScheme | None = None) -> list[tuple[Gtk.CssProvider, str]]:
+    """style/ の CSS を順に読む (無いものは飛ばしてログに書く)。解析の誤りは errors に足す。
+
+    settings を渡すと、各 provider を follow_color_scheme でその外観に従わせる (アプリ)。
+    scheme を渡すと、その外観に固定して読む (自己診断・試験)。どちらも読む前に決める
+    (後から変えると GTK が読み直すので、解析が 2 度になる)。どちらも無ければ既定
+    (ライト扱い)。
+    """
     providers = []
     for name, path in css_paths():
         if not os.path.exists(path):
             log(f"{name}.css がありません (飛ばします)")
             continue
         provider = Gtk.CssProvider()
+        if settings is not None:
+            follow_color_scheme(provider, settings)
+        elif scheme is not None:
+            provider.set_property("prefers-color-scheme", scheme)
 
         def on_error(_provider, section, error, name=name):
             where = section.to_string() if section is not None else name
@@ -522,7 +572,8 @@ def self_check() -> int:
                 problems.append(f"ページ {page_id} のクラスを読めません ({type(exc).__name__}: {exc})")
     except Exception as exc:
         problems.append(f"pages を読めません ({exc})")
-    # 2. CSS
+    # 2. CSS (と、外観の切り替えに要る GTK の性質)
+    problems.extend(color_scheme_problems())
     errors: list[str] = []
     loaded = load_css(errors)
     if not loaded:

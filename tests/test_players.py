@@ -535,20 +535,24 @@ class PlaybackProblemTest(PlayerTestBase):
         self.assertTrue(run_loop(lambda: self.store.status.state == "playing"
                                  and self.store.status.track.title == "ふつうの曲", 5.0))
 
-    def with_css(self):
+    def with_css(self, scheme=None):
+        """アプリの CSS を足す (外観は scheme に固定。既定はダーク)。足した provider を返す。"""
         from cliamp_music.app import load_css
 
         errors: list[str] = []
         display = Gdk.Display.get_default()
-        for provider, _name in load_css(errors):
+        providers = []
+        for provider, _name in load_css(errors, scheme=scheme or Gtk.InterfaceColorScheme.DARK):
             Gtk.StyleContext.add_provider_for_display(display, provider, Gtk.STYLE_PROVIDER_PRIORITY_USER + 1)
             self.addCleanup(Gtk.StyleContext.remove_provider_for_display, display, provider)
+            providers.append(provider)
         self.assertEqual(errors, [])
+        return providers
 
     def test_bar_shows_the_reason_in_a_warning_tone(self):
         from cliamp_music.playerbar import PlayerBar
 
-        self.with_css()
+        providers = self.with_css()
         bar = PlayerBar(self.ctx)
         self.host(bar, 900, 80)
         self.fail()
@@ -568,6 +572,14 @@ class PlaybackProblemTest(PlayerTestBase):
         self.assertGreater(color.red, 0.9)
         self.assertTrue(0.6 < color.green < 0.8, color.green)
         self.assertLess(color.blue, 0.35)
+        # ライトでは白の上で読める暗い琥珀 (#b35c00。赤 #e0223b でもない)
+        for provider in providers:
+            provider.set_property("prefers-color-scheme", Gtk.InterfaceColorScheme.LIGHT)
+        run_loop(lambda: False, 0.1)
+        color = bar.subtitle_label.get_color()
+        self.assertTrue(0.6 < color.red < 0.8, color.red)
+        self.assertTrue(0.3 < color.green < 0.45, color.green)
+        self.assertLess(color.blue, 0.1)
         self.recover()
         self.assertTrue(run_loop(lambda: bar.subtitle_label.get_text() == "誰か — 盤", 3.0))
         self.assertFalse(bar.subtitle_label.has_css_class("problem"))

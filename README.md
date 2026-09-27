@@ -4,7 +4,9 @@
 macOS 27 の「ミュージック」風に操作する GTK4 + libadwaita のアプリ
 (アプリ ID `org.nixos.Music`、実行ファイル `cliamp-music`)。
 
-![ホーム](docs/screenshots/home.png)
+| ライト | ダーク |
+|---|---|
+| ![ホーム (ライト)](docs/screenshots/home-light.png) | ![ホーム (ダーク)](docs/screenshots/home.png) |
 
 再生そのものは常駐している cliamp が行い、このアプリは IPC
 (`~/.config/cliamp/cliamp.sock`) だけを通して操作する。アプリを閉じても音楽は止まらず、
@@ -39,6 +41,9 @@ macOS 27 の「ミュージック」風に操作する GTK4 + libadwaita のア�
 - **フルスクリーンプレーヤー**: アートワークをぼかした背景に大きな歌詞か次に再生。
 - **ミニプレーヤー** (アートワーク全面の正方形と横長) と **イコライザ** (cliamp の
   10 バンドとプリセット、再生速度)。
+- **外観**: システムのライト / ダーク (GNOME の「スタイル」、macOS 風のシステム設定の「外観」) に
+  従い、切り替えるとその場で変わる。フルスクリーンプレーヤーとミニプレーヤーは Apple と同じく
+  どちらでも暗い (ぼかしたアートワークの上に白)。
 - 再生に失敗したときは、理由 (「YouTube のサインインが必要な曲です」など) を再生バーと
   トーストに出す。cliamp が止まっている・繋がらないときは「cliamp を起動」を出し、
   繋ぎ直す。
@@ -51,7 +56,7 @@ macOS 27 の「ミュージック」風に操作する GTK4 + libadwaita のア�
 <img src="docs/screenshots/mini-square.png" alt="ミニプレーヤー" width="240">
 
 画面写真は試験用の偽の cliamp (`tests/fake_cliamp.py`) と、そのために描いた絵で撮ったもの
-(`scripts/shoot.py`)。
+(`scripts/shoot.py`、ライトは `--scheme light`)。
 
 ## 仕組み
 
@@ -269,7 +274,7 @@ Web API だけの接続にならず、曲は Spotify から鳴らそうとして
 
 ## 制限
 
-- 配色は暗色だけ (このアプリを作った環境が暗色で固定のため)。
+- フルスクリーンプレーヤーとミニプレーヤーは、外観によらず暗い (Apple と同じ。ぼかした絵の上に白)。
 - ライブラリに出るのは cliamp が持っているものだけ: ローカルのプレイリスト (TOML)、
   履歴、cliamp に登録したプロバイダー (Spotify・Navidrome・Jellyfin など) のプレイリスト。
   YouTube Music のライブラリは、cliamp に Google の OAuth の client_id / client_secret を
