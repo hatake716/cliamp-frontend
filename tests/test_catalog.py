@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+import time
 import unittest
 import unittest.mock
 from pathlib import Path
@@ -11,10 +12,16 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 sys.path.insert(0, str(HERE))
 
-from fake_cliamp import FakeCliamp, run_loop, temp_socket_path  # noqa: E402
+from fake_cliamp import (  # noqa: E402
+    SPOTIFY_SEARCH_BLOCKED,
+    SPOTIFY_SEARCH_REFUSED_PAGE,
+    FakeCliamp,
+    run_loop,
+    temp_socket_path,
+)
 
 try:
-    from cliamp_music.catalog import Catalog
+    from cliamp_music.catalog import STICKY_FAILURE_TTL, Catalog, sticky_failure_ttl
     from cliamp_music.client import CliampClient
     from cliamp_music.protocol import (
         RECENTLY_PLAYED,
@@ -29,6 +36,12 @@ try:
     HAVE_GI = True
 except ImportError:  # pragma: no cover
     HAVE_GI = False
+
+
+def later(seconds: float):
+    """time.monotonic を seconds 秒先へ進めた時計にする (main loop の待ちも同じ時計で進む)。"""
+    real = time.monotonic
+    return unittest.mock.patch("cliamp_music.catalog.time.monotonic", side_effect=lambda: real() + seconds)
 
 
 @unittest.skipUnless(HAVE_GI, "PyGObject がありません")
@@ -291,15 +304,41 @@ class WebOnlySpotify(CatalogTest):
             self.assertIsNone(track.youtube_id)
             self.assertFalse(track.unplayable)
 
-    def test_search_is_explained_in_japanese(self):
-        result = self.get(self.catalog.search, "spotify", "夜")
-        self.assertIsInstance(result, Response)
-        self.assertIn("search blocked", result.error)
-        self.assertTrue(result.message.startswith("Spotify では検索できません"), result.message)
-        # 失敗は覚えない (次もまた頼む)
-        self.get(self.catalog.search, "spotify", "夜")
-        self.assertEqual(self.count("search"), 2)
-        # YouTube の検索はふつうに使える
+    def test_search_results_are_bridged(self):
+        """自前の client_id (開発モード) でも Spotify を検索でき、結果は YouTube で探して鳴らす形
+        (Premium のアカウントで Web API だけに繋がった利用者の検索)。"""
+        tracks = self.get(self.catalog.search, "spotify", "夜", limit=20)
+        self.assertNotIsInstance(tracks, Response)
+        self.assertEqual(len(tracks), 20)
+        self.assertEqual(self.fake.requests_for("search")[-1]["limit"], 20)
+        for track in tracks:
+            self.assertTrue(is_youtube_bridge(track))
+            self.assertTrue(track.path.startswith("ytsearch1:"))
+            self.assertIsNotNone(track.spotify_id)
+            self.assertIsNone(track.youtube_id)
+            self.assertFalse(track.unplayable)
+            self.assertFalse(track.stream)
+        self.assertEqual(len({t.spotify_id for t in tracks}), 20)
+        # 成功は覚える (同じ語はもう頼まない)
+        self.get(self.catalog.search, "spotify", "夜", limit=20)
+        self.assertEqual(self.count("search"), 1)
+        self.assertIsNone(self.catalog.provider_failure("spotify"))
+
+    def test_refused_search_is_explained_in_japanese(self):
+        """Spotify が検索の件数を断ったとき (パッチの "Spotify refused a page of 10 results"、古い cliamp の
+        "search blocked")。日本語で言い直し、失敗は覚えない (次もまた頼む)。YouTube の検索は使える。"""
+        for error in (SPOTIFY_SEARCH_REFUSED_PAGE, SPOTIFY_SEARCH_BLOCKED):
+            with self.subTest(error=error[:40]):
+                self.fake.spotify_search_refused = error
+                sent = self.count("search")
+                result = self.get(self.catalog.search, "spotify", "夜")
+                self.assertIsInstance(result, Response)
+                self.assertEqual(result.error, error)
+                self.assertTrue(result.message.startswith("Spotify では検索できません"), result.message)
+                self.assertNotIn("client_id is too new", result.message)
+                self.get(self.catalog.search, "spotify", "夜")
+                self.assertEqual(self.count("search"), sent + 2)
+                self.assertIsNone(self.catalog.provider_failure("spotify"))
         self.assertTrue(self.get(self.catalog.search, "youtube", "夜"))
 
     def test_rate_limit_is_explained_in_japanese(self):
@@ -372,6 +411,106 @@ class OwnerPremiumSpotify(CatalogTest):
         self.get(self.catalog.playlists, "spotify")
         self.assertEqual(len(self.spotify_requests()), 2)
         self.assertIsNone(self.catalog.provider_failure("spotify"))
+
+    def test_the_refusal_is_remembered_only_briefly(self):
+        """Premium にした後で Spotify が断りを解いたら (反映に数時間かかる) 早く気づけるよう、覚えるのは
+        2 分まで。過ぎたら (Ctrl+R を待たずに) 頼み直す。"""
+        self.assertLessEqual(STICKY_FAILURE_TTL, 120.0)
+        self.get(self.catalog.playlists, "spotify")
+        self.assertEqual(len(self.spotify_requests()), 1)
+        self.fake.spotify_owner_premium = False  # Spotify が Premium を反映した
+        with later(60):
+            self.assertIsNotNone(self.catalog.provider_failure("spotify"))
+            self.assertIsInstance(self.get(self.catalog.search, "spotify", "夜"), Response)
+        self.assertEqual(len(self.spotify_requests()), 1)
+        with later(STICKY_FAILURE_TTL + 1):
+            self.assertIsNone(self.catalog.provider_failure("spotify"))
+            results = self.get(self.catalog.search, "spotify", "夜")
+        self.assertNotIsInstance(results, Response)
+        self.assertTrue(results)
+        self.assertEqual(len(self.spotify_requests()), 2)
+
+
+class QuotaSpotify(CatalogTest):
+    """Spotify の開発者の利用枠を使い切った (429 の reason "QUOTA_EXCEEDED")。1 人の開発者のアプリは
+    すべて 1 つの枠を分け合うので、どの呼び出しも断られる。覚えて頼み続けない (枠を減らさない)。"""
+
+    # パッチの cliamp の QuotaExceededError の文言そのもの
+    QUOTA = "spotify: Spotify quota exceeded for this developer account; retry after 1h0m0s"
+    WANT = "Spotify の開発者向けの利用枠を使い切りました。1 時間ほどしてから試してください"
+
+    def spotify_requests(self):
+        return [r for r in self.fake.requests if r.get("provider") == "spotify"]
+
+    def test_quota_refusal_is_remembered_and_explained(self):
+        self.fake.spotify_error = self.QUOTA
+        first = self.get(self.catalog.search, "spotify", "夜")
+        self.assertIsInstance(first, Response)
+        self.assertEqual(first.message, self.WANT)
+        self.assertIs(self.catalog.provider_failure("spotify"), first)
+        for method, args in ((self.catalog.search, ("spotify", "朝")), (self.catalog.playlists, ("spotify",)),
+                             (self.catalog.tracks, ("spotify", "YOUR MUSIC"))):
+            with self.subTest(method=method.__name__, args=args):
+                again = self.get(method, *args)
+                self.assertIsInstance(again, Response)
+                self.assertEqual(again.message, self.WANT)
+        self.assertEqual(len(self.spotify_requests()), 1)
+        self.assertTrue(self.get(self.catalog.search, "youtube", "夜"))
+        # Ctrl+R はすぐ頼み直す
+        self.fake.spotify_error = ""
+        results = self.get(self.catalog.search, "spotify", "朝", force=True)
+        self.assertNotIsInstance(results, Response)
+        self.assertIsNone(self.catalog.provider_failure("spotify"))
+        self.assertEqual(len(self.spotify_requests()), 2)
+
+    def test_short_wait_is_remembered_only_for_that_wait(self):
+        self.fake.spotify_error = ("spotify: search: spotify: Spotify quota exceeded for this developer account; "
+                                   "retry after 45s")
+        self.get(self.catalog.search, "spotify", "夜")
+        self.assertIsNotNone(self.catalog.provider_failure("spotify"))
+        with later(40):
+            self.assertIsNotNone(self.catalog.provider_failure("spotify"))
+        with later(46):
+            self.assertIsNone(self.catalog.provider_failure("spotify"))
+
+    def test_sticky_failure_ttl(self):
+        body = '{"error": {"status": 403, "message": "Active premium subscription required for the owner of the app"}}'
+        self.assertEqual(sticky_failure_ttl(f"spotify: search: http status 403 Forbidden: {body}"), STICKY_FAILURE_TTL)
+        self.assertEqual(sticky_failure_ttl(self.QUOTA), STICKY_FAILURE_TTL)
+        self.assertEqual(sticky_failure_ttl("spotify: Spotify quota exceeded"), STICKY_FAILURE_TTL)
+        self.assertEqual(sticky_failure_ttl("spotify: Spotify quota exceeded; retry after 30s"), 30.0)
+        for text in ("spotify: rate limited by Spotify; retry after 24h0m0s",
+                     "spotify: search: context deadline exceeded",
+                     "resolving yt-dlp ytsearch20:Spotify quota exceeded: yt-dlp: exit status 1",
+                     # YouTube の検索の誤りは語を繰り返す。語が ": " の後に利用枠の文言を含んでも覚えない
+                     "resolving yt-dlp ytsearch25:lofi: spotify quota exceeded: yt-dlp: exit status 1",
+                     "resolving yt-dlp ytsearch25:x: spotify: Spotify quota exceeded; retry after 1h0m0s: "
+                     "yt-dlp: exit status 1",
+                     'resolving yt-dlp ytsearch25:x: {"error": {"message": "Active premium subscription required '
+                     'for the owner of the app"}}: yt-dlp: exit status 1', ""):
+            with self.subTest(text=text):
+                self.assertEqual(sticky_failure_ttl(text), 0.0)
+
+    def test_youtube_failure_echoing_quota_words_is_not_remembered(self):
+        """YouTube の検索の失敗が語に利用枠の文言を含んでも、YouTube のプロバイダーを失敗として覚えない
+        (覚えると、その後の YouTube の検索が 2 分間すべて送られずに同じ誤りになる)。"""
+        for query in ("Error: spotify quota exceeded __fail__", "x: spotify: Spotify quota exceeded __fail__"):
+            with self.subTest(query=query):
+                failed = self.get(self.catalog.search, "youtube", query)
+                self.assertIsInstance(failed, Response)
+                self.assertIn(query, failed.error)
+                self.assertIsNone(self.catalog.provider_failure("youtube"))
+                sent = self.count("search")
+                results = self.get(self.catalog.search, "youtube", f"lofi hip hop {sent}")
+                self.assertNotIsInstance(results, Response)
+                self.assertTrue(results)
+                self.assertEqual(self.count("search"), sent + 1, "次の YouTube の検索が送られません")
+                self.assertEqual(self.fake.requests_for("search")[-1]["query"], f"lofi hip hop {sent}")
+        # Spotify の範囲の同じ文言 (cliamp の Spotify の誤り) は今までどおり覚える
+        self.fake.spotify_error = self.QUOTA
+        self.get(self.catalog.search, "spotify", "夜")
+        self.assertIsNotNone(self.catalog.provider_failure("spotify"))
+        self.assertIsNone(self.catalog.provider_failure("youtube"))
 
 
 class TrackHook(CatalogTest):

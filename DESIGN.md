@@ -155,15 +155,26 @@ def describe_playback_error(text) -> (short_ja, detail)  # 年齢確認・非公
                                                          # 文の、先頭か ": " の直後の cliamp の文言だけ)
 def playback_error_headline(short) -> str   # 末尾の括弧書き (手当て) を除く (トースト用)
 def playback_error_tooltip(short, detail) -> str
-def describe_catalog_error(text) -> str     # カタログ系の失敗の言い直し (回数の制限・検索の封鎖・
+def describe_catalog_error(text) -> str     # カタログ系の失敗の言い直し (利用枠・回数の制限・持ち主が
+                                            # Premium でない・アプリの利用者でない・検索の件数の断り・
                                             # 鳴らせない曲)。Response.message が使う。無ければ ""。
                                             # cliamp の Spotify の誤り ("spotify: " で始まる) だけ
                                             # (YouTube の検索の誤りは語を繰り返すので見ない)
 def is_spotify_owner_premium_required(text) -> bool   # "spotify: …" の誤りに 403 "Active premium subscription
                                             # required for the owner of the app" (SPOTIFY_OWNER_PREMIUM に言い直す)
 def is_spotify_not_accessible(text) -> bool # "spotify: playlist not accessible: …" (tracks の 403 の上流の言い換え)
-def is_spotify_search_blocked(text) -> bool # "spotify: …" の誤りで、friendlySearchError ("spotify: search
+def is_spotify_search_blocked(text) -> bool # "spotify: …" の誤りで、古い friendlySearchError ("spotify: search
                                             # blocked") か "spotify: search: …" の 400 "Invalid limit"
+                                            # (説明は 2026 年の規則: 開発モードでも 1 回 10 件までは検索
+                                            # でき、止められるのは持ち主が Premium でないか利用枠のときだけ)
+def is_spotify_not_a_user(text) -> bool     # "spotify: …" の誤りで、アカウントがアプリの User Management に
+                                            # 無い ("not a user of the Developer app"・"the user may not be
+                                            # registered")。SPOTIFY_NOT_A_USER に言い直す
+def spotify_quota_wait(text) -> float | None   # 開発者の利用枠を使い切った (429 の reason QUOTA_EXCEEDED。
+                                            # パッチの "spotify: Spotify quota exceeded for this developer
+                                            # account; retry after 1h0m0s") なら待つ秒 (不明は 0)、違えば None。
+                                            # 回数の制限より先に見て「Spotify の開発者向けの利用枠を使い切り
+                                            # ました。1 時間ほどしてから試してください」と言う
 def spotify_rate_limit_wait(text) -> float | None   # 回数の制限なら待つ秒 (不明は 0)、違えば None。
                                             # "spotify: rate limited by Spotify" が先頭か ": " の直後のときだけ
 def parse_go_duration(text) -> float | None; format_wait(seconds) -> str   # "24h0m0s" → 86400 → 「24 時間」
@@ -316,8 +327,9 @@ providers の `playback` は cliamp が Spotify のセッションを作った�
 
 失敗は `Response` (kind 付き) をそのまま callback に渡す (`Response.message` は Spotify の回数の
 制限・持ち主が Premium でない・読めないプレイリスト・検索の封鎖を日本語に言い直す。`describe_catalog_error`)。
-Spotify の Web API が「開発者アプリの持ち主が Premium でない」と断った答え (`is_spotify_owner_premium_required`) は
-10 分覚え、そのプロバイダーの playlists / tracks / search には送らずに同じ答えを返す (サイドバー・ホーム・
+Spotify の Web API が「開発者アプリの持ち主が Premium でない」と断った答え (`is_spotify_owner_premium_required`) と
+「開発者の利用枠を使い切った」答え (`spotify_quota_wait`。1 人の開発者のアプリはすべて 1 つの枠を分け合う) は
+2 分 (利用枠で言われた待ちがそれより短ければその間。Premium にした後で Spotify が反映したら早く気づけるよう短め) 覚え、そのプロバイダーの playlists / tracks / search には送らずに同じ答えを返す (サイドバー・ホーム・
 すべてのプレイリスト・打ちながらの検索が 403 を受け続けない。force と繋ぎ直しで忘れる)。結果は短時間
 覚えておく (検索は同じ語で 10 分、プレイリスト一覧は 5 分)。期限切れは足すたびに
 まとめて捨て、検索は新しい 200 件、歌詞は 300 件、曲の一覧は 100 件まで。
@@ -631,7 +643,9 @@ macOS 27 の形: 窓の端まで続く帯 (浮かない)、赤い記号、選択
 
 ツールバーの中央に検索欄 (カプセル、幅 380、赤いフォーカスの輪)、右に範囲の切り替え
 (`Adw.ToggleGroup`): 「YouTube」「Spotify」(使えるときだけ)「ライブラリ」(ローカルの
-プレイリストと履歴から探す)。Enter か 0.6 秒の入力停止で検索。
+プレイリストと履歴から探す)。Enter か 0.6 秒の入力停止で検索。「Spotify」の範囲は入力停止を 0.9 秒待ち
+(Enter は待たない)、1 回に 20 件を頼む (開発モードのアプリの Web API は検索が 1 回 10 件までで、パッチの cliamp が
+2 回に分ける。利用枠は 1 人の開発者のアプリすべてで分け合うので、打ちながらの検索で減らしすぎない)。
 - 入力前: 「最近の検索」(押せる丸いチップ、右に「消去」) と「カテゴリーを探す」
   (16:9、角 8 のタイル、色の組はカテゴリーごとに固定。J-POP、アニメ、シティポップ、
   ロック、ヒップホップ、ジャズ、クラシック、エレクトロニック、Lo-fi、作業用BGM、
@@ -639,12 +653,15 @@ macOS 27 の形: 窓の端まで続く帯 (浮かない)、赤い記号、選択
 - 結果: 左に「トップの結果」(大きな絵 + 曲名 + アーティスト + 再生ボタン)、右に
   「曲」の最初の 4 行。その下に「すべての曲 (N)」の全件 (40px の絵、曲名、アーティスト、時間、「…」)。
   行のダブルクリック/Enter で結果全体を `replace` してその曲から再生。
-- 検索中はスピナー、失敗は理由を空状態で出す。Spotify の範囲で、開発モードのアプリ (自分で
-  登録した client_id) の検索を Spotify が止めているとき (cliamp の friendlySearchError
-  "spotify: search blocked — …"、元の 400 "Invalid limit") は、英語の文の代わりに題
-  「Spotify では検索できません」と、使えるもの (プレイリスト・保存した曲) と YouTube で探すことを
-  言う説明、赤いカプセル「YouTube で検索」(範囲を YouTube に替えて同じ語で探し直す) を出す。
-  回数の制限 ("rate limited by Spotify; retry after …") は待つ長さつきの日本語 (Response.message)。
+- 検索中はスピナー、失敗は理由を空状態で出す。Spotify の範囲で、Spotify が検索の件数を断ったとき
+  (古い cliamp の friendlySearchError "spotify: search blocked — …"、元の 400 "Invalid limit"、パッチの
+  "Spotify refused a page of N results") は、英語の文の代わりに題「Spotify では検索できません」と、
+  今の規則 (開発モードでも 1 回 10 件までは検索でき、止められるのは持ち主が Premium でないか利用枠の
+  ときだけ)・使えるもの (プレイリスト・保存した曲)・YouTube で探すことを言う説明、赤いカプセル
+  「YouTube で検索」(範囲を YouTube に替えて同じ語で探し直す) を出す。
+  回数の制限 ("rate limited by Spotify; retry after …") と利用枠 ("Spotify quota exceeded …") は、題
+  「検索できませんでした」に待つ長さつきの日本語 (Response.message)。持ち主が Premium でない 403 の説明には
+  「Premium にした直後は、Spotify が反映するまで数時間かかることがあります」を含める。
 
 ### ラジオ (pages/radio.py)
 

@@ -2,7 +2,10 @@
 
 ヘッダーの中央にカプセルの検索欄 (幅 380、赤いフォーカスの輪)、右に範囲の切り替え
 (Adw.ToggleGroup: YouTube / Spotify (使えるときだけ) / ライブラリ)。Enter か
-0.6 秒の入力停止で検索する。
+0.6 秒の入力停止で検索する。Spotify の範囲は入力停止を 0.9 秒待ち (Enter は待たない)、1 回に 20 件を
+頼む: 開発モードのアプリの Web API は 1 人の開発者のアプリすべてで 1 つの利用枠を分け合い、検索は
+1 回 10 件まで (cliamp が 10 件ずつ 2 回に分けて頼む) なので、打ちながらの検索で枠を減らしすぎない。
+まだ送っていない古い語の検索は lane で捨てる (送らない)。
 
 - 入力前: 「最近の検索」(丸いチップ、右に赤い「消去」) と「カテゴリーを探す」
   (16:9 のタイル。色の組はカテゴリーごとに固定)。タイルを押すとその語で検索。
@@ -10,15 +13,19 @@
   その下に「すべての曲」。行のダブルクリック/Enter で結果全体を replace して
   その曲から再生 (出どころは Source(provider=範囲, name=「語」))。
 - 検索中はスピナー、失敗は理由を、該当なしは「結果がありません」を空状態で出す。
-  Spotify が開発モードのアプリ (自分の client_id) の検索を止めているとき (cliamp の
-  friendlySearchError "spotify: search blocked — …"、元の 400 "Invalid limit") は、英語の文の
-  代わりに「Spotify では検索できません」と使えるもの (プレイリスト・保存した曲) を言い、
-  「YouTube で検索」のボタン (範囲を YouTube に替えて探し直す) を出す。Spotify の範囲の
+  Spotify が検索の件数を断ったとき (cliamp 1.50.0 の friendlySearchError "spotify: search blocked —
+  your client_id is too new…"、元の 400 "Invalid limit"、パッチの "Spotify refused a page of N results"。
+  今の規則では 1 回 10 件を越えたときの答え) は、英語の文の代わりに「Spotify では検索できません」と、
+  今の規則 (開発モードでも 1 回 10 件までは検索でき、検索そのものが止められるのは持ち主が Premium でないか
+  利用枠を使い切ったときだけ) と使えるもの (プレイリスト・保存した曲) を言い、「YouTube で検索」のボタン
+  (範囲を YouTube に替えて探し直す) を出す。Spotify の範囲の
   検索のときだけ (YouTube の検索の誤りは語を繰り返すので、語に同じ言葉があっても出さない)。
   Spotify の開発者アプリの持ち主が Premium でないとき (403 "Active premium subscription required for
-  the owner of the app") も題は「Spotify では検索できません」。説明に理由と、公開プレイリストは
-  「Spotify から取り込む」で使えることを書き、「YouTube で検索」と「Spotify から取り込む…」を出す
-  (カタログがその答えを覚えるので、打ちながらの検索が Spotify に頼み続けることはない)。
+  the owner of the app") も題は「Spotify では検索できません」。説明に理由 (Premium にした直後は反映まで
+  数時間かかること) と、公開プレイリストは「Spotify から取り込む」で使えることを書き、「YouTube で検索」と
+  「Spotify から取り込む…」を出す。開発者の利用枠を使い切ったとき (429 QUOTA_EXCEEDED) と回数の制限は、
+  待つ長さつきの日本語 (Response.message) を「検索できませんでした」の説明に出す (カタログが持ち主の
+  断りと利用枠の答えを覚えるので、打ちながらの検索が Spotify に頼み続けることはない)。
 - 範囲は GuiState.search_scope に保存する。
 """
 
@@ -39,6 +46,7 @@ from ..protocol import (  # noqa: E402
     Track,
     is_spotify_owner_premium_required,
     is_spotify_search_blocked,
+    spotify_quota_wait,
     spotify_rate_limit_wait,
 )
 from ..widgets import (  # noqa: E402
@@ -70,6 +78,9 @@ from .playlists import IMPORT_LABEL  # noqa: E402
 
 DEBOUNCE_MS = 600
 SEARCH_LIMIT = 25
+# Spotify の範囲: 入力停止を長めに待ち、1 回に頼む数を 20 にする (開発者の利用枠を分け合うため。上の説明)
+SPOTIFY_DEBOUNCE_MS = 900
+SPOTIFY_SEARCH_LIMIT = 20
 TOP_SONGS = 4
 
 # (範囲の名前, 表示)。spotify は providers に検索できる spotify があるときだけ出す。
@@ -405,7 +416,12 @@ class SearchPage(PageBase):
         if not text.strip():
             self._show_browse()
             return
-        self._timer = GLib.timeout_add(DEBOUNCE_MS, weak_call(self._on_debounced))
+        self._timer = GLib.timeout_add(self.debounce_ms, weak_call(self._on_debounced))
+
+    @property
+    def debounce_ms(self) -> int:
+        """入力停止から検索までの待ち (ミリ秒)。Spotify の範囲は長め (利用枠を減らしすぎない)。"""
+        return SPOTIFY_DEBOUNCE_MS if self.scope == "spotify" else DEBOUNCE_MS
 
     def _on_debounced(self) -> bool:
         self._timer = 0
@@ -495,8 +511,10 @@ class SearchPage(PageBase):
         if scope == "library":
             catalog.search_library(query, done)
         else:
-            # 打ちながらの検索: まだ送っていない古い語は送らずに捨てる (worker を塞がない)
-            catalog.search(scope, query, done, SEARCH_LIMIT, force=force, lane="search-page")
+            # 打ちながらの検索: まだ送っていない古い語は送らずに捨てる (worker を塞がない・Spotify の
+            # 利用枠を減らさない)
+            limit = SPOTIFY_SEARCH_LIMIT if scope == "spotify" else SEARCH_LIMIT
+            catalog.search(scope, query, done, limit, force=force, lane="search-page")
 
     def open_import(self) -> None:
         """「Spotify から取り込む」の窓を出す。"""
@@ -520,10 +538,10 @@ class SearchPage(PageBase):
                                         secondary_label=IMPORT_LABEL if callable(opener) else None,
                                         on_secondary=weak_call(self.open_import))
             elif (scope == "spotify" and is_spotify_search_blocked(result.error)
-                  and spotify_rate_limit_wait(result.error) is None):
-                # 開発モードのアプリでは Spotify が検索を止めている。英語の長い文ではなく、
-                # 何が使えて何を使えばよいかを言い、YouTube の範囲へ移るボタンを出す
-                # (回数の制限は下の message が待ちの長さと一緒に言う)。Spotify の範囲の検索の
+                  and spotify_rate_limit_wait(result.error) is None and spotify_quota_wait(result.error) is None):
+                # Spotify が検索の件数を断った (古い cliamp の "search blocked"・400 "Invalid limit")。英語の長い
+                # 文ではなく、何が使えて何を使えばよいかを言い、YouTube の範囲へ移るボタンを出す
+                # (回数の制限と利用枠は下の message が待ちの長さと一緒に言う)。Spotify の範囲の検索の
                 # ときだけ (YouTube の検索の誤りは語を繰り返すので、語に "search blocked" が
                 # 入っていても Spotify の断りではない。ボタンもいまの範囲へ移るだけになる)
                 self.results.show_empty("music-search-symbolic", SPOTIFY_SEARCH_BLOCKED_TITLE,

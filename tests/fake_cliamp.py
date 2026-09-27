@@ -38,9 +38,13 @@
   通った後) で、起動したばかりの providers には付かない。プレイリスト・保存した曲 (YOUR MUSIC) の
   曲は YouTube で探して鳴らす形 (path `ytsearch1:<アーティストを空白で繋いだもの> <曲名>`、
   曲名などは Spotify のまま、meta `{"spotify.id": …, "spotify.bridge": "youtube"}`、`stream` も
-  `unplayable` も無し) で返る。Spotify の検索は開発モードのアプリと同じく cliamp の
-  friendlySearchError の文言で断り、spotify:track: の曲を始めると本物と同じ
+  `unplayable` も無し) で返る。Spotify の検索の結果も同じ形 (パッチの cliamp は開発モードのアプリでも
+  10 件ずつに分けて検索できる)。spotify:track: の曲を始めると本物と同じ
   "custom streamer: spotify: streaming unavailable (…)" の誤りで止まる。
+- spotify_search_refused (--spotify-search-refused) に文言を入れると、Spotify の検索だけをその誤りで断る
+  (Spotify が検索の件数を断ったとき。既定の文言はパッチの "spotify: search: Spotify refused a page of 10
+  results (…): http status 400 Bad Request: {…Invalid limit…}"、古い cliamp の "spotify: search blocked — …"
+  は SPOTIFY_SEARCH_BLOCKED)。
 - spotify_owner_premium=True (--spotify-owner-premium) は、Spotify の開発者アプリの持ち主が Premium で
   ないとき (2026-09 の実測)。Web API はどの呼び出しにも 403 "Active premium subscription required for the
   owner of the app" を返し、cliamp は本物と同じ文脈で包む: playlists は "spotify: your music: http status
@@ -215,12 +219,18 @@ UPLOADERS = ["Aurora Lane", "青い灯台", "Kite Theory", "真夜中ポスト",
 # path にこれを含む曲は鳴らせない (playback_error の試験と画面写真のため)。
 FAIL_MARK = "__fail__"
 
-# cliamp の external/spotify の friendlySearchError (開発モードのアプリで /v1/search が 400
-# "Invalid limit" になったときの言い直し)。本物の文言そのまま。
+# cliamp 1.50.0 (と前のパッチ) の external/spotify の friendlySearchError (/v1/search が 400 "Invalid limit" に
+# なったときの言い直し)。本物の文言そのまま。いまのパッチはこれを出さない (SPOTIFY_SEARCH_REFUSED_PAGE)。
 SPOTIFY_SEARCH_BLOCKED = (
     "spotify: search blocked — your client_id is too new. Spotify's Nov 27 2024 change blocks /v1/search "
     "for apps in Development Mode (the rest of cliamp still works on your app). Remove client_id from "
     "[spotify] in config.toml to use the built-in fallback for search, or apply for Extended Quota Mode")
+# いまのパッチの friendlySearchError: 10 件の頁でも Spotify が 400 "Invalid limit" で断ったとき (Spotify が上限を
+# さらに下げたら)。本物の文言そのまま
+SPOTIFY_SEARCH_REFUSED_PAGE = (
+    "spotify: search: Spotify refused a page of 10 results (cliamp asks for at most 10 per request, the limit for "
+    "Development Mode apps since February 2026; Spotify may have lowered it again): http status 400 Bad Request: "
+    '{"error":{"status":400,"message":"Invalid limit"}}')
 # Web API だけの接続で spotify:track: の曲を始めたときの誤り (librespot のセッションが無い)。
 # 本物の ErrStreamingUnavailable に player の "custom streamer: " が付いたもの。
 SPOTIFY_STREAMING_UNAVAILABLE = ("custom streamer: spotify: streaming unavailable (this Spotify connection is "
@@ -240,12 +250,13 @@ SPOTIFY_OWNER_PREMIUM_ERRORS = {
 def spotify_bridge(track: dict) -> dict:
     """Spotify の曲 (path spotify:track:<id>) を YouTube で探して鳴らす形にする (Web API だけの接続)。
 
-    path は "ytsearch1:<アーティストを空白で繋いだもの> <曲名>"、曲名・アーティスト・アルバム・年・
+    path は "ytsearch1:<アーティストを空白で繋いだもの> <曲名>" (空白の連なりは 1 つに)、曲名・アーティスト・アルバム・年・
     曲番号・長さは Spotify のまま、unplayable も stream も立てない (本物の bridged() と同じ)。
     meta は spotify.id と spotify.bridge (撮影の絵 art があれば残す)。"""
     sid = str(track["path"]).removeprefix("spotify:track:")
-    artists = " ".join(a for a in str(track.get("artist") or "").split(", ") if a)
-    query = " ".join(part for part in (artists, str(track.get("title") or "")) if part)
+    # 本物の bridgeQuery と同じく、空のアーティストは飛ばし、空白の連なり・改行・タブは 1 つの空白にする
+    words = [a for a in str(track.get("artist") or "").split(", ") if a] + [str(track.get("title") or "")]
+    query = " ".join(" ".join(words).split())
     bridged = {k: v for k, v in track.items() if k not in ("path", "unplayable", "stream", "meta")}
     bridged["path"] = f"ytsearch1:{query}"
     meta = {"spotify.id": sid, "spotify.bridge": "youtube"}
@@ -736,12 +747,14 @@ class FakeCliamp:
                  initial_state: str = "playing", empty: bool = False, seed: int = 7,
                  radios_toml: bool = False, device_descriptions: bool = False,
                  switch_keeps_old: bool = False, spotify_web_only: bool = False,
-                 spotify_owner_premium: bool = False):
+                 spotify_owner_premium: bool = False, spotify_search_refused: str = ""):
         self.socket_path = socket_path
         self.legacy = legacy
         self.spotify_needs_auth = spotify_needs_auth
-        # Spotify の接続が Web API だけ (曲は YouTube で探して鳴らし、検索は開発モードで断られる)
+        # Spotify の接続が Web API だけ (プレイリスト・保存した曲・検索の曲は YouTube で探して鳴らす)
         self.spotify_web_only = spotify_web_only
+        # 空でなければ Spotify の検索だけをこの誤りで断る (Spotify が検索の件数を断ったとき)
+        self.spotify_search_refused = spotify_search_refused
         # Spotify のセッションができたか。本物の cliamp はカタログ系の初回 (ensureSession) に作り、
         # providers の playback はセッションができてからしか付かない
         self._spotify_session = False
@@ -1786,18 +1799,19 @@ class FakeCliamp:
             refused = self._spotify_session_or_refusal("search")
             if refused is not None:
                 return refused
-            if self.spotify_web_only:
-                # 自前の client_id (開発モード) の Web API は /v1/search を断られる
-                return {"ok": False, "error": SPOTIFY_SEARCH_BLOCKED}
+            if self.spotify_search_refused:
+                return {"ok": False, "error": self.spotify_search_refused}
             rng = random.Random("spotify|" + query)
             tracks = []
             for i in range(limit):
                 title = SEARCH_TEMPLATES[i % 4].format(q=query)
                 artist = rng.choice(UPLOADERS)
-                tracks.append(self._with_art(
+                track = self._with_art(
                     {"path": f"spotify:track:{fake_spotify_id(query + str(i))}", "title": title,
                      "artist": artist, "album": f"{query} (Single)", "year": 2020 + i % 6,
-                     "duration": rng.randint(150, 330), "track_number": 1}, f"{query}|{i}"))
+                     "duration": rng.randint(150, 330), "track_number": 1}, f"{query}|{i}")
+                # Web API だけの接続では、検索の曲もプレイリストと同じく YouTube で探して鳴らす形
+                tracks.append(spotify_bridge(track) if self.spotify_web_only else track)
             return {"ok": True, "tracks": tracks}
         # radio のように Searcher でないプロバイダーは yt-dlp の YouTube 検索へ退避する。
         rng = random.Random("youtube|" + query)
@@ -1926,7 +1940,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--switch-keeps-old", action="store_true",
                         help="読み込み中の曲の切り替えで前の曲の位置と長さを出す (本物の TUI)")
     parser.add_argument("--spotify-web-only", action="store_true",
-                        help="Spotify を Web API だけの接続にする (曲は YouTube で探して鳴らし、検索は断られる)")
+                        help="Spotify を Web API だけの接続にする (プレイリスト・保存した曲・検索の曲は YouTube で探して鳴らす)")
+    parser.add_argument("--spotify-search-refused", nargs="?", const=SPOTIFY_SEARCH_REFUSED_PAGE, default="",
+                        metavar="ERROR",
+                        help="Spotify の検索だけを断る (Spotify が検索の件数を断ったとき。既定はパッチの "
+                             "\"Spotify refused a page of 10 results\" の文言)")
     parser.add_argument("--spotify-owner-premium", action="store_true",
                         help="Spotify の開発者アプリの持ち主が Premium でない (Web API がどの呼び出しも 403 で断る)")
     parser.add_argument("--no-local-playlists", action="store_true",
@@ -1938,7 +1956,8 @@ def main(argv: list[str] | None = None) -> int:
                         buffer_secs=args.buffer, initial_state=args.state, empty=args.empty,
                         radios_toml=args.radios_toml, device_descriptions=args.device_descriptions,
                         switch_keeps_old=args.switch_keeps_old, spotify_web_only=args.spotify_web_only,
-                        spotify_owner_premium=args.spotify_owner_premium)
+                        spotify_owner_premium=args.spotify_owner_premium,
+                        spotify_search_refused=args.spotify_search_refused)
     if args.no_local_playlists:
         server.local_playlists.clear()
     server.start()

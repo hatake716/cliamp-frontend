@@ -45,10 +45,8 @@ from fake_cliamp import FakeCliamp, temp_socket_path  # noqa: E402
 
 from cliamp_music.protocol import (  # noqa: E402
     SPOTIFY_PREMIUM_REQUIRED,
-    Response,
     decode_response,
     encode_request,
-    is_spotify_search_blocked,
     is_youtube_bridge,
     parse_lyrics,
     parse_playlist,
@@ -973,7 +971,7 @@ class _WebOnlyConformance(_Calls):
     """Spotify の接続が Web API だけの cliamp の断言 (偽と本物に共通)。
 
     librespot のセッションを作れない (Spotify が資格情報を断る・Premium でない) とき、cliamp は
-    OAuth のトークンで Web API だけを使い、プレイリストと保存した曲の曲を YouTube で探して鳴らす
+    OAuth のトークンで Web API だけを使い、プレイリスト・保存した曲・検索の曲を YouTube で探して鳴らす
     形で返す。曲を鳴らさない (yt-dlp で探しに行かない) ように組んである。"""
 
     # 手元に無いファイル (開始が必ず失敗し、後ろの曲を鳴らさずに止まる)
@@ -1027,12 +1025,34 @@ class _WebOnlyConformance(_Calls):
                     self.assertEqual(track.spotify_id, meta["spotify.id"])
                     self.assertEqual(track.web_url, f"https://open.spotify.com/track/{meta['spotify.id']}")
 
-    def test_search_is_blocked_for_development_mode_apps(self):
-        error = self.err("search", provider="spotify", query="夜明けのバス停")
-        self.assertTrue(is_spotify_search_blocked(error), error)
-        message = Response(False, {}, error, "error").message
-        self.assertIn("YouTube", message)
-        self.assertNotIn("client_id is too new", message)
+    def test_search_results_are_bridged_to_youtube(self):
+        """自前の client_id (開発モードのアプリ) でも Spotify を検索でき (パッチの cliamp は 10 件ずつに分けて
+        頼む)、結果はプレイリストの曲と同じく YouTube で探して鳴らす形。以前の "spotify: search blocked" は
+        もう返らない。件数は GUI の Spotify の範囲と同じ 20 (2 頁)。"""
+        tracks = self.ok("search", provider="spotify", query="夜明けのバス停", limit=20).get("tracks") or []
+        self.assertTrue(tracks, "Web API だけの Spotify の検索で曲が返りません")
+        self.assertLessEqual(len(tracks), 20)
+        ids = []
+        for t in tracks:
+            with self.subTest(title=t.get("title")):
+                self.assertTrue(t.get("title"), t)
+                self.assertTrue(t.get("artist"), t)
+                self.assertGreater(t.get("duration", 0), 0, t)
+                # 本物の bridgeQuery: 空のアーティストは飛ばし、空白の連なりは 1 つに
+                words = [a for a in t["artist"].split(", ") if a] + [t["title"]]
+                self.assertEqual(t["path"], "ytsearch1:" + " ".join(" ".join(words).split()))
+                self.assertNotIn("unplayable", t, "YouTube で探す曲は鳴らせる")
+                self.assertNotIn("stream", t, "橋渡しの曲は stream ではない (本物の bridged())")
+                meta = t.get("meta") or {}
+                self.assertEqual(set(meta), {"spotify.id", "spotify.bridge"}, meta)
+                self.assertEqual(meta["spotify.bridge"], "youtube")
+                self.assertRegex(meta["spotify.id"], r"^[A-Za-z0-9]{22}$")
+                ids.append(meta["spotify.id"])
+                track = parse_tracks([t])[0]
+                self.assertTrue(is_youtube_bridge(track))
+                self.assertIsNone(track.youtube_id)
+                self.assertEqual(track.spotify_id, meta["spotify.id"])
+        self.assertEqual(len(ids), len(set(ids)), "同じ曲は 1 度だけ (頁の重なりを除く)")
 
     def test_spotify_track_without_streaming_session_fails(self):
         sid = parse_tracks(self.bridged(self.spotify_lists()[0]["id"]))[0].spotify_id

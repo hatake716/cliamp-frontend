@@ -733,18 +733,28 @@ def parse_status(d: Any) -> Status:
     )
 
 
-# --- Spotify の断り (検索の封鎖・回数の制限・鳴らせない曲) ---------------------------------
+# --- Spotify の断り (検索の封鎖・回数の制限・利用枠・鳴らせない曲) --------------------------
 
 # Spotify の曲を鳴らすには librespot のセッション (Premium) が要る。Web API だけの接続で
 # spotify:track: の曲を始めると、cliamp は "spotify: streaming unavailable…" で断る。
 SPOTIFY_STREAMING_UNAVAILABLE = "spotify: streaming unavailable"
 SPOTIFY_PREMIUM_REQUIRED = "Spotify の曲の再生には Premium が必要です"
-# 開発モードのアプリ (自分で登録した client_id) には Spotify が /v1/search を許さない
-# (400 "Invalid limit"。cliamp の friendlySearchError は "spotify: search blocked — …" に言い直す)。
+# 持ち主が Premium にした直後も、Spotify がそれを反映するまで (数時間) は同じ 403 が続く
+SPOTIFY_PREMIUM_PROPAGATION = "Premium にした直後は、Spotify が反映するまで数時間かかることがあります"
+# Spotify が検索の件数を断った。2026 年の規則 (2026-02-11 以降に作ったアプリ、既存のアプリは 03-09 から) では、
+# 開発モードのアプリ (自分で登録した client_id) の /v1/search は 1 回 10 件まで (既定 5) で、それを
+# 越えると 400 "Invalid limit" (パッチの cliamp は 10 件ずつに分けて頼み、それでも断られたら
+# "spotify: search: Spotify refused a page of N results (…): http status 400 …Invalid limit…" と言う)。
+# cliamp 1.50.0 の friendlySearchError はこの 400 を "spotify: search blocked — your client_id is too new. …"
+# に言い直す (2024-11 の規則の頃の文言。古い cliamp の答えとして今も見分ける)。今の規則で検索そのものが
+# 止められるのは、アプリの持ち主が Premium でない (403) か、開発者の利用枠を使い切った (429) ときだけ
+# (どちらも別に見分けて言う)。
 SPOTIFY_SEARCH_BLOCKED_TITLE = "Spotify では検索できません"
-SPOTIFY_SEARCH_BLOCKED = ("自分で登録した Spotify のアプリ (開発モードの client_id) からの検索は、Spotify が"
-                          "止めています。プレイリストと保存した曲はそのまま使えます。曲を探すときは YouTube で"
-                          "検索してください。")
+SPOTIFY_SEARCH_BLOCKED = ("Spotify が 1 回の検索の件数を断りました。自分で登録したアプリ (開発モードの client_id) の"
+                          "検索は 1 回 10 件までで、パッチを当てた cliamp は 10 件ずつに分けて頼みます (断られたのは、"
+                          "cliamp が古いか、Spotify が上限をさらに下げたためです)。検索そのものが止められるのは、"
+                          "アプリの持ち主が Premium でないときと、開発者向けの利用枠を使い切ったときだけです。"
+                          "プレイリストと保存した曲はそのまま使えます。その間は YouTube で検索してください。")
 # パッチは Spotify の Web API の待ち (Retry-After) を 30 秒ほどで打ち切り、それより長く待てと
 # 言われたら "spotify: rate limited by Spotify; retry after 24h0m0s" で断る。cliamp 1.50.0 の
 # 素の文言 ("spotify: web api rate-limited on /v1/… after 8 retries") も同じ扱い (待ちは不明)。
@@ -757,16 +767,42 @@ _SPOTIFY_AT = r"(?:^|:\s)"
 _SPOTIFY_RATE_LIMITED = re.compile(
     _SPOTIFY_AT + r"spotify: rate limited by spotify(?:;\s*retry after\s+([0-9][0-9.a-zµμ]*))?"
     r"|" + _SPOTIFY_AT + r"spotify: web api rate-limited\b", re.IGNORECASE | re.MULTILINE)
+# 開発者の利用枠 (2026-07 から。1 人の開発者の開発モードのアプリはすべて 1 つの枠を分け合う) を使い切ると、
+# Spotify は 429 に {"error": {…, "reason": "QUOTA_EXCEEDED"}} を付ける (ふつうの回数の制限とは別)。
+# パッチの cliamp は待たずに "spotify: Spotify quota exceeded for this developer account; retry after 1h0m0s"
+# (QuotaExceededError。待ちが分からなければ "; retry after …" は無い) で断る。前に文脈が付くこともある
+# ("spotify: search: …")。文言は回数の制限と同じく "spotify: " から始まるものを、文の先頭か ": " の直後だけで見る
+# (再生の誤りの "custom streamer: spotify: …" も)。"spotify: " の付かない "Spotify quota exceeded" と、本文の reason を
+# そのまま包んだ Spotify の誤り ("spotify: search: http status 429 …: {…"reason": "QUOTA_EXCEEDED"…}") は、全体が
+# cliamp の Spotify の誤り ("spotify: " で始まる) のときだけ見る (フォルダ名 "x: Spotify quota exceeded" の手元の
+# ファイルが無い、語に同じ言葉を含む YouTube の検索の誤り、などは利用枠ではない)。
+SPOTIFY_QUOTA_EXCEEDED = "Spotify の開発者向けの利用枠を使い切りました"
+_QUOTA_RETRY = r"(?:[^\n]*?\bretry after\s+([0-9][0-9.a-zµμ]*))?"
+_SPOTIFY_QUOTA_RE = re.compile(_SPOTIFY_AT + r"spotify: (?:spotify |web api )?quota exceeded\b" + _QUOTA_RETRY,
+                               re.IGNORECASE | re.MULTILINE)
+_SPOTIFY_QUOTA_BARE_RE = re.compile(_SPOTIFY_AT + r"spotify quota exceeded\b" + _QUOTA_RETRY,
+                                    re.IGNORECASE | re.MULTILINE)
+_SPOTIFY_QUOTA_REASON_RE = re.compile(r'"reason"\s*:\s*"quota_exceeded"', re.IGNORECASE)
 _SPOTIFY_SEARCH_BLOCKED_RE = re.compile(_SPOTIFY_AT + r"spotify: search blocked\b",
                                         re.IGNORECASE | re.MULTILINE)
 _SPOTIFY_SEARCH_FAILED_RE = re.compile(_SPOTIFY_AT + r"spotify: search:", re.IGNORECASE | re.MULTILINE)
 # Spotify の Web API は、開発者アプリ (client_id) の持ち主が Premium でないと、どの呼び出しにも 403
 # "Active premium subscription required for the owner of the app" を返す (2026-09 の実測)。cliamp は
 # 本文をそのまま包む ("spotify: your music: http status 403 Forbidden: {…"message": "Active premium …"}")。
+# Premium にした後も、Spotify が反映するまで (数時間) は同じ 403 が続く。
 SPOTIFY_OWNER_PREMIUM = ("Spotify の開発者アプリの持ち主が Premium でないため、Spotify のライブラリは読めません。"
-                         "公開プレイリストは「Spotify から取り込む」で使えます")
+                         f"{SPOTIFY_PREMIUM_PROPAGATION}。公開プレイリストは「Spotify から取り込む」で使えます")
 _SPOTIFY_OWNER_PREMIUM_RE = re.compile(r"active premium subscription required for the owner of the app",
                                        re.IGNORECASE)
+# 開発モードのアプリを使えるのは、Dashboard の User Management に登録した利用者 (5 人まで) だけ。登録されて
+# いないアカウントには Spotify が 403 "Check settings on developer.spotify.com/dashboard, the user may not be
+# registered." を返す。パッチの cliamp の検索は "spotify: search: this Spotify account is not a user of the
+# Developer app (…): …" と言い直す (ほかの呼び出しは本文のまま)。
+SPOTIFY_NOT_A_USER = ("サインインした Spotify のアカウントが、開発者アプリの利用者に登録されていません。"
+                      "developer.spotify.com/dashboard のアプリの「User Management」で足してください (開発モードの"
+                      "アプリの利用者は 5 人まで)")
+_SPOTIFY_NOT_A_USER_RE = re.compile(r"\bnot a user of the developer app\b|\bthe user may not be registered\b",
+                                    re.IGNORECASE)
 # cliamp の Spotify の tracks は Web API の 403 をどれも "spotify: playlist not accessible: only playlists you
 # own or collaborate on can be loaded" に言い換える (持ち主が Premium でないときも)
 SPOTIFY_NOT_ACCESSIBLE = ("このプレイリストは Spotify のライブラリから読めません (読めるのは自分のと共同編集の"
@@ -828,7 +864,37 @@ def spotify_rate_limit_message(wait: float) -> str:
     return f"Spotify から回数の制限を受けています。{span + 'ほど' if span else 'しばらく'}待ってから、もう一度試してください"
 
 
-def _is_spotify_error(text: str) -> bool:
+def spotify_quota_wait(text: str) -> float | None:
+    """Spotify の開発者の利用枠を使い切った誤り (429 の reason "QUOTA_EXCEEDED") なら、待つように
+    言われた秒 (分からなければ 0)。違えば None。パッチの文言 ("spotify: Spotify quota exceeded; …")
+    は回数の制限と同じく文の先頭か ": " の後ろにあるときだけ、"spotify: " の付かない "Spotify quota exceeded"
+    と本文の reason は cliamp の Spotify の誤り ("spotify: " で始まる) の中にあるときだけ見る (YouTube の
+    検索の誤りが繰り返す語や、手元のファイルのパスでは決めない)。"""
+    text = _as_str(text)[:_CLASSIFY_MAX]
+    spotify = is_spotify_error(text)
+    match = _SPOTIFY_QUOTA_RE.search(text)
+    if match is None and spotify:
+        match = _SPOTIFY_QUOTA_BARE_RE.search(text)
+    if match is not None:
+        wait = parse_go_duration((match.group(1) or "").rstrip("."))
+        return wait if wait is not None else 0.0
+    if spotify and _SPOTIFY_QUOTA_REASON_RE.search(text):
+        return 0.0
+    return None
+
+
+def is_spotify_quota_exceeded(text: str) -> bool:
+    """Spotify の開発者の利用枠を使い切った誤りか (spotify_quota_wait が None でない)。"""
+    return spotify_quota_wait(text) is not None
+
+
+def spotify_quota_message(wait: float) -> str:
+    """利用枠を使い切ったときの説明 (カタログ系の失敗の文)。待ちが分かればその長さを言う。"""
+    span = format_wait(wait)
+    return f"{SPOTIFY_QUOTA_EXCEEDED}。{span + 'ほど' if span else 'しばらく'}してから試してください"
+
+
+def is_spotify_error(text: str) -> bool:
     """cliamp の Spotify のプロバイダーの誤りか。カタログ系の誤りは IPC が包まないので、
     Spotify のものは必ず "spotify: " で始まる (YouTube の検索の誤りは "resolving yt-dlp …" か
     "yt-dlp: …")。"""
@@ -836,11 +902,16 @@ def _is_spotify_error(text: str) -> bool:
 
 
 def is_spotify_search_blocked(text: str) -> bool:
-    """開発モードのアプリで Spotify の検索が止められている誤りか (cliamp の friendlySearchError
-    "spotify: search blocked — …" か、その元の "spotify: search: http status 400 …Invalid limit…")。
-    どちらも cliamp の Spotify の誤り ("spotify: " で始まる) のときだけ。"""
+    """Spotify に検索 (の件数) を断られた誤りか: cliamp 1.50.0 の friendlySearchError "spotify: search
+    blocked — your client_id is too new…"、その元の "spotify: search: http status 400 …Invalid limit…"、
+    パッチの "spotify: search: Spotify refused a page of N results (…): …Invalid limit…"。どれも cliamp の
+    Spotify の誤り ("spotify: " で始まる) のときだけ。
+
+    古い文言は 2024-11 の規則 (開発モードのアプリの検索の封鎖) の頃のものだが、2026 年の規則では開発モードでも
+    1 回 10 件までは検索できる。説明 (SPOTIFY_SEARCH_BLOCKED) は今の規則で書く。持ち主が Premium でない
+    (is_spotify_owner_premium_required) と利用枠 (spotify_quota_wait) は別に見分ける。"""
     text = _as_str(text)[:_CLASSIFY_MAX]
-    if not _is_spotify_error(text):
+    if not is_spotify_error(text):
         return False
     if _SPOTIFY_SEARCH_BLOCKED_RE.search(text):
         return True
@@ -852,27 +923,40 @@ def is_spotify_owner_premium_required(text: str) -> bool:
     "Active premium subscription required for the owner of the app")。cliamp の Spotify の誤り
     ("spotify: " で始まる) のときだけ (YouTube の検索の誤りは利用者の語を繰り返すので見ない)。"""
     text = _as_str(text)[:_CLASSIFY_MAX]
-    return _is_spotify_error(text) and bool(_SPOTIFY_OWNER_PREMIUM_RE.search(text))
+    return is_spotify_error(text) and bool(_SPOTIFY_OWNER_PREMIUM_RE.search(text))
+
+
+def is_spotify_not_a_user(text: str) -> bool:
+    """サインインしたアカウントが開発モードのアプリの利用者 (User Management) に無いと断られた誤りか。
+    cliamp の Spotify の誤り ("spotify: " で始まる) のときだけ。"""
+    text = _as_str(text)[:_CLASSIFY_MAX]
+    return is_spotify_error(text) and bool(_SPOTIFY_NOT_A_USER_RE.search(text))
 
 
 def is_spotify_not_accessible(text: str) -> bool:
     """cliamp の Spotify の tracks が 403 を言い換えた "spotify: playlist not accessible: …" か。"""
     text = _as_str(text)[:_CLASSIFY_MAX]
-    return _is_spotify_error(text) and bool(_SPOTIFY_NOT_ACCESSIBLE_RE.search(text))
+    return is_spotify_error(text) and bool(_SPOTIFY_NOT_ACCESSIBLE_RE.search(text))
 
 
 def describe_catalog_error(text: str) -> str:
-    """カタログ系の失敗のうち日本語で言い直せるもの (Spotify の回数の制限・持ち主が Premium でない・
-    読めないプレイリスト・検索の封鎖・鳴らせない曲)。cliamp の Spotify の誤り ("spotify: " で始まる) だけを言い直し、それ以外
+    """カタログ系の失敗のうち日本語で言い直せるもの (Spotify の利用枠・回数の制限・持ち主が Premium でない・
+    アプリの利用者でない・読めないプレイリスト・検索の件数の断り・鳴らせない曲)。cliamp の Spotify の誤り ("spotify: " で始まる) だけを言い直し、それ以外
     (語を繰り返す YouTube の検索の誤りなど) は空。"""
     text = _as_str(text)
-    if not text or not _is_spotify_error(text):
+    if not text or not is_spotify_error(text):
         return ""
+    # 利用枠はふつうの回数の制限 (429) より先に見る (どちらも 429。待っても枠が戻るまで断られる)
+    quota = spotify_quota_wait(text)
+    if quota is not None:
+        return spotify_quota_message(quota)
     wait = spotify_rate_limit_wait(text)
     if wait is not None:
         return spotify_rate_limit_message(wait)
     if is_spotify_owner_premium_required(text):
         return SPOTIFY_OWNER_PREMIUM
+    if is_spotify_not_a_user(text):
+        return SPOTIFY_NOT_A_USER
     if is_spotify_not_accessible(text):
         return SPOTIFY_NOT_ACCESSIBLE
     if is_spotify_search_blocked(text):
@@ -994,6 +1078,10 @@ def _describe(text: str) -> tuple[str, str]:
     # (フォルダ名 "Rate Limited By Spotify" の手元のファイルが無いのは「ファイルが見つかりません」)
     if _SPOTIFY_STREAMING_RE.search(low):
         return SPOTIFY_PREMIUM_REQUIRED, detail
+    quota = spotify_quota_wait(low)
+    if quota is not None:
+        span = format_wait(quota)
+        return f"{SPOTIFY_QUOTA_EXCEEDED} ({span + 'ほど' if span else 'しばらく'}待つ)", detail
     wait = spotify_rate_limit_wait(low)
     if wait is not None:
         span = format_wait(wait)

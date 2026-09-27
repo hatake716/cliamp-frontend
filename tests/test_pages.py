@@ -26,6 +26,7 @@ sys.path.insert(0, str(HERE))
 
 from fake_cliamp import (  # noqa: E402
     SPOTIFY_SEARCH_BLOCKED,
+    SPOTIFY_SEARCH_REFUSED_PAGE,
     FakeCliamp,
     isolate_display,
     run_loop,
@@ -299,6 +300,66 @@ class SearchPageTest(PageCase):
         run_loop(lambda: False, 0.1)
         self.assertEqual(self.search_requests()[-1]["query"], "雨 & <傘>")
         self.assertEqual(self.ctx.state.recent_searches[0], "雨 & <傘>")
+
+    def test_spotify_scope_waits_longer_and_asks_for_20(self):
+        """Spotify の範囲は入力停止を 0.9 秒待ち (開発者の利用枠を分け合うので打ちながらの検索を減らす)、
+        1 回に 20 件を頼む (Web API は 1 回 10 件まで。cliamp が 2 回に分ける)。Enter は待たない。"""
+        page = self.show(SearchPage(self.ctx))
+        self.wait(lambda: page.scopes.get_n_toggles() == 3, message="Spotify の範囲が出ません")
+        page.set_scope("spotify")
+        self.assertEqual(page.debounce_ms, 900)
+        calls = []
+        search = self.ctx.catalog.search
+
+        def spy(*args, **kwargs):
+            calls.append((args, kwargs))
+            return search(*args, **kwargs)
+
+        self.ctx.catalog.search = spy
+        page.entry.set_text("夜")
+        run_loop(lambda: False, 0.3)
+        page.entry.set_text("夜の街")
+        run_loop(lambda: False, 0.7)
+        self.assertEqual(self.search_requests(), [], "Spotify の範囲で 0.9 秒待たずに検索しました")
+        self.wait(lambda: self.search_requests(), 2)
+        run_loop(lambda: False, 0.3)
+        self.assertEqual([(r["provider"], r["query"], r["limit"]) for r in self.search_requests()],
+                         [("spotify", "夜の街", 20)])
+        self.assertEqual(len(calls), 1, "打ち直しの前の語も頼みました")
+        self.assertEqual(calls[0][1].get("lane"), "search-page", "打ちながらの検索に lane が付いていません")
+        self.wait(lambda: page.results.state == "content")
+        self.assertEqual(len(page.results_tracks), 20)
+        # Enter は待たない
+        page.entry.set_text("雨")
+        page.entry.emit("activate")
+        run_loop(lambda: False, 0.1)
+        self.assertEqual(self.search_requests()[-1]["query"], "雨")
+        self.assertEqual(self.search_requests()[-1]["limit"], 20)
+        # YouTube の範囲は今までどおり (0.6 秒・25 件)
+        page.set_scope("youtube")
+        self.assertEqual(page.debounce_ms, 600)
+        self.wait(lambda: self.search_requests()[-1]["provider"] == "youtube")
+        self.assertEqual(self.search_requests()[-1]["limit"], 25)
+
+    def test_spotify_quota_is_explained(self):
+        self.fake.spotify_error = ("spotify: search: spotify: Spotify quota exceeded for this developer account; "
+                                   "retry after 1h0m0s")
+        page = self.show(SearchPage(self.ctx))
+        self.wait(lambda: page.scopes.get_n_toggles() == 3, message="Spotify の範囲が出ません")
+        page.set_scope("spotify")
+        page.set_query("雨")
+        self.wait(lambda: page.results.state == "empty")
+        empty = page.results.empty
+        self.assertEqual(empty.title_label.get_text(), "検索できませんでした")
+        self.assertEqual(empty.description_label.get_text(),
+                         "Spotify の開発者向けの利用枠を使い切りました。1 時間ほどしてから試してください")
+        # 覚えた断りで、打ちながらの検索は Spotify に頼み続けない (枠を減らさない)
+        page.set_query("雪")
+        self.wait(lambda: page.results.state == "empty" and page._query == "雪")
+        run_loop(lambda: False, 0.2)
+        self.assertEqual(len(self.search_requests()), 1)
+        self.assertEqual(empty.description_label.get_text(),
+                         "Spotify の開発者向けの利用枠を使い切りました。1 時間ほどしてから試してください")
 
     def test_result_row_plays_all_results(self):
         page = self.show(SearchPage(self.ctx))
@@ -581,7 +642,8 @@ class PlaylistsAuthTest(PageCase):
 
 
 class WebOnlySpotifyTest(PageCase):
-    """Spotify の接続が Web API だけの cliamp (曲は YouTube で探して鳴らし、検索は断られる)。"""
+    """Spotify の接続が Web API だけの cliamp (プレイリスト・保存した曲・検索の曲は YouTube で探して鳴らす)。
+    Spotify が検索の件数を断ったときの説明は、偽の spotify_search_refused で確かめる。"""
 
     fake_options = {"spotify_web_only": True}
 
@@ -664,7 +726,33 @@ class WebOnlySpotifyTest(PageCase):
         self.assertEqual(page.header.note_label.get_text(), WEB_ONLY_NOTE)
         self.assertTrue(page.header.note_label.get_visible())
 
+    def test_spotify_search_shows_bridged_results(self):
+        """自前の client_id で Web API だけに繋がった Spotify でも、Spotify の範囲で検索でき (1 回に 20 件)、
+        結果の曲は YouTube で探して鳴らす形のまま送る。"""
+        page = self.show(SearchPage(self.ctx))
+        self.wait(lambda: page.scopes.get_n_toggles() == 3, message="Spotify の範囲が出ません")
+        page.set_scope("spotify")
+        page.set_query("夜明けのバス停")
+        self.wait(lambda: page.results.state == "content", message="Spotify の検索の結果が出ません")
+        request = self.requests("search")[-1]
+        self.assertEqual((request["provider"], request["query"], request["limit"]), ("spotify", "夜明けのバス停", 20))
+        tracks = page.results_tracks
+        self.assertEqual(len(tracks), 20)
+        self.assertTrue(all(is_youtube_bridge(t) for t in tracks))
+        rows = page.all_songs.rows()
+        self.assertEqual(len(rows), 20)
+        page.all_songs.emit("row-activated", rows[2])
+        self.wait(lambda: self.requests("replace"))
+        replace = self.requests("replace")[-1]
+        self.assertEqual(replace["index"], 2)
+        self.assertEqual(replace["source"], {"provider": "spotify", "name": "「夜明けのバス停」"})
+        self.assertTrue(all(t["path"].startswith("ytsearch1:") for t in replace["tracks"]))
+        self.assertEqual(replace["tracks"][2]["meta"]["spotify.bridge"], "youtube")
+        self.assertEqual(replace["tracks"][2]["meta"]["spotify.id"], tracks[2].spotify_id)
+
     def test_spotify_search_restriction_is_explained(self):
+        """Spotify が検索の件数を断ったとき (パッチの "Spotify refused a page of 10 results")。"""
+        self.fake.spotify_search_refused = SPOTIFY_SEARCH_REFUSED_PAGE
         page = self.show(SearchPage(self.ctx))
         self.wait(lambda: page.scopes.get_n_toggles() == 3, message="Spotify の範囲が出ません")
         page.set_scope("spotify")
@@ -744,7 +832,7 @@ class WebOnlySpotifyTest(PageCase):
         self.wait(lambda: box["page"].scopes.get_n_toggles() == 3)
         box["page"].set_scope("spotify")
         box["page"].set_query("星")
-        self.wait(lambda: box["page"].results.state == "empty")
+        self.wait(lambda: box["page"].results.state == "content")
         detail = {"page": PlaylistDetailPage(self.ctx, provider="spotify", id="YOUR MUSIC", name="Your Music")}
         refs = [weakref.ref(box["page"]), weakref.ref(detail["page"])]
         self.show(detail["page"])

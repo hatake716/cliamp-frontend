@@ -29,8 +29,8 @@ macOS 27 の「ミュージック」風に操作する GTK4 + libadwaita のア�
   リンクのコピー、歌詞と次に再生のパネル、出力先 (cliamp の `device`)、音量。
 - **ホーム**: 最近再生した YouTube の曲から作るステーション (YouTube のミックス)、
   最近再生した項目、プレイリスト、日本の人気のラジオ局。
-- **検索**: YouTube (cliamp の yt-dlp の検索)、Spotify (登録されていれば。自前の client_id では
-  Spotify が検索を止めているので [下](#spotify-無料プラン))、ライブラリ
+- **検索**: YouTube (cliamp の yt-dlp の検索)、Spotify (登録されていれば。自分の client_id で、
+  開発者アプリの持ち主が Premium のとき。[下](#spotify))、ライブラリ
   (ローカルのプレイリストと履歴)。トップの結果と曲の一覧、最近の検索、カテゴリーのタイル。
 - **ラジオ**: cliamp ラジオ (組み込みの局とお気に入り) と
   [Radio Browser](https://www.radio-browser.info/) の人気局・局の検索。
@@ -174,23 +174,50 @@ macOS の Command は Ctrl に置き換えてある。
 | Ctrl+0 | メインの窓 |
 | Ctrl+W / Ctrl+Q | 窓を閉じる / 終了 (cliamp の再生は続く) |
 
-## Spotify (無料プラン)
+## Spotify
 
-cliamp の Spotify は、曲そのものを librespot (Spotify の再生の仕組み) で受けて鳴らすので、
-Spotify から直接鳴らせるのは Premium の利用者だけ。さらに 2026 年 9 月の時点で、Spotify の
-Web API は **開発者アプリ (client_id) の持ち主が Premium でないと、どの呼び出しにも 403
-"Active premium subscription required for the owner of the app" を返す**。無料プランの
-アカウントで自分の client_id を作っても、プレイリスト・保存した曲・検索のどれも読めない
-(`client_id` を書かないときの cliamp の組み込みの共有の client_id は、世界中で共有されているため
-回数の制限にかかり、24 時間待てと言われる)。無料プランで Spotify のプレイリストを使うには、
-下の「Spotify から取り込む」を使う。
+cliamp の Spotify は、自分で [Spotify for Developers](https://developer.spotify.com/dashboard) に登録した
+開発者アプリ (開発モードの client_id) で Spotify の Web API を使う。2026 年の規則 (2026-02-11 以降に
+作ったアプリ、既存のアプリは 03-09 から) では、開発モードのアプリは次のとおり。
 
-アプリはこの 403 を英語のまま出さず、「Spotify の開発者アプリの持ち主が Premium でないため、
-Spotify のライブラリは読めません。公開プレイリストは「Spotify から取り込む」で使えます」と
-言い換える (すべてのプレイリストの Spotify の節、検索の「Spotify」の範囲 (「Spotify では検索できません」と
-「YouTube で検索」「Spotify から取り込む…」のボタン)、Spotify のプレイリストの詳細)。サイドバーには Spotify のプレイリストの代わりに「Spotify から取り込む…」の行を 1 つ出す。
-一度この答えを受けたら 10 分は Spotify に頼み直さない (打ちながらの検索が 403 を受け続けない。
-Ctrl+R と cliamp への繋ぎ直しで頼み直す)。
+- **持ち主は Premium**: 開発者アプリの持ち主が Premium でないと、Web API はどの呼び出しにも 403
+  "Active premium subscription required for the owner of the app" を返す。**Premium にした直後は、
+  Spotify が反映するまで数時間かかることがある** (その間は同じ 403 が続く)。
+- **利用者は 5 人まで**: 開発モードのアプリを使えるアカウントは、アプリの「User Management」に登録した
+  5 人まで。登録されていないアカウントでは 403 になり、アプリは「サインインした Spotify のアカウントが、
+  開発者アプリの利用者に登録されていません」と出す。
+- **検索は 1 回 10 件まで** (既定は 5。越えると 400 "Invalid limit")。パッチの cliamp が 10 件ずつ
+  `offset` で分けて頼むので、使う側は気にしなくてよい (検索の「Spotify」の範囲は 20 件 = 2 回の呼び出し)。
+- **利用枠は開発者ごと**: 1 人の開発者の開発モードのアプリは、client_id が違ってもすべて 1 つの利用枠を
+  分け合う。使い切ると 429 (reason "QUOTA_EXCEEDED"。2026-07 から) になり、アプリは「Spotify の
+  開発者向けの利用枠を使い切りました。しばらくしてから試してください」(待ちが分かれば「1 時間ほど」の
+  ように長さ) と出す。
+
+**自分の client_id と Premium** なら、プレイリスト (自分のものと共同編集のもの。他人のプレイリストの
+中身は Web API では読めない)・保存した曲 (Your Music)・検索が使える。曲を Spotify から直接鳴らせるかは、
+Spotify が librespot (Spotify の再生の仕組み) のセッションを受け入れるかによる。受け入れれば曲は
+Spotify から鳴り、断られたら (自分で登録した client_id のトークンを `login5` が断る、など) Web API だけの
+接続になって、曲は **YouTube で探して鳴らす** (下の「Web API だけ」)。前に Web API だけで繋がっていた
+cliamp は librespot を試し直さないので、Premium にした後で Spotify から直接鳴らしたいときは、端末で
+`cliamp spotify reset` してサインインし直す。
+
+アプリは Spotify の利用枠を減らさないようにする: 検索の「Spotify」の範囲は入力が止まってから 0.9 秒
+待って探し (YouTube などは 0.6 秒。Enter は待たない)、打ち直しでまだ送っていない古い語の検索は送らず、
+同じ語の結果は 10 分覚える。持ち主が Premium でない 403 と、利用枠を使い切った 429 は、どの呼び出しも
+同じに断られるので、一度受けたら 2 分 (利用枠で言われた待ちがそれより短ければその間) は Spotify に
+頼み直さない。短めなのは、Premium の反映を早く拾うため (Ctrl+R と cliamp への繋ぎ直しはすぐ頼み直す)。
+
+持ち主が Premium でない 403 は英語のまま出さず、「Spotify の開発者アプリの持ち主が Premium でないため、
+Spotify のライブラリは読めません。Premium にした直後は、Spotify が反映するまで数時間かかることがあります。
+公開プレイリストは「Spotify から取り込む」で使えます」と言い換える (すべてのプレイリストの Spotify の節、
+検索の「Spotify」の範囲 (「Spotify では検索できません」と「YouTube で検索」「Spotify から取り込む…」の
+ボタン)、Spotify のプレイリストの詳細)。サイドバーには Spotify のプレイリストの代わりに
+「Spotify から取り込む…」の行を 1 つ出す。
+
+**無料プラン** のアカウントで自分の client_id を作っても、上の 403 でプレイリスト・保存した曲・検索の
+どれも読めない (`client_id` を書かないときの cliamp の組み込みの共有の client_id は、世界中で共有されて
+いるため回数の制限にかかり、24 時間待てと言われる)。無料プランで Spotify のプレイリストを使うには、
+下の「Spotify から取り込む」を使う (Web API を通さないので、Premium でも利用枠を使わない)。
 
 ### Spotify から取り込む (公開プレイリスト・アルバム)
 
@@ -261,14 +288,18 @@ Web API だけの接続にならず、曲は Spotify から鳴らそうとして
 `~/.config/cliamp/config.toml` の `[spotify]` の `client_id` に書く。サインインは端末の cliamp で
 行う (アプリからは始めない)。
 
-- **検索**: 開発モードのアプリからの `/v1/search` は Spotify が止めている (400 "Invalid limit")。
-  検索の「Spotify」の範囲では英語の誤りの代わりに「Spotify では検索できません」と出し、
+- **検索**: 開発モードのアプリでも、1 回 10 件までなら `/v1/search` を使える。パッチの cliamp は
+  10 件ずつに分けて頼む (Web API だけの接続では、結果の曲も YouTube で探して鳴らす形になる)。
+  古い cliamp (1 回に 10 件より多く頼む) や、Spotify が上限をさらに下げたときは 400 "Invalid limit" で
+  断られ、検索の「Spotify」の範囲では英語の誤りの代わりに「Spotify では検索できません」と今の規則を出し、
   「YouTube で検索」のボタンで YouTube の範囲に替えて探し直せる。プレイリストと保存した曲は
   そのまま使える。
 - **回数の制限**: Spotify の Web API に待つよう言われたとき (429 の Retry-After)、cliamp は短い
   待ち (30 秒まで) だけ待ってやり直し、それより長ければ待たずに失敗を返す (何時間も止まった
   ままにならない)。アプリは「Spotify から回数の制限を受けています。24 時間ほど待ってから、
   もう一度試してください」のように待つ長さを出す。
+- **利用枠**: 429 に reason "QUOTA_EXCEEDED" が付いていたら、待っても戻らないので cliamp は待たずに
+  失敗を返し、アプリは回数の制限とは分けて「Spotify の開発者向けの利用枠を使い切りました。…」と出す。
 - Web API だけの接続では、`spotify:track:` の曲 (前に Premium で作ったリストなど) は鳴らせず、
   再生バーに「Spotify の曲の再生には Premium が必要です」と出る。
 

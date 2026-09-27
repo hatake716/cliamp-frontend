@@ -85,6 +85,34 @@ Developer アプリでも GUI から使えるよう、次を足す。
   IPC の要求の goroutine が 1 日止まっていた。30 秒以下は従来どおり待って繰り返す。
   秒数が time.Duration に収まらないほど大きくても (桁あふれで負や短い待ちに
   化けて繰り返していた) 同じく失敗する。
+- Spotify が 2026 年 2 月から Development Mode のアプリ (自分で登録した client_id) に
+  当てている規則に合わせる (external/spotify/devmode.go。Premium の接続でも同じ)。
+  /v1/search の limit は 10 までになった (越えると 400 "Invalid limit")。SearchTracks は
+  offset を進めて 10 件ずつ (最後は残りの数) 求め、要る数 (従来どおり 1〜50 に丸める) まで
+  つなぐ。短い頁か total に達したら止め、同じ曲 ID は最初の 1 つだけ残して順を保つ。
+  2 頁目以降が失敗したらそれまでの結果を返して警告を記録し、1 頁目の失敗はその誤りで返す。
+  ただし、しばらくどの呼び出しも同じに断られる誤り (利用枠の使い切り、30 秒を越える回数の
+  制限、サインイン切れ、持ち主が Premium でない 403。refusesEveryCall) は 2 頁目以降でも
+  その誤りで返す。GUI は成功した検索を 10 分覚え、利用枠と持ち主の断りを覚えて Spotify に
+  頼むのを止めるので、足りない結果を完全なものに見せて隠さない。
+  上流は "Invalid limit" を「client_id が新しすぎて検索が塞がれている」と言い換えていたが、
+  原因は TUI が 20 件を 1 回で求めていたことだった。その言い換えをやめ、それでも返ったら
+  断られた件数と上限を述べる。アカウントがアプリの利用者に登録されていない 403 には
+  直し方を添える。取り除かれた POST /v1/playlists/{id}/tracks と POST /v1/users/{id}/playlists
+  の代わりに POST /v1/playlists/{id}/items と POST /v1/me/playlists を使う (作成に /v1/me の
+  利用者 ID は要らなくなった)。ほかの呼び出し (/v1/me の id、/v1/me/tracks、
+  /v1/me/playlists、/v1/playlists/{id}/items) は影響を受けない。持ち主が Premium でない
+  アプリの 403 "Active premium subscription required for the owner of the app" は Tracks でも
+  Spotify の本文のまま返す (上流はどの 403 も "playlist not accessible" に言い換えていた)。
+  cliamp setup の説明と docs/spotify.md の「新しいアプリは検索できない」も直す。
+  cliamp setup・config.toml.example・組み込みの client_id のコメント (config/config.go,
+  external/spotify/creds.go) の「組み込みの client_id なら検索の制限を避けられる」も、
+  登録したくない人のための共有の client_id という説明に直す。
+- Web API の 429 の本文の error.reason が QUOTA_EXCEEDED のとき (2026 年 7 月から。同じ
+  開発者のアプリで分け合う割り当ての使い切り) は、待っても直らないので Retry-After に
+  関わらず繰り返さず、"spotify: Spotify quota exceeded for this developer account; retry
+  after 1h0m0s" (Retry-After が無ければ "; retry after …" なし) で失敗する
+  (QuotaExceededError)。ほかの 429 は上のとおり。
 - 試験のため、librespot への接続・ブラウザでのサインイン・accounts と Web API の
   宛先を差し替えられるようにする (external/spotify/backend.go。session.go の
   sess と player は streamBackend 1 つにまとめた)。試験は httptest の偽物だけを
@@ -122,10 +150,11 @@ TUI のキー割り当ては変えない。
 変更は新しいファイル (ipc/gui.go, ipc/shutdown.go, ipc/playerr.go, playlist/gui.go,
 ui/model/ipc_gui.go, ui/model/ipc_gui_stale.go, ui/model/ipc_gui_playerr.go,
 player/supersede.go, external/local/gui.go, external/radio/gui.go,
-external/spotify/{backend,webonly,bridge,ratelimit}.go, catalog.go,
+external/spotify/{backend,webonly,bridge,ratelimit,devmode}.go, catalog.go,
 daemon_gui.go と各試験) に寄せ、既存のファイルには型のフィールド、呼び出し、世代番号を
 増やす行など最小限だけを足している (external/spotify/session.go は librespot の
-組み立てを backend.go へ移したぶん大きく変わる)。
+組み立てを backend.go へ移したぶん大きく変わる。external/spotify/provider.go の
+SearchTracks と friendlySearchError は devmode.go へ移した)。
 上流のファイルが変わって当たらなくなったらビルドが落ちる (cliamp.nix は
 版が 1.50.0 でなければ評価の時点で止める)。go.mod は変えず、新しく import
 するのは既に vendor にあるパッケージだけなので、vendorHash はそのまま使える。
@@ -1006,6 +1035,114 @@ index 0000000..ba0cc86
 +		t.Fatalf("providers = %+v, %v", resp, err)
 +	}
 +}
+diff --git a/cmd/setup.go b/cmd/setup.go
+index ef24bed..a2e4508 100644
+--- a/cmd/setup.go
++++ b/cmd/setup.go
+@@ -242,14 +242,14 @@ func providers() []providerSpec {
+ 				"Recommended: register your own Spotify Developer app at",
+ 				"developer.spotify.com/dashboard (redirect URI",
+ 				"http://127.0.0.1:19872/login). Your own client_id gives you a",
+-				"private rate-limit quota and works for playback, library, and",
+-				"playlists. Apps registered after Nov 27, 2024 can't use",
+-				"/v1/search though — that's a Spotify dev-mode restriction.",
++				"private rate-limit quota and works for playback, library,",
++				"playlists, and search. Since Feb 2026 Spotify requires the",
++				"app's owner to have Premium for Development Mode apps.",
+ 				"",
+ 				"Alternative: cliamp ships a built-in client_id (the librespot",
+-				"keymaster) that bypasses the search restriction. It's shared",
+-				"with every librespot- and spotify-player-based client, so you",
+-				"may see occasional 429 errors when the pool is busy.",
++				"keymaster) for users who don't want to register an app. It's",
++				"shared with every librespot- and spotify-player-based client,",
++				"so you may see occasional 429 errors when the pool is busy.",
+ 			},
+ 			picker: &pickerSpec{
+ 				key:   keySpotifyMode,
+diff --git a/cmd/setup_spotify_test.go b/cmd/setup_spotify_test.go
+new file mode 100644
+index 0000000..2309883
+--- /dev/null
++++ b/cmd/setup_spotify_test.go
+@@ -0,0 +1,30 @@
++package cmd
++
++import (
++	"strings"
++	"testing"
++)
++
++// The Spotify intro follows Spotify's February 2026 rules: an app of your
++// own can search (external/spotify/devmode.go), so neither choice is
++// described as lacking or bypassing a search restriction.
++func TestSpotifySetupIntroNoSearchRestriction(t *testing.T) {
++	var intro string
++	for _, p := range providers() {
++		if p.section == "spotify" {
++			intro = strings.Join(p.intro, " ")
++			break
++		}
++	}
++	if intro == "" {
++		t.Fatal("spotify spec missing")
++	}
++	if !strings.Contains(intro, "playlists, and search") {
++		t.Errorf("intro does not say your own client_id can search: %q", intro)
++	}
++	for _, stale := range []string{"search restriction", "can't use", "Nov 27", "bypass"} {
++		if strings.Contains(intro, stale) {
++			t.Errorf("intro still mentions %q: %q", stale, intro)
++		}
++	}
++}
+diff --git a/config.toml.example b/config.toml.example
+index 304c6db..0fa3bef 100644
+--- a/config.toml.example
++++ b/config.toml.example
+@@ -60,18 +60,19 @@ eq = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+ # developer.spotify.com/dashboard with redirect URI
+ # http://127.0.0.1:19872/login, then uncomment the section below with
+ # your client_id. You get a private rate-limit quota and your app works
+-# for playback, library, and playlists.
++# for playback, library, playlists, and search.
+ # [spotify]
+ # client_id = "your-spotify-app-client-id"
+ # bitrate = 320
+ #
+-# Note: apps registered after Nov 27, 2024 in Development Mode can't use
+-# /v1/search (Spotify returns "Invalid limit"). Everything else works.
++# Note: since Feb 2026 Spotify requires the owner of a Development Mode
++# app to have Premium, and all such apps of one developer share a quota
++# (see docs/spotify.md).
+ #
+ # Alternative: drop client_id to use cliamp's built-in fallback (the
+-# librespot keymaster client_id). It still has search access, but the
+-# rate-limit quota is shared with every librespot-based client and you
+-# may see occasional 429s.
++# librespot keymaster client_id) if you don't want to register an app.
++# Its rate-limit quota is shared with every librespot-based client, so
++# you may see occasional 429s.
+ 
+ # ---
+ # Navidrome / Subsonic server (optional)
+diff --git a/config/config.go b/config/config.go
+index 9a93f63..ec98682 100644
+--- a/config/config.go
++++ b/config/config.go
+@@ -80,9 +80,9 @@ func (n NavidromeConfig) IsSet() bool {
+ 
+ // SpotifyConfig holds settings for the Spotify provider. Requires a Spotify
+ // Premium account. If client_id is empty, a built-in fallback (the librespot
+-// keymaster ID) is used so search and catalog endpoints work even for users
+-// who never registered their own developer app — see Spotify's Nov 27, 2024
+-// dev-mode quota restriction.
++// keymaster ID) is used, for users who don't want to register their own
++// developer app; it is shared with every librespot-based client, so it may
++// see 429s when that pool is busy.
+ type SpotifyConfig struct {
+ 	Disabled bool   // true only when user explicitly sets enabled = false
+ 	Enabled  bool   // true when [spotify] section exists (even without client_id)
 diff --git a/daemon.go b/daemon.go
 index 88e4221..30a79c3 100644
 --- a/daemon.go
@@ -1959,6 +2096,62 @@ index 0000000..89e79ae
 +		t.Fatalf("playback_error after restarting = %q", got)
 +	}
 +}
+diff --git a/docs/spotify.md b/docs/spotify.md
+index ce8ff89..1c3a06d 100644
+--- a/docs/spotify.md
++++ b/docs/spotify.md
+@@ -2,7 +2,7 @@
+ 
+ Cliamp can stream your [Spotify](https://www.spotify.com/) library directly through its audio pipeline. EQ, visualizer, and all effects apply. Requires a [Spotify Premium](https://www.spotify.com/premium/) account.
+ 
+-> **Quick start:** run `cliamp setup`, pick Spotify, and follow the prompts. The recommended path is to register your own Spotify Developer app and paste its `client_id` — it gives you a private rate-limit quota and works for playback, library, and playlists. There's also a built-in shared `client_id` available for users who specifically need Spotify search.
++> **Quick start:** run `cliamp setup`, pick Spotify, and follow the prompts. The recommended path is to register your own Spotify Developer app and paste its `client_id` — it gives you a private rate-limit quota and works for playback, library, playlists, and search. There's also a built-in shared `client_id` for users who don't want to register an app.
+ 
+ ## Setup
+ 
+@@ -30,24 +30,25 @@ To register one:
+ 
+ Run `cliamp`, select Spotify as a provider, and press Enter to sign in. Credentials are cached at `~/.config/cliamp/spotify_credentials.json`. Subsequent launches refresh silently.
+ 
+-### Newer apps and the search caveat
++### Development Mode apps (February 2026 rules)
+ 
+-Apps registered in Development Mode (the default for anything created on developer.spotify.com after Nov 27, 2024) **still work for almost everything** — playback, your library, your playlists, save/follow actions, OAuth itself. The one specific thing they can't do is hit Spotify's **catalog endpoints**: `/v1/search` and a handful of related endpoints.
++Apps you register are in Development Mode. Since February 2026 Spotify applies these rules to them:
+ 
+-You'll see the catalog restriction as `400 "Invalid limit"` whenever you press <kbd>Ctrl+F</kbd> to search Spotify — Spotify [introduced this restriction on Nov 27, 2024](https://developer.spotify.com/blog/2024-11-27-changes-to-the-web-api) and rarely grants Extended Quota Mode to personal/non-commercial apps. Cliamp surfaces a friendlier error explaining what's actually wrong instead of the raw "Invalid limit" message.
+-
+-If you don't use Spotify search often, your own `client_id` is the better choice — keep it.
++- **The app's owner needs Premium.** Otherwise every Web API call fails with `403 "Active premium subscription required for the owner of the app"`. After subscribing it can take a few hours before Spotify notices.
++- **Search returns at most 10 results per request.** A larger `limit` is refused with `400 "Invalid limit"`. Cliamp asks for pages of 10 and joins them (the <kbd>Ctrl+F</kbd> search asks for 20 results: two requests).
++- **Some endpoints moved.** Cliamp adds tracks with `POST /v1/playlists/{id}/items` and creates playlists with `POST /v1/me/playlists`.
++- **One quota per developer.** All Development Mode apps of one developer share a quota. When it is used up Spotify answers `429` with the reason `QUOTA_EXCEEDED`; cliamp then stops at once with `spotify: Spotify quota exceeded for this developer account; retry after …` instead of retrying.
+ 
+ ### Alternative: built-in shared client ID
+ 
+-If Spotify search is essential to you and your own app hits the dev-mode restriction above, drop the `client_id` line:
++If you'd rather not register an app, drop the `client_id` line:
+ 
+ ```toml
+ [spotify]
+ bitrate = 320
+ ```
+ 
+-cliamp falls back to a built-in `client_id` (the same one [librespot](https://github.com/librespot-org/librespot) and [spotify-player](https://github.com/aome510/spotify-player) ship with) which predates the Nov 27, 2024 cutoff and retains catalog access.
++cliamp falls back to a built-in `client_id` (the same one [librespot](https://github.com/librespot-org/librespot) and [spotify-player](https://github.com/aome510/spotify-player) ship with).
+ 
+ > **Heads-up — shared rate limit:** The built-in `client_id` is shared with every librespot-, spotify-player-, and cliamp user worldwide. Spotify's per-app quota is global, so when the pool is busy you may see `429 Too Many Requests` errors during search or playlist loading. Cliamp retries with backoff, but persistent 429s mean the pool is hot — your own `client_id` doesn't share that problem.
+ 
+@@ -82,7 +83,8 @@ Only playlists in your Spotify library are shown. This includes playlists you've
+ - **Re-authenticate**: Run `cliamp spotify reset` to clear stored credentials, then relaunch cliamp and select Spotify to sign in again. (Equivalent to deleting `~/.config/cliamp/spotify_credentials.json` manually.)
+ - **Persistent "rate-limited" errors on `/v1/me`**: Your stored auth has expired or been revoked. Cliamp will detect this on most launches and prompt you to sign in again, but if it does not, run `cliamp spotify reset` and re-authenticate. This is *not* a real Spotify rate limit — waiting will not resolve it.
+ - **`429 Too Many Requests` on search or playlist loading (using the built-in fallback)**: The built-in `client_id` is shared with every librespot- and spotify-player-based client; when the global pool is busy, Spotify caps requests for everyone using it. Cliamp retries with exponential backoff, but if the errors keep returning the simplest fix is to register your own developer app and set `client_id` in `[spotify]` — your personal app gets its own quota.
+-- **"search blocked — your client_id is too new" on <kbd>Ctrl+F</kbd>**: Your registered Spotify Developer app is in Development Mode and can't hit `/v1/search` (Spotify's Nov 27, 2024 change). Everything else on your app — playback, library, playlists, save/follow — still works fine. Either remove `client_id` from `[spotify]` to use the built-in fallback for search, or just don't use Spotify search and keep your own app.
++- **`403 "Active premium subscription required for the owner of the app"`**: The account that registered your Developer app has no Premium subscription (or Spotify has not noticed it yet; wait a few hours after subscribing).
++- **"Spotify quota exceeded for this developer account"**: Your Development Mode apps have used up their shared quota. Wait for the time given after "retry after".
+ 
+ ## Requirements
+ 
 diff --git a/external/local/gui.go b/external/local/gui.go
 new file mode 100644
 index 0000000..8047b96
@@ -2645,7 +2838,7 @@ index 0000000..36b100c
 +}
 diff --git a/external/spotify/bridge_test.go b/external/spotify/bridge_test.go
 new file mode 100644
-index 0000000..510a2d9
+index 0000000..5bdb2d6
 --- /dev/null
 +++ b/external/spotify/bridge_test.go
 @@ -0,0 +1,301 @@
@@ -2894,13 +3087,13 @@ index 0000000..510a2d9
 +	for _, tt := range tests {
 +		t.Run(tt.name, func(t *testing.T) {
 +			f := isolate(t)
-+			f.json("POST /v1/playlists/pl1/tracks", http.StatusCreated, map[string]string{"snapshot_id": "s2"})
++			f.json("POST /v1/playlists/pl1/items", http.StatusCreated, map[string]string{"snapshot_id": "s2"})
 +			p := New(webOnlyTestSession(t, ""), "cid", 320)
 +			defer p.Close()
 +			if err := p.AddTrackToPlaylist(context.Background(), "pl1", tt.track); err != nil {
 +				t.Fatalf("AddTrackToPlaylist: %v", err)
 +			}
-+			bodies := f.body("POST /v1/playlists/pl1/tracks")
++			bodies := f.body("POST /v1/playlists/pl1/items")
 +			if len(bodies) != 1 {
 +				t.Fatalf("requests = %d", len(bodies))
 +			}
@@ -2915,12 +3108,12 @@ index 0000000..510a2d9
 +}
 +
 +// Creating a playlist and adding a bridged track works on a web-only session
-+// (the TUI's "new playlist" flow), using the remembered user id.
++// (the TUI's "new playlist" flow). POST /v1/me/playlists needs no user id.
 +func TestCreatePlaylistWebOnly(t *testing.T) {
 +	f := isolate(t)
-+	f.json("POST /v1/users/u9/playlists", http.StatusCreated, map[string]string{"id": "newpl"})
-+	f.json("POST /v1/playlists/newpl/tracks", http.StatusCreated, map[string]string{"snapshot_id": "s1"})
-+	p := New(webOnlyTestSession(t, "u9"), "cid", 320)
++	f.json("POST /v1/me/playlists", http.StatusCreated, map[string]string{"id": "newpl"})
++	f.json("POST /v1/playlists/newpl/items", http.StatusCreated, map[string]string{"snapshot_id": "s1"})
++	p := New(webOnlyTestSession(t, ""), "cid", 320)
 +	defer p.Close()
 +
 +	id, err := p.CreatePlaylist(context.Background(), "From cliamp")
@@ -2928,13 +3121,13 @@ index 0000000..510a2d9
 +		t.Fatalf("CreatePlaylist = %q, %v", id, err)
 +	}
 +	if f.count("GET /v1/me") != 0 {
-+		t.Fatal("CreatePlaylist asked /v1/me although the user id is known")
++		t.Fatal("CreatePlaylist asked /v1/me")
 +	}
 +	bridged := spotifyTrack{id: "tid", title: "T", artists: []string{"A"}}.track(true)
 +	if err := p.AddTrackToPlaylist(context.Background(), id, bridged); err != nil {
 +		t.Fatal(err)
 +	}
-+	if b := f.body("POST /v1/playlists/newpl/tracks"); len(b) != 1 || b[0] != `{"uris":["spotify:track:tid"]}` {
++	if b := f.body("POST /v1/playlists/newpl/items"); len(b) != 1 || b[0] != `{"uris":["spotify:track:tid"]}` {
 +		t.Fatalf("add body = %q", b)
 +	}
 +}
@@ -2948,6 +3141,855 @@ index 0000000..510a2d9
 +	}
 +	if got := p.PlaybackVia(); got != "" {
 +		t.Fatalf("PlaybackVia = %q", got)
++	}
++}
+diff --git a/external/spotify/creds.go b/external/spotify/creds.go
+index 826cf4e..95f0da7 100644
+--- a/external/spotify/creds.go
++++ b/external/spotify/creds.go
+@@ -11,8 +11,7 @@ import (
+ // DefaultClientID is the librespot keymaster client_id, shared by spotify-player
+ // and other librespot-based players. Used when the user hasn't configured their
+ // own client_id — Spotify's loopback exception lets it work with any 127.0.0.1
+-// port, and it predates the Nov 27, 2024 dev-mode quota restriction so /v1/search
+-// and other catalog endpoints stay accessible.
++// port. Its rate-limit quota is shared with every librespot-based client.
+ const DefaultClientID = "65b708073fc0480ea92a077233ca87bd"
+ 
+ // CredsPath returns the absolute path to the stored Spotify credentials file.
+diff --git a/external/spotify/devmode.go b/external/spotify/devmode.go
+new file mode 100644
+index 0000000..3551352
+--- /dev/null
++++ b/external/spotify/devmode.go
+@@ -0,0 +1,200 @@
++//go:build !windows
++
++package spotify
++
++// devmode.go — the Web API as Spotify serves it to Development Mode apps
++// since February 2026 (apps created from Feb 11, existing ones from Mar 9).
++//
++// A client_id registered on developer.spotify.com is a Development Mode app.
++// The changes that concern cliamp:
++//
++//   - /v1/search accepts at most limit=10 (default 5); more is a 400
++//     "Invalid limit". SearchTracks pages through with offset.
++//   - POST /v1/playlists/{id}/tracks became POST /v1/playlists/{id}/items and
++//     POST /v1/users/{id}/playlists became POST /v1/me/playlists
++//     (AddTrackToPlaylist, CreatePlaylist in provider.go).
++//   - The app's owner must have Premium, or every call is a 403 "Active
++//     premium subscription required for the owner of the app". That reply is
++//     passed on with Spotify's text (ownerPremiumRequired).
++//   - A 429 with the reason QUOTA_EXCEEDED (July 2026) is the developer's
++//     shared quota, not a rate limit (ratelimit.go).
++//
++// The other calls cliamp makes — GET /v1/me (only its id is read),
++// GET /v1/me/tracks, GET /v1/me/playlists and GET /v1/playlists/{id}/items
++// (already the new name, reading items.total and each entry's item) — are
++// unchanged for it.
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"net/url"
++	"strconv"
++	"strings"
++
++	"cliamp/applog"
++	"cliamp/playlist"
++)
++
++// spotifySearchPageSize is the largest limit /v1/search accepts from a
++// Development Mode app.
++const spotifySearchPageSize = 10
++
++// maxSearchResults caps SearchTracks' limit (the Web API's former page size).
++const maxSearchResults = 50
++
++// SearchTracks searches for tracks on Spotify and returns up to limit results
++// (limit is clamped to 1..50) in Spotify's order, each track once.
++//
++// It asks for pages of at most spotifySearchPageSize at increasing offsets
++// and stops early at a short page or at the reported total. When the first
++// page fails, its error is returned. When a later page fails, the results so
++// far are returned and the failure is logged, unless it is a refusal that
++// every call gets for a while (refusesEveryCall): then that error is returned,
++// so the caller sees it rather than a short list that looks complete.
++func (p *SpotifyProvider) SearchTracks(ctx context.Context, query string, limit int) ([]playlist.Track, error) {
++	if err := p.ensureSession(); err != nil {
++		return nil, err
++	}
++	limit = min(max(limit, 1), maxSearchResults)
++
++	var tracks []spotifyTrack
++	seen := make(map[string]struct{})
++	for offset := 0; offset < limit && len(tracks) < limit; {
++		size := min(spotifySearchPageSize, limit-offset)
++		page, err := p.searchPage(ctx, query, offset, size)
++		if err != nil {
++			if offset == 0 || refusesEveryCall(err) {
++				return nil, err
++			}
++			applog.UserWarn("spotify: search: returning the first %d results; the page at offset %d failed: %v", len(tracks), offset, err)
++			break
++		}
++		for _, t := range page.tracks {
++			if _, dup := seen[t.id]; dup || len(tracks) == limit {
++				continue
++			}
++			seen[t.id] = struct{}{}
++			tracks = append(tracks, t)
++		}
++		offset += size
++		if page.returned < size || (page.total > 0 && offset >= page.total) {
++			break
++		}
++	}
++	return p.presentTracks(tracks), nil
++}
++
++// refusesEveryCall reports whether err is a refusal that the next calls get
++// too until something changes: the developer quota is used up, Spotify asked
++// to wait longer than cliamp waits, the sign-in is gone, or the app's owner
++// has no Premium. SearchTracks does not hide these behind the pages it
++// already has: the GUI keeps a successful search for minutes and remembers
++// the quota and owner refusals so that it stops asking Spotify.
++func refusesEveryCall(err error) bool {
++	var quota *QuotaExceededError
++	var limited *RateLimitError
++	return errors.As(err, &quota) || errors.As(err, &limited) ||
++		errors.Is(err, playlist.ErrNeedsAuth) || ownerPremiumRequired(err)
++}
++
++// searchResultPage is one /v1/search reply.
++type searchResultPage struct {
++	tracks   []spotifyTrack // the items with an id
++	returned int            // items in the reply, null ones included
++	total    int            // tracks.total (0 when absent)
++}
++
++// searchPage asks /v1/search for size tracks from offset.
++func (p *SpotifyProvider) searchPage(ctx context.Context, query string, offset, size int) (searchResultPage, error) {
++	// No market parameter: when the request carries a user OAuth token, Spotify
++	// implicitly scopes results to the account's country.
++	q := url.Values{
++		"q":      {query},
++		"type":   {"track"},
++		"limit":  {strconv.Itoa(size)},
++		"offset": {strconv.Itoa(offset)},
++	}
++	resp, err := p.webAPI(ctx, "GET", "/v1/search", q)
++	if err != nil {
++		return searchResultPage{}, friendlySearchError(err, size)
++	}
++
++	var result struct {
++		Tracks struct {
++			Items []*struct {
++				ID      string `json:"id"`
++				Name    string `json:"name"`
++				Artists []struct {
++					Name string `json:"name"`
++				} `json:"artists"`
++				Album struct {
++					Name        string `json:"name"`
++					ReleaseDate string `json:"release_date"`
++				} `json:"album"`
++				DurationMs  int `json:"duration_ms"`
++				TrackNumber int `json:"track_number"`
++			} `json:"items"`
++			Total int `json:"total"`
++		} `json:"tracks"`
++	}
++	if err := decodeBody(resp, &result); err != nil {
++		return searchResultPage{}, fmt.Errorf("spotify: parse search: %w", err)
++	}
++
++	page := searchResultPage{returned: len(result.Tracks.Items), total: result.Tracks.Total}
++	for _, t := range result.Tracks.Items {
++		if t == nil || t.ID == "" {
++			continue
++		}
++		artists := make([]string, len(t.Artists))
++		for i, a := range t.Artists {
++			artists[i] = a.Name
++		}
++		var year int
++		if len(t.Album.ReleaseDate) >= 4 {
++			if y, err := strconv.Atoi(t.Album.ReleaseDate[:4]); err == nil {
++				year = y
++			}
++		}
++		page.tracks = append(page.tracks, spotifyTrack{
++			id:           t.ID,
++			title:        t.Name,
++			artists:      artists,
++			album:        t.Album.Name,
++			year:         year,
++			durationSecs: t.DurationMs / 1000,
++			trackNumber:  t.TrackNumber,
++			fromSearch:   true,
++		})
++	}
++	return page, nil
++}
++
++// friendlySearchError describes a failed /v1/search call of size results.
++//
++// Spotify's 400 "Invalid limit" used to be read as "your client_id is too
++// new, Development Mode apps cannot search". It meant the page size: since
++// February 2026 Development Mode allows at most spotifySearchPageSize, which
++// SearchTracks no longer exceeds, so the message names the size Spotify
++// refused. A 403 because the signed-in account is not a user of the app gets
++// a hint. Everything else — including the 403 for an app owner without
++// Premium, whose text is already clear — is wrapped unchanged.
++func friendlySearchError(err error, size int) error {
++	msg := err.Error()
++	switch {
++	case strings.Contains(msg, "http status 400") && strings.Contains(msg, "Invalid limit"):
++		return fmt.Errorf("spotify: search: Spotify refused a page of %d results (cliamp asks for at most %d per request, the limit for Development Mode apps since February 2026; Spotify may have lowered it again): %w", size, spotifySearchPageSize, err)
++	case strings.Contains(msg, "http status 403") && strings.Contains(msg, "may not be registered"):
++		return fmt.Errorf("spotify: search: this Spotify account is not a user of the Developer app (add it under User Management at developer.spotify.com/dashboard): %w", err)
++	}
++	return fmt.Errorf("spotify: search: %w", err)
++}
++
++// ownerPremiumRequired reports whether err is the Web API's 403 for an app
++// whose owner has no Premium subscription. Spotify answers every call so
++// until it sees the owner's Premium, which can take hours after subscribing.
++func ownerPremiumRequired(err error) bool {
++	msg := strings.ToLower(err.Error())
++	return strings.Contains(msg, "http status 403") && strings.Contains(msg, "premium subscription required for the owner")
++}
+diff --git a/external/spotify/devmode_test.go b/external/spotify/devmode_test.go
+new file mode 100644
+index 0000000..b5e0012
+--- /dev/null
++++ b/external/spotify/devmode_test.go
+@@ -0,0 +1,623 @@
++//go:build !windows
++
++package spotify
++
++// Tests for the Development Mode rules of February / July 2026 (devmode.go,
++// ratelimit.go). The fake answers as Spotify does for such apps: /v1/search
++// refuses limit > 10 with 400 "Invalid limit", and the removed endpoints are
++// not served at all.
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"net/http"
++	"reflect"
++	"slices"
++	"strconv"
++	"strings"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"cliamp/applog"
++	"cliamp/playlist"
++)
++
++// searchCall is one /v1/search request the fake received.
++type searchCall struct{ offset, limit int }
++
++// searchFake serves /v1/search from ids ("" is a null item) with the given
++// total. fail answers the page at an offset instead.
++type searchFake struct {
++	ids   []string
++	total int
++	fail  map[int]http.HandlerFunc
++
++	mu    sync.Mutex
++	calls []searchCall
++}
++
++func (s *searchFake) serve(w http.ResponseWriter, r *http.Request) {
++	q := r.URL.Query()
++	limit := 5 // Spotify's default since February 2026
++	if v := q.Get("limit"); v != "" {
++		limit, _ = strconv.Atoi(v)
++	}
++	offset, _ := strconv.Atoi(q.Get("offset"))
++	s.mu.Lock()
++	s.calls = append(s.calls, searchCall{offset, limit})
++	s.mu.Unlock()
++	w.Header().Set("Content-Type", "application/json")
++	if limit < 1 || limit > 10 {
++		w.WriteHeader(http.StatusBadRequest)
++		_, _ = io.WriteString(w, `{"error":{"status":400,"message":"Invalid limit"}}`)
++		return
++	}
++	if h := s.fail[offset]; h != nil {
++		h(w, r)
++		return
++	}
++	items := []any{}
++	for i := offset; i < len(s.ids) && i < offset+limit; i++ {
++		if s.ids[i] == "" {
++			items = append(items, nil)
++			continue
++		}
++		id := s.ids[i]
++		items = append(items, map[string]any{
++			"id": id, "name": "Song " + id, "artists": []map[string]string{{"name": "Artist " + id}},
++			"album":       map[string]string{"name": "Album " + id, "release_date": "2021-05-01"},
++			"duration_ms": 180500, "track_number": 3,
++		})
++	}
++	_ = json.NewEncoder(w).Encode(map[string]any{
++		"tracks": map[string]any{"items": items, "total": s.total, "limit": limit, "offset": offset},
++	})
++}
++
++func (s *searchFake) seen() []searchCall {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	return append([]searchCall(nil), s.calls...)
++}
++
++func seq(prefix string, n int) []string {
++	out := make([]string, n)
++	for i := range out {
++		out[i] = fmt.Sprintf("%s%d", prefix, i)
++	}
++	return out
++}
++
++// trackIDs returns the Spotify id of each track (either playback mode).
++func trackIDs(ts []playlist.Track) []string {
++	out := make([]string, len(ts))
++	for i, t := range ts {
++		out[i] = strings.TrimPrefix(spotifyTrackURI(t), spotifyTrackPrefix)
++	}
++	return out
++}
++
++// testProvider returns a provider on a web-only or a Premium session.
++func testProvider(t *testing.T, webOnly bool) *SpotifyProvider {
++	t.Helper()
++	var sess *Session
++	if webOnly {
++		sess = webOnlyTestSession(t, "")
++	} else {
++		sess = premiumTestSession(t, &fakeBackend{})
++	}
++	p := New(sess, "cid", 320)
++	t.Cleanup(p.Close)
++	return p
++}
++
++var playbackModes = []struct {
++	name    string
++	webOnly bool
++}{{"web-only", true}, {"premium", false}}
++
++func TestSearchTracksPagination(t *testing.T) {
++	dups := append(seq("a", 10), "a5", "b0", "a3", "b1", "", "b2", "b2", "b3", "b4", "b5")
++	dups = append(dups, seq("c", 10)...)
++	tests := []struct {
++		name      string
++		ids       []string
++		total     int
++		limit     int
++		wantCalls []searchCall
++		wantIDs   []string
++	}{
++		{"limit 20 is two pages of 10", seq("t", 60), 60, 20,
++			[]searchCall{{0, 10}, {10, 10}}, seq("t", 20)},
++		{"limit 25 is pages of 10, 10 and 5", seq("t", 60), 60, 25,
++			[]searchCall{{0, 10}, {10, 10}, {20, 5}}, seq("t", 25)},
++		{"limit 5 is one page", seq("t", 60), 60, 5,
++			[]searchCall{{0, 5}}, seq("t", 5)},
++		{"limit 10 is one page", seq("t", 60), 60, 10,
++			[]searchCall{{0, 10}}, seq("t", 10)},
++		{"limit 0 is clamped to 1", seq("t", 60), 60, 0,
++			[]searchCall{{0, 1}}, seq("t", 1)},
++		{"limit 100 is clamped to 50", seq("t", 60), 60, 100,
++			[]searchCall{{0, 10}, {10, 10}, {20, 10}, {30, 10}, {40, 10}}, seq("t", 50)},
++		// Spotify's total is often larger than what it returns: the short
++		// page ends the search.
++		{"a short page stops", seq("t", 13), 1000, 25,
++			[]searchCall{{0, 10}, {10, 10}}, seq("t", 13)},
++		{"reaching the total stops", seq("t", 10), 10, 25,
++			[]searchCall{{0, 10}}, seq("t", 10)},
++		{"no results", nil, 0, 25,
++			[]searchCall{{0, 10}}, nil},
++		// Repeats (across and within pages) and null items are dropped; the
++		// first occurrence keeps its place. Pages are not re-requested to
++		// make up for them.
++		{"duplicate ids are dropped in order", dups, 1000, 25,
++			[]searchCall{{0, 10}, {10, 10}, {20, 5}},
++			append(append(seq("a", 10), "b0", "b1", "b2", "b3", "b4", "b5"), seq("c", 5)...)},
++	}
++	for _, mode := range playbackModes {
++		for _, tt := range tests {
++			t.Run(mode.name+"/"+tt.name, func(t *testing.T) {
++				f := isolate(t)
++				sf := &searchFake{ids: tt.ids, total: tt.total}
++				f.handle("GET /v1/search", sf.serve)
++				p := testProvider(t, mode.webOnly)
++
++				got, err := p.SearchTracks(context.Background(), "q", tt.limit)
++				if err != nil {
++					t.Fatalf("SearchTracks: %v", err)
++				}
++				if calls := sf.seen(); !slices.Equal(calls, tt.wantCalls) {
++					t.Fatalf("requests (offset, limit) = %v, want %v", calls, tt.wantCalls)
++				}
++				if ids := trackIDs(got); !slices.Equal(ids, tt.wantIDs) {
++					t.Fatalf("ids = %v, want %v", ids, tt.wantIDs)
++				}
++				// Each result keeps the mode's shape (bridged or spotify:track:).
++				for _, tr := range got {
++					if mode.webOnly != (tr.Meta(metaBridge) == PlaybackYouTube) || mode.webOnly == strings.HasPrefix(tr.Path, spotifyTrackPrefix) {
++						t.Fatalf("track %#v is not in the %s shape", tr, mode.name)
++					}
++				}
++			})
++		}
++	}
++}
++
++// The search query and type go on every page.
++func TestSearchTracksPageQuery(t *testing.T) {
++	f := isolate(t)
++	var queries []string
++	var mu sync.Mutex
++	sf := &searchFake{ids: seq("t", 30), total: 30}
++	f.handle("GET /v1/search", func(w http.ResponseWriter, r *http.Request) {
++		mu.Lock()
++		queries = append(queries, r.URL.Query().Get("q")+"|"+r.URL.Query().Get("type")+"|"+r.URL.Query().Get("market"))
++		mu.Unlock()
++		sf.serve(w, r)
++	})
++	p := testProvider(t, true)
++	if _, err := p.SearchTracks(context.Background(), "米津玄師 Lemon", 20); err != nil {
++		t.Fatal(err)
++	}
++	want := []string{"米津玄師 Lemon|track|", "米津玄師 Lemon|track|"}
++	if !slices.Equal(queries, want) {
++		t.Fatalf("queries = %q, want %q", queries, want)
++	}
++}
++
++func quotaExceededHandler(retryAfter string) http.HandlerFunc {
++	return func(w http.ResponseWriter, _ *http.Request) {
++		if retryAfter != "" {
++			w.Header().Set("Retry-After", retryAfter)
++		}
++		w.Header().Set("Content-Type", "application/json")
++		w.WriteHeader(http.StatusTooManyRequests)
++		_, _ = io.WriteString(w, `{"error":{"status":429,"message":"Quota exceeded","reason":"QUOTA_EXCEEDED"}}`)
++	}
++}
++
++func serverError(w http.ResponseWriter, _ *http.Request) {
++	http.Error(w, `{"error":{"status":500,"message":"Server error"}}`, http.StatusInternalServerError)
++}
++
++func rateLimitedHandler(retryAfter string) http.HandlerFunc {
++	return func(w http.ResponseWriter, _ *http.Request) {
++		w.Header().Set("Retry-After", retryAfter)
++		w.WriteHeader(http.StatusTooManyRequests)
++	}
++}
++
++func ownerPremiumHandler(w http.ResponseWriter, _ *http.Request) {
++	w.Header().Set("Content-Type", "application/json")
++	w.WriteHeader(http.StatusForbidden)
++	_, _ = io.WriteString(w, `{"error":{"status":403,"message":"Active premium subscription required for the owner of the app"}}`)
++}
++
++// A later page that fails leaves the pages before it, unless the failure is
++// a refusal every call gets for a while (quota, long rate limit, owner
++// without Premium): that is the search's error, as is any failure of the
++// first page.
++func TestSearchTracksPageFailure(t *testing.T) {
++	tests := []struct {
++		name      string
++		fail      map[int]http.HandlerFunc
++		wantCalls []searchCall
++		wantIDs   []string
++		wantErr   string
++		wantWarn  string
++	}{
++		{"second page fails", map[int]http.HandlerFunc{10: serverError},
++			[]searchCall{{0, 10}, {10, 10}}, seq("t", 10), "",
++			"spotify: search: returning the first 10 results; the page at offset 10 failed: spotify: search: http status 500"},
++		{"third page runs out of quota", map[int]http.HandlerFunc{20: quotaExceededHandler("3600")},
++			[]searchCall{{0, 10}, {10, 10}, {20, 5}}, nil,
++			"spotify: search: spotify: Spotify quota exceeded for this developer account; retry after 1h0m0s", ""},
++		{"second page is rate limited for a day", map[int]http.HandlerFunc{10: rateLimitedHandler("86400")},
++			[]searchCall{{0, 10}, {10, 10}}, nil,
++			"spotify: search: spotify: rate limited by Spotify; retry after 24h0m0s", ""},
++		{"second page: owner without Premium", map[int]http.HandlerFunc{10: ownerPremiumHandler},
++			[]searchCall{{0, 10}, {10, 10}}, nil,
++			"spotify: search: http status 403 Forbidden: {\"error\":{\"status\":403,\"message\":\"Active premium subscription required for the owner of the app\"}}", ""},
++		{"first page fails", map[int]http.HandlerFunc{0: serverError},
++			[]searchCall{{0, 10}}, nil, "spotify: search: http status 500 Internal Server Error: ", ""},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			f := isolate(t)
++			sf := &searchFake{ids: seq("t", 60), total: 60, fail: tt.fail}
++			f.handle("GET /v1/search", sf.serve)
++			p := testProvider(t, true)
++			applog.Drain()
++
++			got, err := p.SearchTracks(context.Background(), "q", 25)
++			if tt.wantErr != "" {
++				if err == nil || !strings.HasPrefix(err.Error(), tt.wantErr) || got != nil {
++					t.Fatalf("SearchTracks = %d tracks, %v; want error %q", len(got), err, tt.wantErr)
++				}
++			} else if err != nil {
++				t.Fatalf("SearchTracks: %v", err)
++			}
++			if calls := sf.seen(); !slices.Equal(calls, tt.wantCalls) {
++				t.Fatalf("requests = %v, want %v", calls, tt.wantCalls)
++			}
++			if ids := trackIDs(got); !slices.Equal(ids, tt.wantIDs) {
++				t.Fatalf("ids = %v, want %v", ids, tt.wantIDs)
++			}
++			if tt.wantWarn != "" {
++				var texts []string
++				for _, e := range applog.Drain() {
++					texts = append(texts, e.Text)
++				}
++				if !slices.ContainsFunc(texts, func(s string) bool { return strings.Contains(s, tt.wantWarn) }) {
++					t.Fatalf("warnings = %q, want one containing %q", texts, tt.wantWarn)
++				}
++			}
++		})
++	}
++}
++
++// Which failures of a later page end the search instead of returning the
++// pages so far.
++func TestRefusesEveryCall(t *testing.T) {
++	tests := []struct {
++		name string
++		err  error
++		want bool
++	}{
++		{"quota", fmt.Errorf("spotify: search: %w", &QuotaExceededError{RetryAfter: time.Hour}), true},
++		{"quota without a wait", &QuotaExceededError{}, true},
++		{"long rate limit", fmt.Errorf("spotify: search: %w", &RateLimitError{RetryAfter: 24 * time.Hour}), true},
++		{"sign-in required", fmt.Errorf("spotify: search: refresh access token: %w", playlist.ErrNeedsAuth), true},
++		{"owner without Premium", errors.New(`spotify: search: http status 403 Forbidden: {"error":{"status":403,"message":"Active premium subscription required for the owner of the app"}}`), true},
++		{"server error", errors.New(`spotify: search: http status 500 Internal Server Error: {}`), false},
++		{"timeout", fmt.Errorf("spotify: search: %w", context.DeadlineExceeded), false},
++		{"retries used up", errors.New("spotify: web api rate-limited on /v1/search after 8 retries (try re-authenticating)"), false},
++		{"other 403", errors.New(`spotify: search: http status 403 Forbidden: {"error":{"status":403,"message":"Forbidden"}}`), false},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			if got := refusesEveryCall(tt.err); got != tt.want {
++				t.Fatalf("refusesEveryCall(%v) = %v, want %v", tt.err, got, tt.want)
++			}
++		})
++	}
++}
++
++// How a refused first page reads.
++func TestSearchTracksErrors(t *testing.T) {
++	const ownerPremium = `{"error":{"status":403,"message":"Active premium subscription required for the owner of the app"}}`
++	const notRegistered = `{"error":{"status":403,"message":"Check settings on developer.spotify.com/dashboard, the user may not be registered."}}`
++	tests := []struct {
++		name    string
++		status  int
++		body    string
++		want    string // exact error text
++		notWant []string
++	}{
++		// Passed on unchanged: the GUI recognises Spotify's own words.
++		{"owner without Premium", 403, ownerPremium,
++			"spotify: search: http status 403 Forbidden: " + ownerPremium, nil},
++		{"account not a user of the app", 403, notRegistered,
++			"spotify: search: this Spotify account is not a user of the Developer app (add it under User Management at developer.spotify.com/dashboard): http status 403 Forbidden: " + notRegistered, nil},
++		// No longer blamed on the client_id's age.
++		{"invalid limit", 400, `{"error":{"status":400,"message":"Invalid limit"}}`,
++			`spotify: search: Spotify refused a page of 10 results (cliamp asks for at most 10 per request, the limit for Development Mode apps since February 2026; Spotify may have lowered it again): http status 400 Bad Request: {"error":{"status":400,"message":"Invalid limit"}}`,
++			[]string{"too new", "search blocked", "Nov 27"}},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			f := isolate(t)
++			var calls atomic.Int32
++			f.handle("GET /v1/search", func(w http.ResponseWriter, _ *http.Request) {
++				calls.Add(1)
++				w.Header().Set("Content-Type", "application/json")
++				w.WriteHeader(tt.status)
++				_, _ = io.WriteString(w, tt.body)
++			})
++			p := testProvider(t, true)
++			_, err := p.SearchTracks(context.Background(), "q", 20)
++			if err == nil || err.Error() != tt.want {
++				t.Fatalf("err =\n %v\nwant\n %s", err, tt.want)
++			}
++			for _, s := range tt.notWant {
++				if strings.Contains(err.Error(), s) {
++					t.Fatalf("err %q mentions %q", err, s)
++				}
++			}
++			if n := calls.Load(); n != 1 {
++				t.Fatalf("requests = %d, want 1 (a refused first page is not retried)", n)
++			}
++		})
++	}
++}
++
++// The owner-Premium 403 keeps Spotify's text in every catalog call; tracks
++// still rewrites other 403s (a playlist the user cannot read).
++func TestOwnerPremiumRequiredPassesThrough(t *testing.T) {
++	const ownerPremium = `{"error":{"status":403,"message":"Active premium subscription required for the owner of the app"}}`
++	forbidden := func(body string) http.HandlerFunc {
++		return func(w http.ResponseWriter, _ *http.Request) {
++			w.Header().Set("Content-Type", "application/json")
++			w.WriteHeader(http.StatusForbidden)
++			_, _ = io.WriteString(w, body)
++		}
++	}
++	f := isolate(t)
++	for _, key := range []string{"GET /v1/me", "GET /v1/me/tracks", "GET /v1/me/playlists", "GET /v1/playlists/pl1/items", "GET /v1/search", "POST /v1/me/playlists", "POST /v1/playlists/pl1/items"} {
++		f.handle(key, forbidden(ownerPremium))
++	}
++	f.handle("GET /v1/playlists/other/items", forbidden(`{"error":{"status":403,"message":"Forbidden"}}`))
++	p := testProvider(t, true)
++	ctx := context.Background()
++
++	_, errPlaylists := p.Playlists()
++	_, errTracks := p.Tracks("pl1")
++	_, errSearch := p.SearchTracks(ctx, "q", 20)
++	_, errCreate := p.CreatePlaylist(ctx, "x")
++	errAdd := p.AddTrackToPlaylist(ctx, "pl1", playlist.Track{Path: "spotify:track:abc"})
++	for name, err := range map[string]error{"playlists": errPlaylists, "tracks": errTracks, "search": errSearch, "create": errCreate, "add": errAdd} {
++		if err == nil || !strings.HasPrefix(err.Error(), "spotify: ") || !strings.HasSuffix(err.Error(), "http status 403 Forbidden: "+ownerPremium) {
++			t.Errorf("%s err = %v, want Spotify's owner-Premium reply", name, err)
++		}
++		if err != nil && !ownerPremiumRequired(err) {
++			t.Errorf("%s: ownerPremiumRequired(%v) = false", name, err)
++		}
++	}
++	_, err := p.Tracks("other")
++	if err == nil || err.Error() != "spotify: playlist not accessible: only playlists you own or collaborate on can be loaded" {
++		t.Fatalf("Tracks(other) err = %v", err)
++	}
++	if ownerPremiumRequired(err) {
++		t.Fatal("ownerPremiumRequired matched an ordinary 403")
++	}
++}
++
++// Adding goes to POST /v1/playlists/{id}/items with {"uris": [...]}; the
++// removed /tracks is never asked.
++func TestAddTrackToPlaylistItemsEndpoint(t *testing.T) {
++	for _, mode := range playbackModes {
++		t.Run(mode.name, func(t *testing.T) {
++			f := isolate(t)
++			f.json("POST /v1/playlists/pl1/items", http.StatusCreated, map[string]string{"snapshot_id": "s2"})
++			p := testProvider(t, mode.webOnly)
++			track := spotifyTrack{id: "tid", title: "T", artists: []string{"A"}}.track(mode.webOnly)
++			if err := p.AddTrackToPlaylist(context.Background(), "pl1", track); err != nil {
++				t.Fatalf("AddTrackToPlaylist: %v", err)
++			}
++			if b := f.body("POST /v1/playlists/pl1/items"); !slices.Equal(b, []string{`{"uris":["spotify:track:tid"]}`}) {
++				t.Fatalf("bodies = %q", b)
++			}
++			if n := f.count("POST /v1/playlists/pl1/tracks"); n != 0 {
++				t.Fatalf("asked the removed /tracks endpoint %d times", n)
++			}
++		})
++	}
++}
++
++// Creating goes to POST /v1/me/playlists as a private playlist, without
++// looking up the user id (POST /v1/users/{id}/playlists was removed).
++func TestCreatePlaylistMeEndpoint(t *testing.T) {
++	for _, mode := range playbackModes {
++		t.Run(mode.name, func(t *testing.T) {
++			f := isolate(t)
++			f.json("GET /v1/me", 200, map[string]string{"id": "u1"})
++			f.json("POST /v1/me/playlists", http.StatusCreated, map[string]any{"id": "newpl", "name": "From cliamp"})
++			p := testProvider(t, mode.webOnly)
++			id, err := p.CreatePlaylist(context.Background(), "From cliamp")
++			if err != nil || id != "newpl" {
++				t.Fatalf("CreatePlaylist = %q, %v", id, err)
++			}
++			b := f.body("POST /v1/me/playlists")
++			if len(b) != 1 {
++				t.Fatalf("POST /v1/me/playlists requests = %d", len(b))
++			}
++			var got map[string]any
++			if err := json.Unmarshal([]byte(b[0]), &got); err != nil || !reflect.DeepEqual(got, map[string]any{"name": "From cliamp", "public": false}) {
++				t.Fatalf("body = %s", b[0])
++			}
++			if n := f.count("GET /v1/me"); n != 0 {
++				t.Fatalf("GET /v1/me asked %d times", n)
++			}
++			if n := f.count("POST /v1/users/u1/playlists"); n != 0 {
++				t.Fatalf("asked the removed /v1/users/{id}/playlists %d times", n)
++			}
++		})
++	}
++}
++
++// A 429 whose body says QUOTA_EXCEEDED fails at once (even with a short
++// Retry-After); any other 429 keeps the capped retry.
++func TestWebAPIQuotaExceeded(t *testing.T) {
++	tests := []struct {
++		name       string
++		retryAfter string
++		body       string
++		wantErr    string // "" → retried once, then succeeds
++		wantCalls  int
++	}{
++		{"quota, Retry-After an hour", "3600", `{"error":{"status":429,"message":"Quota exceeded","reason":"QUOTA_EXCEEDED"}}`,
++			"spotify: Spotify quota exceeded for this developer account; retry after 1h0m0s", 1},
++		{"quota, short Retry-After is not retried", "1", `{"error":{"status":429,"message":"Quota exceeded","reason":"QUOTA_EXCEEDED"}}`,
++			"spotify: Spotify quota exceeded for this developer account; retry after 1s", 1},
++		{"quota, no Retry-After", "", `{"error":{"status":429,"reason":"QUOTA_EXCEEDED"}}`,
++			"spotify: Spotify quota exceeded for this developer account", 1},
++		{"quota, a day", "86400", `{"error":{"status":429,"message":"x","reason":"QUOTA_EXCEEDED"}}`,
++			"spotify: Spotify quota exceeded for this developer account; retry after 24h0m0s", 1},
++		{"ordinary rate limit with a JSON body", "1", `{"error":{"status":429,"message":"API rate limit exceeded"}}`, "", 2},
++		{"ordinary rate limit with another reason", "1", `{"error":{"status":429,"message":"slow down","reason":"RATE_LIMITED"}}`, "", 2},
++		{"ordinary rate limit without a body", "1", "", "", 2},
++		{"ordinary rate limit with a text body", "1", "Too Many Requests", "", 2},
++		{"ordinary long rate limit still fails fast", "86400", `{"error":{"status":429,"message":"API rate limit exceeded"}}`,
++			"spotify: rate limited by Spotify; retry after 24h0m0s", 1},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			f := isolate(t)
++			var calls atomic.Int32
++			f.handle("GET /v1/me/playlists", func(w http.ResponseWriter, _ *http.Request) {
++				if calls.Add(1) == 1 {
++					if tt.retryAfter != "" {
++						w.Header().Set("Retry-After", tt.retryAfter)
++					}
++					w.WriteHeader(http.StatusTooManyRequests)
++					_, _ = io.WriteString(w, tt.body)
++					return
++				}
++				w.Header().Set("Content-Type", "application/json")
++				_, _ = w.Write([]byte(`{"items":[],"total":0}`))
++			})
++			p := testProvider(t, true)
++			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
++			defer cancel()
++			start := time.Now()
++			resp, err := p.webAPI(ctx, "GET", "/v1/me/playlists", nil)
++			elapsed := time.Since(start)
++			if resp != nil {
++				resp.Body.Close()
++			}
++			if tt.wantErr == "" {
++				if err != nil {
++					t.Fatalf("webAPI: %v", err)
++				}
++			} else {
++				if err == nil || err.Error() != tt.wantErr {
++					t.Fatalf("err = %v, want %q", err, tt.wantErr)
++				}
++				if elapsed > 2*time.Second {
++					t.Fatalf("failing took %v", elapsed)
++				}
++			}
++			if n := int(calls.Load()); n != tt.wantCalls {
++				t.Fatalf("requests = %d, want %d", n, tt.wantCalls)
++			}
++		})
++	}
++}
++
++// The quota error reaches the catalog's callers with its type.
++func TestQuotaExceededReachesCallers(t *testing.T) {
++	f := isolate(t)
++	f.handle("GET /v1/search", quotaExceededHandler("120"))
++	f.handle("GET /v1/me/tracks", quotaExceededHandler("120"))
++	p := testProvider(t, true)
++
++	_, err := p.SearchTracks(context.Background(), "q", 25)
++	var qe *QuotaExceededError
++	if !errors.As(err, &qe) || qe.RetryAfter != 2*time.Minute ||
++		err.Error() != "spotify: search: spotify: Spotify quota exceeded for this developer account; retry after 2m0s" {
++		t.Fatalf("SearchTracks err = %v", err)
++	}
++	var rl *RateLimitError
++	if errors.As(err, &rl) {
++		t.Fatal("a quota error is also a RateLimitError")
++	}
++	if n := f.count("GET /v1/search"); n != 1 {
++		t.Fatalf("search requests = %d", n)
++	}
++	_, err = p.Playlists()
++	if !errors.As(err, &qe) || err.Error() != "spotify: your music: spotify: Spotify quota exceeded for this developer account; retry after 2m0s" {
++		t.Fatalf("Playlists err = %v", err)
++	}
++}
++
++func TestRateLimitReason(t *testing.T) {
++	tests := []struct {
++		body string
++		want string
++	}{
++		{`{"error":{"status":429,"message":"Quota exceeded","reason":"QUOTA_EXCEEDED"}}`, "QUOTA_EXCEEDED"},
++		{`{"error":{"reason":" QUOTA_EXCEEDED "}}`, "QUOTA_EXCEEDED"},
++		{`{"error":{"status":429,"message":"API rate limit exceeded"}}`, ""},
++		{`{"error":"too_many_requests"}`, ""},
++		{`{"reason":"QUOTA_EXCEEDED"}`, ""},
++		{"", ""},
++		{"Too Many Requests", ""},
++		{`{"error":{"reason":"QUOTA_EXCEEDED"}}` + strings.Repeat(" ", maxRateLimitBody), "QUOTA_EXCEEDED"},
++		{`{"error":{"reason":` + strings.Repeat(" ", maxRateLimitBody) + `"QUOTA_EXCEEDED"}}`, ""}, // cut off
++	}
++	for i, tt := range tests {
++		if got := rateLimitReason(strings.NewReader(tt.body)); got != tt.want {
++			t.Errorf("#%d rateLimitReason(%.60q) = %q, want %q", i, tt.body, got, tt.want)
++		}
++	}
++}
++
++func TestQuotaExceeded(t *testing.T) {
++	now := time.Date(2026, 9, 27, 12, 0, 0, 0, time.UTC)
++	h := func(ra string) http.Header {
++		hd := http.Header{}
++		if ra != "" {
++			hd.Set("Retry-After", ra)
++		}
++		return hd
++	}
++	tests := []struct {
++		reason, retryAfter string
++		want               string // "" → not a quota error
++	}{
++		{"QUOTA_EXCEEDED", "3600", "spotify: Spotify quota exceeded for this developer account; retry after 1h0m0s"},
++		{"quota_exceeded", "5", "spotify: Spotify quota exceeded for this developer account; retry after 5s"},
++		{"QUOTA_EXCEEDED", "", "spotify: Spotify quota exceeded for this developer account"},
++		{"QUOTA_EXCEEDED", "0", "spotify: Spotify quota exceeded for this developer account"},
++		{"QUOTA_EXCEEDED", "soon", "spotify: Spotify quota exceeded for this developer account"},
++		{"QUOTA_EXCEEDED", now.Add(90 * time.Minute).Format(http.TimeFormat), "spotify: Spotify quota exceeded for this developer account; retry after 1h30m0s"},
++		{"QUOTA_EXCEEDED", "99999999999999999999", "spotify: Spotify quota exceeded for this developer account; retry after 2562047h47m16.854775807s"},
++		{"", "3600", ""},
++		{"RATE_LIMITED", "3600", ""},
++	}
++	for _, tt := range tests {
++		err := quotaExceeded(tt.reason, h(tt.retryAfter), now)
++		got := ""
++		if err != nil {
++			got = err.Error()
++		}
++		if got != tt.want {
++			t.Errorf("quotaExceeded(%q, %q) = %q, want %q", tt.reason, tt.retryAfter, got, tt.want)
++		}
 +	}
 +}
 diff --git a/external/spotify/fake_test.go b/external/spotify/fake_test.go
@@ -3255,7 +4297,7 @@ index 0000000..92a16cc
 +	return &Session{stream: b, devID: generateDeviceID(), clientID: "cid", tokenSource: conf.TokenSource(context.Background(), signInToken())}
 +}
 diff --git a/external/spotify/provider.go b/external/spotify/provider.go
-index 3de77db..5ddaf65 100644
+index 3de77db..fb9f879 100644
 --- a/external/spotify/provider.go
 +++ b/external/spotify/provider.go
 @@ -79,7 +79,7 @@ func playlistAccessible(item spotifyPlaylistItem, userID string) bool {
@@ -3420,6 +4462,15 @@ index 3de77db..5ddaf65 100644
  	offset := 0
  	limit := spotifyTrackPageSize
  
+@@ -424,7 +480,7 @@ func (p *SpotifyProvider) Tracks(playlistID string) ([]playlist.Track, error) {
+ 		}
+ 
+ 		if err != nil {
+-			if strings.Contains(err.Error(), "403") {
++			if strings.Contains(err.Error(), "http status 403") && !ownerPremiumRequired(err) {
+ 				return nil, fmt.Errorf("spotify: playlist not accessible: only playlists you own or collaborate on can be loaded")
+ 			}
+ 			return nil, fmt.Errorf("spotify: list tracks: %w", err)
 @@ -462,16 +518,15 @@ func (p *SpotifyProvider) Tracks(playlistID string) ([]playlist.Track, error) {
  				}
  			}
@@ -3467,26 +4518,33 @@ index 3de77db..5ddaf65 100644
  	spotID, err := librespot.SpotifyIdFromUri(uri)
  	if err != nil {
  		return nil, beep.Format{}, 0, fmt.Errorf("spotify: invalid URI %q: %w", uri, err)
-@@ -588,7 +648,9 @@ func (p *SpotifyProvider) webAPI(ctx context.Context, method, path string, query
+@@ -588,7 +648,10 @@ func (p *SpotifyProvider) webAPI(ctx context.Context, method, path string, query
  
  // webAPIWithBody is like webAPI but accepts an optional request body, content type,
  // and a set of acceptable HTTP status codes (e.g. 200, 201). Retries 429 with
 -// exponential backoff (honoring Retry-After when present).
 +// exponential backoff (honoring Retry-After when present), waiting at most
 +// maxRateLimitWait each time; a longer Retry-After fails at once with a
-+// *RateLimitError (ratelimit.go).
++// *RateLimitError, and a 429 with the reason QUOTA_EXCEEDED with a
++// *QuotaExceededError (ratelimit.go).
  func (p *SpotifyProvider) webAPIWithBody(ctx context.Context, method, path string, query url.Values, body io.Reader, contentType string, acceptStatus ...int) (*http.Response, error) {
  	const maxRetries = 8
  
-@@ -614,19 +676,16 @@ func (p *SpotifyProvider) webAPIWithBody(ctx context.Context, method, path strin
+@@ -613,20 +676,22 @@ func (p *SpotifyProvider) webAPIWithBody(ctx context.Context, method, path strin
+ 			return nil, err
  		}
  		if resp.StatusCode == http.StatusTooManyRequests {
++			reason := rateLimitReason(resp.Body)
  			resp.Body.Close()
 -			wait := time.Duration(1<<uint(attempt)) * time.Second
 -			if ra := resp.Header.Get("Retry-After"); ra != "" {
 -				if secs, err := strconv.Atoi(ra); err == nil && secs > 0 {
 -					wait = time.Duration(secs) * time.Second
 -				}
++			if err := quotaExceeded(reason, resp.Header, time.Now()); err != nil {
++				applog.UserWarn("spotify: web api quota exceeded on %s; not retrying: %v", path, err)
++				return nil, err
++			}
 +			wait, err := rateLimitWait(resp.Header, attempt, time.Now())
 +			if err != nil {
 +				applog.UserWarn("spotify: web api rate-limited on %s; not retrying: %v", path, err)
@@ -3505,29 +4563,87 @@ index 3de77db..5ddaf65 100644
  		}
  
  		ok := slices.Contains(acceptStatus, resp.StatusCode)
-@@ -697,7 +756,8 @@ func (p *SpotifyProvider) SearchTracks(ctx context.Context, query string, limit
- 					Name        string `json:"name"`
- 					ReleaseDate string `json:"release_date"`
- 				} `json:"album"`
--				DurationMs int `json:"duration_ms"`
-+				DurationMs  int `json:"duration_ms"`
-+				TrackNumber int `json:"track_number"`
- 			} `json:"items"`
- 		} `json:"tracks"`
- 	}
-@@ -705,7 +765,7 @@ func (p *SpotifyProvider) SearchTracks(ctx context.Context, query string, limit
- 		return nil, fmt.Errorf("spotify: parse search: %w", err)
- 	}
+@@ -643,106 +708,19 @@ func (p *SpotifyProvider) webAPIWithBody(ctx context.Context, method, path strin
+ 	return nil, fmt.Errorf("spotify: web api rate-limited on %s after %d retries (try re-authenticating)", path, maxRetries)
+ }
  
+-// friendlySearchError rewrites Spotify's misleading 400 "Invalid limit" reply
+-// from /v1/search into something a user can act on. Since Nov 27, 2024 Spotify
+-// returns this error for developer apps registered in Development Mode — the
+-// rest of the API (playback, playlists, library) keeps working, but the
+-// catalog endpoints (/v1/search etc.) are blocked. The limit value is fine.
+-func friendlySearchError(err error) error {
+-	if err == nil {
+-		return nil
+-	}
+-	msg := err.Error()
+-	if strings.Contains(msg, "400") && strings.Contains(msg, "Invalid limit") {
+-		return fmt.Errorf("spotify: search blocked — your client_id is too new. Spotify's Nov 27 2024 change blocks /v1/search for apps in Development Mode (the rest of cliamp still works on your app). Remove client_id from [spotify] in config.toml to use the built-in fallback for search, or apply for Extended Quota Mode")
+-	}
+-	return fmt.Errorf("spotify: search: %w", err)
+-}
+-
+-// SearchTracks searches for tracks on Spotify and returns up to limit results.
+-// limit is clamped to Spotify's accepted range of 1..50.
+-func (p *SpotifyProvider) SearchTracks(ctx context.Context, query string, limit int) ([]playlist.Track, error) {
+-	if err := p.ensureSession(); err != nil {
+-		return nil, err
+-	}
+-
+-	if limit < 1 {
+-		limit = 1
+-	} else if limit > 50 {
+-		limit = 50
+-	}
+-
+-	// No market parameter: when the request carries a user OAuth token, Spotify
+-	// implicitly scopes results to the account's country.
+-	q := url.Values{
+-		"q":     {query},
+-		"type":  {"track"},
+-		"limit": {fmt.Sprintf("%d", limit)},
+-	}
+-
+-	resp, err := p.webAPI(ctx, "GET", "/v1/search", q)
+-	if err != nil {
+-		return nil, friendlySearchError(err)
+-	}
+-
+-	var result struct {
+-		Tracks struct {
+-			Items []struct {
+-				ID      string `json:"id"`
+-				Name    string `json:"name"`
+-				Artists []struct {
+-					Name string `json:"name"`
+-				} `json:"artists"`
+-				Album struct {
+-					Name        string `json:"name"`
+-					ReleaseDate string `json:"release_date"`
+-				} `json:"album"`
+-				DurationMs int `json:"duration_ms"`
+-			} `json:"items"`
+-		} `json:"tracks"`
+-	}
+-	if err := decodeBody(resp, &result); err != nil {
+-		return nil, fmt.Errorf("spotify: parse search: %w", err)
+-	}
+-
 -	var tracks []playlist.Track
-+	var tracks []spotifyTrack
- 	for _, t := range result.Tracks.Items {
- 		if t.ID == "" {
- 			continue
-@@ -720,23 +780,26 @@ func (p *SpotifyProvider) SearchTracks(ctx context.Context, query string, limit
- 				year = y
- 			}
- 		}
+-	for _, t := range result.Tracks.Items {
+-		if t.ID == "" {
+-			continue
+-		}
+-		artists := make([]string, len(t.Artists))
+-		for i, a := range t.Artists {
+-			artists[i] = a.Name
+-		}
+-		var year int
+-		if len(t.Album.ReleaseDate) >= 4 {
+-			if y, err := strconv.Atoi(t.Album.ReleaseDate[:4]); err == nil {
+-				year = y
+-			}
+-		}
 -		tracks = append(tracks, playlist.Track{
 -			Path:         fmt.Sprintf("spotify:track:%s", t.ID),
 -			Title:        t.Name,
@@ -3535,21 +4651,11 @@ index 3de77db..5ddaf65 100644
 -			Album:        t.Album.Name,
 -			Year:         year,
 -			DurationSecs: t.DurationMs / 1000,
-+		tracks = append(tracks, spotifyTrack{
-+			id:           t.ID,
-+			title:        t.Name,
-+			artists:      artists,
-+			album:        t.Album.Name,
-+			year:         year,
-+			durationSecs: t.DurationMs / 1000,
-+			trackNumber:  t.TrackNumber,
-+			fromSearch:   true,
- 		})
- 	}
+-		})
+-	}
 -	return tracks, nil
-+	return p.presentTracks(tracks), nil
- }
- 
+-}
+-
  // AddTrackToPlaylist adds a track to an existing Spotify playlist.
 -// The track's Path is used as the Spotify URI (e.g. "spotify:track:xxx").
 +// The track's Path is used as the Spotify URI (e.g. "spotify:track:xxx"); a
@@ -3561,12 +4667,40 @@ index 3de77db..5ddaf65 100644
  	if err := p.ensureSession(); err != nil {
  		return err
  	}
+ 
++	// POST /v1/playlists/{id}/tracks was removed in February 2026 (devmode.go).
+ 	body, _ := json.Marshal(map[string]any{"uris": []string{trackURI}})
+-	path := fmt.Sprintf("/v1/playlists/%s/tracks", playlistID)
++	path := fmt.Sprintf("/v1/playlists/%s/items", playlistID)
+ 
+ 	resp, err := p.webAPIWithBody(ctx, "POST", path, nil, bytes.NewReader(body), "application/json", http.StatusOK, http.StatusCreated)
+ 	if err != nil {
+@@ -765,15 +743,12 @@ func (p *SpotifyProvider) CreatePlaylist(ctx context.Context, name string) (stri
+ 		return "", err
+ 	}
+ 
+-	userID := p.currentUserID(ctx)
+-	if userID == "" {
+-		return "", fmt.Errorf("spotify: could not determine user ID")
+-	}
+-
++	// POST /v1/users/{id}/playlists was removed in February 2026; the
++	// replacement creates the playlist for the signed-in user, so the user id
++	// is not needed (devmode.go).
+ 	body, _ := json.Marshal(map[string]any{"name": name, "public": false})
+-	path := fmt.Sprintf("/v1/users/%s/playlists", userID)
+ 
+-	resp, err := p.webAPIWithBody(ctx, "POST", path, nil, bytes.NewReader(body), "application/json", http.StatusOK, http.StatusCreated)
++	resp, err := p.webAPIWithBody(ctx, "POST", "/v1/me/playlists", nil, bytes.NewReader(body), "application/json", http.StatusOK, http.StatusCreated)
+ 	if err != nil {
+ 		return "", fmt.Errorf("spotify: create playlist: %w", err)
+ 	}
 diff --git a/external/spotify/ratelimit.go b/external/spotify/ratelimit.go
 new file mode 100644
-index 0000000..cccd64c
+index 0000000..7d1cba5
 --- /dev/null
 +++ b/external/spotify/ratelimit.go
-@@ -0,0 +1,87 @@
+@@ -0,0 +1,151 @@
 +//go:build !windows
 +
 +package spotify
@@ -3577,14 +4711,22 @@ index 0000000..cccd64c
 +// for 86400 s; honouring that parked the caller (and the GUI's IPC request)
 +// for a day. Short waits are still retried; anything longer than
 +// maxRateLimitWait fails at once with a RateLimitError.
++//
++// Since July 2026 a 429 whose JSON body carries "reason": "QUOTA_EXCEEDED"
++// means the developer account's quota is used up (every Development Mode
++// client ID of one developer shares it). Retrying cannot help, so it fails at
++// once with a QuotaExceededError, whatever Retry-After says.
 +
 +import (
 +	"context"
++	"encoding/json"
 +	"errors"
 +	"fmt"
++	"io"
 +	"math"
 +	"net/http"
 +	"strconv"
++	"strings"
 +	"time"
 +)
 +
@@ -3601,30 +4743,86 @@ index 0000000..cccd64c
 +	return fmt.Sprintf("spotify: rate limited by Spotify; retry after %v", e.RetryAfter)
 +}
 +
++// QuotaExceededError is returned when Spotify answers 429 with the reason
++// QUOTA_EXCEEDED. RetryAfter is zero when Spotify did not say how long.
++type QuotaExceededError struct {
++	RetryAfter time.Duration
++}
++
++func (e *QuotaExceededError) Error() string {
++	const msg = "spotify: Spotify quota exceeded for this developer account"
++	if e.RetryAfter > 0 {
++		return fmt.Sprintf("%s; retry after %v", msg, e.RetryAfter)
++	}
++	return msg
++}
++
++// quotaExceededReason is the "reason" of a 429 that no retry will fix.
++const quotaExceededReason = "QUOTA_EXCEEDED"
++
++// maxRateLimitBody caps how much of a 429 body is read for its reason.
++const maxRateLimitBody = 64 << 10
++
++// rateLimitReason returns the "reason" of a Web API error body
++// ({"error": {"status": 429, "message": …, "reason": …}}), or "" when the body
++// is empty, not JSON or of another shape (an ordinary rate limit).
++func rateLimitReason(body io.Reader) string {
++	data, err := io.ReadAll(io.LimitReader(body, maxRateLimitBody))
++	if err != nil && len(data) == 0 {
++		return ""
++	}
++	var v struct {
++		Error struct {
++			Reason string `json:"reason"`
++		} `json:"error"`
++	}
++	if json.Unmarshal(data, &v) != nil {
++		return ""
++	}
++	return strings.TrimSpace(v.Error.Reason)
++}
++
++// quotaExceeded returns the error to fail a 429 with at once, or nil when it
++// is an ordinary rate limit to wait out (rateLimitWait). reason is
++// rateLimitReason of its body.
++func quotaExceeded(reason string, h http.Header, now time.Time) error {
++	if !strings.EqualFold(reason, quotaExceededReason) {
++		return nil
++	}
++	asked, _ := retryAfter(h, now)
++	return &QuotaExceededError{RetryAfter: asked}
++}
++
++// retryAfter parses the Retry-After header (seconds or an HTTP date). ok is
++// false when it is missing, unparsable or not in the future.
++func retryAfter(h http.Header, now time.Time) (d time.Duration, ok bool) {
++	ra := h.Get("Retry-After")
++	if ra == "" {
++		return 0, false
++	}
++	// A number too large for an int is still a request to wait (Atoi then
++	// returns the clamped value with ErrRange).
++	if secs, err := strconv.Atoi(ra); err == nil || errors.Is(err, strconv.ErrRange) {
++		if secs <= 0 {
++			return 0, false
++		}
++		return secondsDuration(secs), true
++	}
++	if at, err := http.ParseTime(ra); err == nil {
++		d = at.Sub(now).Round(time.Second)
++		return d, d > 0
++	}
++	return 0, false
++}
++
 +// rateLimitWait returns how long to wait before retrying after the attempt-th
 +// (0-based) 429 with header h: Retry-After when given (seconds or an HTTP
 +// date), else exponential backoff capped at maxRateLimitWait. It returns a
 +// *RateLimitError instead when Retry-After exceeds maxRateLimitWait.
 +func rateLimitWait(h http.Header, attempt int, now time.Time) (time.Duration, error) {
 +	wait := min(time.Duration(1)<<min(attempt, 30)*time.Second, maxRateLimitWait)
-+	ra := h.Get("Retry-After")
-+	if ra == "" {
-+		return wait, nil
-+	}
-+	var asked time.Duration
-+	// A number too large for an int is still a request to wait (Atoi then
-+	// returns the clamped value with ErrRange).
-+	if secs, err := strconv.Atoi(ra); err == nil || errors.Is(err, strconv.ErrRange) {
-+		if secs <= 0 {
-+			return wait, nil
-+		}
-+		asked = secondsDuration(secs)
-+	} else if at, err := http.ParseTime(ra); err == nil {
-+		asked = at.Sub(now).Round(time.Second)
-+		if asked <= 0 {
-+			return wait, nil
-+		}
-+	} else {
++	asked, ok := retryAfter(h, now)
++	if !ok {
 +		return wait, nil
 +	}
 +	if asked > maxRateLimitWait {

@@ -296,7 +296,8 @@ URL へ展開する。
 `unknown provider: x`、`provider youtube has no playlists`、`invalid playlist name "a/b"`、
 `"Recently Played" is a virtual history playlist and cannot be modified`、
 `track index N out of range`。tests/test_conformance.py が偽と本物の両方で確かめる。
-Spotify の Web API が長い待ちを求めたとき (下) は `… spotify: rate limited by Spotify; retry after 24h0m0s`。
+Spotify の Web API が長い待ちを求めたとき (下) は `… spotify: rate limited by Spotify; retry after 24h0m0s`、
+開発者の割り当てを使い切ったとき (下) は `… spotify: Spotify quota exceeded for this developer account; retry after 1h0m0s`。
 
 ### Spotify の Web API だけの接続 (`playback: "youtube"`)
 
@@ -341,18 +342,21 @@ cliamp の Spotify は、サインインで得た OAuth のトークンから go
   従来どおり付かない)。`unplayable` は付かない (Spotify の地域制限は YouTube には関係しない)。
   `stream` も付かない。Spotify の曲の ID が要るときは
   `meta` の `spotify.id` を使う (TUI の「Spotify のプレイリストへ追加」もそうする)。
-- 自分で登録した Development Mode のアプリでは `search` が Spotify 側で塞がれている
-  (`spotify: search blocked — …`)。GUI は YouTube の検索を勧めてよい。
+- `search` は Premium の接続と同じく、下の「Spotify の Development Mode の規則」どおり 10 件ずつの
+  頁をつなぐ (自分で登録した Development Mode のアプリでも検索できる。以前の文言
+  `spotify: search blocked — …` はもう出ない)。
 - `spotify:track:` の曲は鳴らせない (上の「再生の失敗」の `spotify: streaming unavailable`)。
 
 開発者アプリ (client_id) の持ち主が Premium でないと、Spotify の Web API はどの呼び出しにも 403
 `{"error": {"status": 403, "message": "Active premium subscription required for the owner of the app"}}` を
-返す (2026-09 の実測。無料プランのアカウントで作ったアプリ)。cliamp は本文をそのまま包むので、`playlists` は
+返す (2026-09 の実測。無料プランのアカウントで作ったアプリ。Premium にしてから Spotify が気づくまで
+数時間かかることがある)。cliamp は本文をそのまま包むので、`playlists` は
 `spotify: your music: http status 403 Forbidden: {…}`、`search` は `spotify: search: http status 403 Forbidden:
-{…}` になる。`tracks` は上流が 403 を含む誤りをどれも `spotify: playlist not accessible: only playlists you own
-or collaborate on can be loaded` に言い換えるので、本文は残らない。GUI は "Active premium subscription required
-for the owner of the app" を含む Spotify の誤りを日本語に言い直し、公開プレイリストの取り込み (下の「GUI 側の
-約束」) を勧める (偽の cliamp は `--spotify-owner-premium` でこの形を返す)。
+{…}`、`tracks` は `spotify: list tracks: http status 403 Forbidden: {…}` になる (上流の `tracks` はどの 403 も
+`spotify: playlist not accessible: only playlists you own or collaborate on can be loaded` に言い換えて本文を
+消していた。パッチはこの 403 だけは言い換えない。ほかの 403 は従来どおり `playlist not accessible`)。
+GUI は "Active premium subscription required for the owner of the app" を含む Spotify の誤りを日本語に言い直し、
+公開プレイリストの取り込み (下の「GUI 側の約束」) を勧める (偽の cliamp は `--spotify-owner-premium` でこの形を返す)。
 
 Web API の 429 (待ってほしい): `Retry-After` が 30 秒以下なら待って繰り返す (最大 8 回。
 `Retry-After` が無ければ 1, 2, 4 … 秒、30 秒で頭打ち)。30 秒を越える待ちを求められたら
@@ -360,6 +364,48 @@ Web API の 429 (待ってほしい): `Retry-After` が 30 秒以下なら待っ
 例 `24h0m0s`) で失敗する。`playlists` なら `spotify: your music: spotify: rate limited by Spotify;
 retry after 24h0m0s` のように前に文脈が付く。Premium の接続でも同じ (以前は 24 時間待ち続け、
 要求が 120 秒で切れるまで返らなかった)。
+
+ただし 429 の本文が `{"error": {…, "reason": "QUOTA_EXCEEDED"}}` のとき (2026 年 7 月から。同じ開発者の
+Development Mode のアプリはすべて 1 つの割り当てを分け合い、それを使い切った) は、待っても直らないので
+`Retry-After` の長さに関わらず繰り返さず、`spotify: Spotify quota exceeded for this developer account; retry
+after <長さ>` (`Retry-After` が無いか読めなければ `; retry after …` の無い
+`spotify: Spotify quota exceeded for this developer account`) で失敗する。前に文脈が付くのは上と同じ
+(`spotify: search: spotify: Spotify quota exceeded …`)。`reason` が無い・ほかの値・JSON でない本文の 429 は
+上の普通の回数の制限として扱う。
+
+### Spotify の Development Mode の規則 (2026 年 2 月から)
+
+自分で登録した client_id (Development Mode のアプリ) には、Spotify が 2026 年 2 月 (新しいアプリは 2 月 11 日、
+既存のアプリは 3 月 9 日) から次の規則を当てている。パッチはこれに合わせる (Premium の接続でも Web API だけの
+接続でも同じ):
+
+- `/v1/search` の `limit` は 10 まで (既定は 5、越えると 400 `Invalid limit`)。`search` は `offset` を 0, 10,
+  20 … と進めて 10 件ずつ (最後は残りの数) 求め、`limit` (1〜50 に丸める) 件までつなぐ。`limit` 25 (`search` の
+  既定) なら 10・10・5 の 3 回、TUI の Ctrl+F (20 件) なら 2 回。求めた数より短い頁が来るか、Spotify の
+  `total` に達したらそこで止める。同じ曲 (Spotify の ID) は最初の 1 つだけ残し、順は Spotify のまま (頁を
+  足して埋め合わせはしないので、件数は `limit` より少ないことがある)。2 頁目以降が失敗したらそれまでの結果を
+  返す (誤りにしない。cliamp のログに警告が残る)。この短い結果は完全な結果と見分けられない (応答に印は
+  無い)。ただし、しばらくどの呼び出しも同じに断られる誤り (上の利用枠の使い切り・30 秒を越える回数の制限・
+  サインイン切れ (`needs_auth`)・持ち主が Premium でない 403) は、2 頁目以降でもその誤りで返す (GUI が
+  成功として 10 分覚えたり、利用枠の断りを覚え損ねたりしないように)。1 頁目が失敗したらその誤り。結果の形 (Web API だけの接続の
+  橋渡し、Premium の `spotify:track:`) は変わらない。
+- 上流は 400 `Invalid limit` を「client_id が新しすぎて検索が塞がれている」(`spotify: search blocked — your
+  client_id is too new …`) と言い換えていたが、原因は件数だった (TUI は 20 件を 1 回で求めていた)。この文言は
+  もう出ない。それでも `Invalid limit` が返ったら (Spotify が上限をさらに下げたとき)
+  `spotify: search: Spotify refused a page of 10 results (cliamp asks for at most 10 per request, the limit for
+  Development Mode apps since February 2026; Spotify may have lowered it again): http status 400 Bad Request: {…}`
+  (偽の cliamp は `--spotify-search-refused` で Spotify の検索だけをこの形で断る)。
+  サインインしたアカウントがアプリの利用者に登録されていない 403 (`… the user may not be registered.`) は
+  `spotify: search: this Spotify account is not a user of the Developer app (add it under User Management at
+  developer.spotify.com/dashboard): http status 403 Forbidden: {…}`。ほかの誤りは従来どおり `spotify: search: …`。
+- Spotify のプレイリストへの追加は `POST /v1/playlists/{id}/items` (`{"uris": […]}`)、作成は
+  `POST /v1/me/playlists` (`{"name": …, "public": false}`。利用者 ID を `/v1/me` に尋ねなくなった) を使う。
+  取り除かれた `POST /v1/playlists/{id}/tracks` と `POST /v1/users/{id}/playlists` は使わない。使うのは TUI の
+  「Spotify のプレイリストへ追加」「新しいプレイリスト」だけで、IPC のコマンドは Spotify のプレイリストを
+  書き換えない (`playlist_add` はローカルのプレイリスト)。
+- ほかの呼び出し (`GET /v1/me` の `id`、`GET /v1/me/tracks`、`GET /v1/me/playlists`、
+  `GET /v1/playlists/{id}/items`) はこの変更の影響を受けない。プレイリストの中身が読めるのは自分の・共同編集の
+  ものだけ (従来どおり、それ以外は `playlists` に出さない)。
 
 ### 既存の `device` (出力先)
 

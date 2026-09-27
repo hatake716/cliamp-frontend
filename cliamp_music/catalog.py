@@ -17,10 +17,13 @@ providers を 1 度だけ取り直し、覚えている答えを置き換える 
 providers の答えを受け取るたびに add_providers_listener の聞き手へ渡す (取り直しの答えも)。
 
 Spotify の Web API が「開発者アプリの持ち主が Premium でない」と断ったとき (403 "Active premium
-subscription required for the owner of the app") は、どの呼び出しも同じ答えになる。サイドバー・ホーム・
-すべてのプレイリスト・打ちながらの検索がそれぞれ Spotify に頼み直さないよう、その答えを
-STICKY_FAILURE_TTL の間覚え、そのプロバイダーの playlists / tracks / search には送らずに同じ失敗を返す
-(force (Ctrl+R) と繋ぎ直しでは忘れて頼み直す)。
+subscription required for the owner of the app") と、開発者の利用枠を使い切ったとき (429 の reason
+"QUOTA_EXCEEDED"。1 人の開発者のアプリはすべて 1 つの枠を分け合う) は、どの呼び出しも同じ答えになる。
+サイドバー・ホーム・すべてのプレイリスト・打ちながらの検索がそれぞれ Spotify に頼み直さない (利用枠を
+減らさない) よう、その答えを STICKY_FAILURE_TTL (2 分。利用枠で言われた待ちがそれより短ければその間) だけ覚え、
+そのプロバイダーの playlists / tracks / search には送らずに同じ失敗を返す (force (Ctrl+R) と繋ぎ直しでは
+忘れて頼み直す)。短めなのは、Premium にした後で Spotify が断りを解いた (反映に数時間かかる) ことに
+早く気づくため。
 
 track_hook (AppContext が差す) は、届いた曲の並び (tracks / search / history) を渡す前に通す関数。
 取り込んだ Spotify のプレイリストの曲 (ローカルの TOML で meta を失ったもの) に Spotify の曲 ID を
@@ -44,11 +47,13 @@ from .protocol import (
     Response,
     Track,
     fold_text,
+    is_spotify_error,
     is_spotify_owner_premium_required,
     parse_lyrics,
     parse_playlists,
     parse_providers,
     parse_tracks,
+    spotify_quota_wait,
     track_key,
 )
 
@@ -70,8 +75,30 @@ SWEEP_SECONDS = 60.0
 LAZY_SESSION_PROVIDERS = frozenset({"spotify"})
 _SESSION_KINDS = frozenset({"playlists", "tracks", "search"})
 _PROVIDERS_KEY = ("providers",)
-# 「持ち主が Premium でない」のように、そのプロバイダーのどの呼び出しも同じに断られる失敗を覚える時間
-STICKY_FAILURE_TTL = 600.0
+# 「持ち主が Premium でない」「利用枠を使い切った」のように、そのプロバイダーのどの呼び出しも同じに
+# 断られる失敗を覚える時間。Premium にした後で Spotify が断りを解いたら早く気づけるよう短め
+# (Ctrl+R はいつでもすぐ頼み直す)
+STICKY_FAILURE_TTL = 120.0
+# その失敗を覚えるプロバイダー (持ち主の Premium と利用枠は Spotify の開発者アプリの断り)
+STICKY_PROVIDERS = frozenset({"spotify"})
+
+
+def sticky_failure_ttl(error: str) -> float:
+    """どの呼び出しも同じに断られる失敗なら、それを覚えておく秒。違えば 0。
+
+    cliamp の Spotify の誤り ("spotify: " で始まる) だけが対象: 持ち主が Premium でない (403) は
+    STICKY_FAILURE_TTL。利用枠を使い切った (429 QUOTA_EXCEEDED) は STICKY_FAILURE_TTL か、言われた待ちが
+    それより短ければその待ち。ふつうの回数の制限は覚えない。YouTube の検索の誤りは利用者の語を繰り返す
+    ("resolving yt-dlp ytsearch25:<語>: …") ので、語に同じ言葉があっても覚えない (覚えると、その後の
+    YouTube の検索がすべて送られずに同じ誤りになる)。"""
+    if not is_spotify_error(error):
+        return 0.0
+    if is_spotify_owner_premium_required(error):
+        return STICKY_FAILURE_TTL
+    wait = spotify_quota_wait(error)
+    if wait is not None:
+        return min(wait, STICKY_FAILURE_TTL) if wait > 0 else STICKY_FAILURE_TTL
+    return 0.0
 
 
 def _call(callback: Callable[[Any], object], value: Any) -> bool:
@@ -102,7 +129,8 @@ class Catalog:
         # 送った providers の答えがセッションより前のものかもしれない (届いたら取り直す)
         self._providers_again = False
         self._providers_listeners: list[Callable[[list[ProviderInfo]], object]] = []
-        # プロバイダー → (期限, 失敗の Response)。どの呼び出しも同じに断られる失敗 (持ち主が Premium でない)
+        # プロバイダー → (期限, 失敗の Response)。どの呼び出しも同じに断られる失敗 (持ち主が Premium でない・
+        # 利用枠を使い切った)
         self._provider_failures: dict[str, tuple[float, Response]] = {}
         # 曲の並びを渡す前に通す関数 (AppContext が取り込んだ曲の ID を付け直すのに使う)
         self.track_hook: Callable[[list[Track]], list[Track]] | None = None
@@ -169,8 +197,10 @@ class Catalog:
                     self._provider_failures.pop(provider, None)
             else:
                 value = response
-                if provider is not None and is_spotify_owner_premium_required(response.error):
-                    self._provider_failures[provider] = (time.monotonic() + STICKY_FAILURE_TTL, response)
+                # 覚えるのは Spotify のアカウント (開発者アプリ) ごとの断りだけ
+                sticky = sticky_failure_ttl(response.error) if provider in STICKY_PROVIDERS else 0.0
+                if sticky > 0:
+                    self._provider_failures[provider] = (time.monotonic() + sticky, response)
                 substitute = miss(response) if miss is not None else None
                 if substitute is not None:
                     value, miss_ttl = substitute
@@ -234,7 +264,8 @@ class Catalog:
             del self._cache[key]
 
     def provider_failure(self, provider: str) -> Response | None:
-        """provider のどの呼び出しも同じに断られている失敗 (持ち主が Premium でないなど)。無ければ None。"""
+        """provider のどの呼び出しも同じに断られている失敗 (持ち主が Premium でない・利用枠を使い切った)。
+        無ければ None。"""
         failure = self._provider_failures.get(provider)
         if failure is None or failure[0] <= time.monotonic():
             return None

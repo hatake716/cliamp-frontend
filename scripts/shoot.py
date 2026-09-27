@@ -34,8 +34,8 @@ nowplaying, lyrics, queue, fullscreen-lyrics, fullscreen-queue, mini-square, min
 equalizer, stress, playback-error, playback-error-fullscreen, playback-error-mini, narrow, collapsed,
 collapsed-sidebar,
 panel-over, disconnected, reconnected, legacy, legacy-playlists, legacy-search,
-playlist-web-only, playlists-web-only, search-spotify-blocked (Spotify の接続が Web API だけの
-cliamp。偽を --spotify-web-only で起こし直す)、
+playlist-web-only, playlists-web-only, search-spotify-web-only, search-spotify-blocked (Spotify の接続が
+Web API だけの cliamp。偽を --spotify-web-only で起こし直す。最後の 1 枚は --spotify-search-refused も付ける)、
 import-dialog, import-dialog-error, import-dialog-network, import-dialog-ready, imported-playlist,
 import-update-confirm, imported-playlists (「Spotify から取り込む」。Spotify の公開頁は
 tests/spotify_fixtures.py の架空のもので答える。窓はどの状態でもリンクの欄が動かないことも確かめる)、
@@ -76,7 +76,8 @@ FRAMED = ("home", "search", "search-results", "radio", "recent", "playlists", "p
           "nowplaying", "lyrics", "queue", "fullscreen-lyrics", "fullscreen-queue", "stress",
           "narrow", "collapsed-sidebar", "panel-over", "disconnected", "legacy", "mini-square", "mini-compact",
           "equalizer", "playback-error", "playback-error-fullscreen", "playback-error-mini",
-          "playlist-web-only", "search-spotify-blocked", "import-dialog", "import-dialog-error",
+          "playlist-web-only", "search-spotify-web-only", "search-spotify-blocked", "import-dialog",
+          "import-dialog-error",
           "import-dialog-network", "import-dialog-ready", "imported-playlist", "import-update-confirm",
           "imported-playlists", "playlists-owner-premium", "search-spotify-owner-premium")
 
@@ -1161,7 +1162,8 @@ def child_main(args: argparse.Namespace) -> int:
             client.disconnect(handler)
 
     def scene_web_only():
-        """Spotify の接続が Web API だけの cliamp: 曲は YouTube で探して鳴らし、検索は断られる。"""
+        """Spotify の接続が Web API だけの cliamp: プレイリスト・検索の曲は YouTube で探して鳴らす。
+        Spotify が検索の件数を断ったときの説明は、偽を --spotify-search-refused で起こし直して撮る。"""
         window = win()
         yield from restart_fake("--spotify-web-only")
         resize(1180)
@@ -1190,13 +1192,28 @@ def child_main(args: argparse.Namespace) -> int:
         yield 1.2
         check(page().sections["spotify"].note.get_text() == WEB_ONLY_NOTE, "Spotify の節の書き添えが違います")
         capture(window, "playlists-web-only")
-        # 検索: Spotify の範囲は開発モードのアプリでは断られる。英語の文ではなく日本語の説明とボタン
+        # 検索: 自前の client_id (開発モード) でも Spotify の範囲で探せ、結果は YouTube で探して鳴らす曲
         window.navigate("search")
         yield Until(lambda: page_id() == "search", 5, "検索が開かない")
         search = page()
         yield Until(lambda: search.scopes.get_n_toggles() == 3, 10, "Spotify の範囲が出ない")
         search.set_scope("spotify")
         search.set_query("夜のドライブ")
+        yield Until(lambda: search.results.state == "content", 10, "Spotify の検索の結果が出ない")
+        check(search.results_tracks and all(is_youtube_bridge(t) for t in search.results_tracks),
+              "Spotify の検索の曲が YouTube で探す形ではありません")
+        window.set_focus(None)
+        yield 1.2
+        capture(window, "search-spotify-web-only")
+        # Spotify が検索の件数を断ったとき: 英語の文ではなく日本語の説明とボタン
+        yield from restart_fake("--spotify-web-only", "--spotify-search-refused")
+        window.navigate("search")
+        yield Until(lambda: page_id() == "search", 5, "検索が開かない")
+        search = page()
+        yield Until(lambda: search.scopes.get_n_toggles() == 3, 10, "Spotify の範囲が出ない")
+        search.set_scope("spotify")
+        search.set_query("夜のドライブ", search=False)
+        search.search("夜のドライブ", force=True)
         yield Until(lambda: search.results.state == "empty", 10, "Spotify の検索の断りが出ない")
         window.set_focus(None)
         yield 1.0

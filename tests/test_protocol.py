@@ -530,6 +530,18 @@ class SpotifyRefusals(unittest.TestCase):
         self.assertTrue(message.startswith(p.SPOTIFY_SEARCH_BLOCKED_TITLE), message)
         self.assertIn("YouTube", message)
         self.assertNotIn("client_id is too new", message)
+        # 説明は 2026 年の規則: 開発モードでも 1 回 10 件までは検索できる。検索そのものが止められるのは
+        # 持ち主が Premium でないか利用枠を使い切ったときだけ
+        for words in ("10 件まで", "Premium でない", "利用枠"):
+            with self.subTest(words=words):
+                self.assertIn(words, message)
+        self.assertNotIn("止めています", message)
+        # パッチの cliamp が 10 件ずつ頼んでも断られた (Spotify が上限をさらに下げた) ときも同じ説明
+        refused = ("spotify: search: Spotify refused a page of 10 results (cliamp asks for at most 10 per request, "
+                   "the limit for Development Mode apps since February 2026; Spotify may have lowered it again): "
+                   'http status 400 Bad Request: {"error":{"status":400,"message":"Invalid limit"}}')
+        self.assertTrue(p.is_spotify_search_blocked(refused))
+        self.assertEqual(Response(False, {}, refused, "error").message, message)
         # 回数の制限を受けた検索 (friendlySearchError は "spotify: search: " を前に付ける) は
         # 「封鎖」とは言わない
         limited = "spotify: search: spotify: rate limited by Spotify; retry after 1h0m0s"
@@ -553,6 +565,80 @@ class SpotifyRefusals(unittest.TestCase):
         # 語が Spotify の文言に似ていなければ、Spotify の誤りの中でも見ない
         self.assertFalse(p.is_spotify_search_blocked("spotify: playlist \"search blocked\" not found"))
         self.assertFalse(p.is_spotify_search_blocked("spotify: list tracks: Invalid limit"))
+
+    def test_owner_premium_mentions_the_propagation_delay(self):
+        body = '{"error": {"status": 403, "message": "Active premium subscription required for the owner of the app"}}'
+        message = Response(False, {}, f"spotify: search: http status 403 Forbidden: {body}", "error").message
+        self.assertEqual(message, p.SPOTIFY_OWNER_PREMIUM)
+        self.assertIn("Premium にした直後は、Spotify が反映するまで数時間かかることがあります", message)
+        self.assertIn("「Spotify から取り込む」", message)
+
+    def test_account_not_a_user_of_the_app(self):
+        """開発モードのアプリの利用者 (User Management、5 人まで) に無いアカウント。"""
+        for text in ("spotify: search: this Spotify account is not a user of the Developer app (add it under User "
+                     "Management at developer.spotify.com/dashboard): http status 403 Forbidden: {\"error\": "
+                     "{\"status\": 403, \"message\": \"Check settings on developer.spotify.com/dashboard, the user "
+                     "may not be registered.\"}}",
+                     "spotify: your music: http status 403 Forbidden: {\"error\": {\"status\": 403, \"message\": "
+                     "\"Check settings on developer.spotify.com/dashboard, the user may not be registered.\"}}"):
+            with self.subTest(text=text[:40]):
+                self.assertTrue(p.is_spotify_not_a_user(text))
+                self.assertEqual(Response(False, {}, text, "error").message, p.SPOTIFY_NOT_A_USER)
+        self.assertIn("User Management", p.SPOTIFY_NOT_A_USER)
+        self.assertIn("5 人", p.SPOTIFY_NOT_A_USER)
+        echo = "resolving yt-dlp ytsearch20:the user may not be registered: yt-dlp: exit status 1"
+        self.assertFalse(p.is_spotify_not_a_user(echo))
+        self.assertEqual(p.describe_catalog_error(echo), "")
+
+    def test_quota_exceeded(self):
+        """開発者の利用枠を使い切った (429 の reason "QUOTA_EXCEEDED")。ふつうの回数の制限とは別に言う。"""
+        base = "Spotify の開発者向けの利用枠を使い切りました"
+        for text, wait in (
+                # パッチの cliamp の QuotaExceededError の文言そのもの (待ちの有無)
+                ("spotify: Spotify quota exceeded for this developer account; retry after 1h0m0s", 3600.0),
+                ("spotify: Spotify quota exceeded for this developer account", 0.0),
+                ("spotify: search: spotify: Spotify quota exceeded for this developer account; retry after 30m0s",
+                 1800.0),
+                ("spotify: your music: spotify: Spotify quota exceeded for this developer account", 0.0),
+                ("spotify: Spotify quota exceeded; retry after 1h0m0s", 3600.0),
+                ("spotify: search: spotify: Spotify quota exceeded; retry after 45m0s.", 2700.0),
+                ("spotify: your music: Spotify quota exceeded (shared by all development-mode apps of this "
+                 "developer); retry after 24h0m0s", 86400.0),
+                ("spotify: Spotify quota exceeded", 0.0),
+                ("spotify: quota exceeded", 0.0),
+                ("spotify: search: Spotify quota exceeded; retry after soon", 0.0),
+                # 本文の reason をそのまま包んだ Spotify の誤り
+                ('spotify: search: http status 429 Too Many Requests: {"error": {"status": 429, '
+                 '"message": "Quota exceeded", "reason": "QUOTA_EXCEEDED"}}', 0.0),
+                ('spotify: your music: http status 429 Too Many Requests: {\n  "error" : {\n    "reason" : '
+                 '"QUOTA_EXCEEDED"\n  }\n}', 0.0)):
+            with self.subTest(text=text[:60]):
+                self.assertEqual(p.spotify_quota_wait(text), wait)
+                self.assertTrue(p.is_spotify_quota_exceeded(text))
+                self.assertFalse(p.is_spotify_search_blocked(text))
+                message = Response(False, {}, text, "error").message
+                self.assertTrue(message.startswith(base + "。"), message)
+                self.assertEqual(message, p.spotify_quota_message(wait))
+        self.assertEqual(p.spotify_quota_message(0), f"{base}。しばらくしてから試してください")
+        self.assertEqual(p.spotify_quota_message(3600), f"{base}。1 時間ほどしてから試してください")
+        self.assertEqual(p.describe_catalog_error("spotify: Spotify quota exceeded; retry after 1h30m0s"),
+                         f"{base}。1 時間 30 分ほどしてから試してください")
+        # ふつうの回数の制限は今までどおり (利用枠とは言わない)
+        limited = "spotify: rate limited by Spotify; retry after 24h0m0s"
+        self.assertIsNone(p.spotify_quota_wait(limited))
+        self.assertNotIn("利用枠", Response(False, {}, limited, "error").message)
+        self.assertIsNone(p.spotify_quota_wait('spotify: search: http status 429: {"reason": "RATE_LIMITED"}'))
+        # 語を繰り返す YouTube の検索の誤りや、cliamp の文言の位置に無いものは利用枠と読まない
+        for text in ("", None, "resolving yt-dlp ytsearch20:Spotify quota exceeded: yt-dlp: exit status 1",
+                     "resolving yt-dlp ytsearch25:Error: spotify quota exceeded: yt-dlp: exit status 1",
+                     "open /music/x: Spotify quota exceeded/01.flac: no such file or directory",
+                     "yt-dlp: timed out resolving ytsearch20:spotify: quota exceeded (30s)",
+                     'resolving yt-dlp ytsearch20:"reason": "QUOTA_EXCEEDED": yt-dlp: exit status 1',
+                     "open /music/Spotify Quota Exceeded/01.flac: no such file or directory",
+                     "spotify: playlist \"quota exceeded\" not found"):
+            with self.subTest(text=text):
+                self.assertIsNone(p.spotify_quota_wait(text))
+                self.assertEqual(p.describe_catalog_error(text), "")
 
     def test_other_errors_are_unchanged(self):
         self.assertEqual(Response(False, {}, "unknown provider: x", "error").message, "unknown provider: x")
@@ -692,6 +778,18 @@ class PlaybackError(unittest.TestCase):
         # YouTube の 429 は今までどおり
         self.assertEqual(self.short("yt-dlp: ERROR: [youtube] abcdefghijk: HTTP Error 429: Too Many Requests"),
                          "YouTube に一時的に拒否されました")
+
+    def test_spotify_quota_exceeded(self):
+        short = self.short("spotify: Spotify quota exceeded for this developer account; retry after 1h0m0s")
+        self.assertEqual(short, "Spotify の開発者向けの利用枠を使い切りました (1 時間ほど待つ)")
+        self.assertEqual(p.playback_error_headline(short), "Spotify の開発者向けの利用枠を使い切りました")
+        self.assertEqual(self.short("custom streamer: spotify: Spotify quota exceeded"),
+                         "Spotify の開発者向けの利用枠を使い切りました (しばらく待つ)")
+        # 手元のファイルのフォルダ名の語では決めない (": " の直後に来ても)
+        self.assertEqual(self.short("open /music/Spotify Quota Exceeded/01.flac: no such file or directory"),
+                         "ファイルが見つかりません")
+        self.assertEqual(self.short("open /music/x: Spotify quota exceeded/01.flac: no such file or directory"),
+                         "ファイルが見つかりません")
 
     def test_unknown_error_is_a_cleaned_first_line(self):
         self.assertEqual(self.short("yt-dlp: ERROR: [generic] Unsupported URL: https://example.com/x"),
