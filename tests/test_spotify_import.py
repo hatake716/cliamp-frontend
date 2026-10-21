@@ -494,6 +494,46 @@ class IndexTest(unittest.TestCase):
                          f"{SPOTIFY_OEMBED}https://open.spotify.com/track/{original.spotify_id}")
         self.assertEqual(art_sources(stored), [])
 
+    def test_auto_sync_flag_persists_and_only_changes_when_toggled(self):
+        index = si.ImportIndex(self.path)
+        index.record("夜更かし", self.result, now=1000.0)
+        self.assertEqual(index.auto_sync_names(), [])
+        self.assertFalse(index.set_auto_sync("夜更かし", False), "off のままを on にしたとは数えない")
+        self.assertTrue(index.set_auto_sync("夜更かし", True))
+        self.assertEqual(index.auto_sync_names(), ["夜更かし"])
+        self.assertTrue(index.get("夜更かし").auto_sync)
+        self.assertFalse(index.set_auto_sync("無い", True), "記録の無いものは触れない")
+        self.assertFalse(index.mark_synced("無い"))
+        # 保存して読み直しても残る
+        reloaded = si.ImportIndex(self.path)
+        self.assertTrue(reloaded.get("夜更かし").auto_sync)
+        self.assertEqual(reloaded.auto_sync_names(), ["夜更かし"])
+        self.assertEqual(reloaded.get("夜更かし").synced_at, "")
+
+    def test_mark_synced_sets_synced_at_and_keeps_auto_sync(self):
+        index = si.ImportIndex(self.path)
+        index.record("夜更かし", self.result, now=1000.0)
+        index.set_auto_sync("夜更かし", True)
+        self.assertTrue(index.mark_synced("夜更かし", now=2_000_000_000))
+        got = index.get("夜更かし")
+        self.assertTrue(got.auto_sync, "同期しても自動同期の印は保つ")
+        self.assertEqual(got.synced_at, si._rfc3339(2_000_000_000))
+        # 保存したファイルから読み直しても synced_at が残る
+        self.assertEqual(si.ImportIndex(self.path).get("夜更かし").synced_at, si._rfc3339(2_000_000_000))
+
+    def test_records_without_new_fields_still_load(self):
+        # auto_sync / synced_at の無い古いファイル (version 1) も普通に読める
+        with open(self.path, "w", encoding="utf-8") as handle:
+            json.dump({"version": 1, "tracks": {}, "playlists": {
+                "夜更かし": {"url": f"spotify:playlist:{PID}", "kind": "playlist", "id": PID,
+                             "title": "夜更かし", "count": 6, "imported_at": "2026-09-21T14:13:20Z"}}}, handle)
+        index = si.ImportIndex(self.path)
+        record = index.get("夜更かし")
+        self.assertIsNotNone(record)
+        self.assertFalse(record.auto_sync)
+        self.assertEqual(record.synced_at, "")
+        self.assertEqual(index.auto_sync_names(), [])
+
     def test_restore_leaves_other_tracks_alone(self):
         index = si.ImportIndex(self.path)
         index.record("夜更かし", self.result)

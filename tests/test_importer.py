@@ -760,6 +760,34 @@ class PlaylistsImportTest(ImportPageCase):
         self.wait(lambda: NAME not in self.fake.local_playlists)
         self.assertIsNone(self.ctx.imports.get(NAME))
 
+    def test_auto_sync_toggle(self):
+        """「Spotify と自動同期」: ON/OFF で記録と書き添えと menu のチェックが動く。"""
+        from gi.repository import GLib
+
+        from cliamp_music.pages.playlists import PlaylistDetailPage
+
+        result = si.fetch_list(URL)
+        done = []
+        importer.save_import(self.ctx, NAME, result, callback=done.append)
+        self.wait(lambda: done)
+        page = self.show(PlaylistDetailPage(self.ctx, provider="local", id=NAME, name=NAME))
+        self.wait(lambda: len(page.list.rows()) == 6)
+        model, group = page._menu()
+        self.assertIn("Spotify と自動同期", menu_labels(model))
+        toggle = group.lookup_action("auto-sync")
+        self.assertFalse(toggle.get_state().get_boolean(), "最初から ON になっています")
+        self.window_stub.toasts.clear()
+        toggle.activate(None)  # メニューで ON にする (change-state → set_state)
+        self.assertTrue(self.ctx.auto_sync_enabled(NAME), "ON にしても記録が ON になりません")
+        self.assertTrue(toggle.get_state().get_boolean(), "menu のチェックが ON になりません")
+        self.assertIn("自動同期 ON", page.header.note_label.get_text())
+        self.assertIn(f"「{NAME}」を Spotify と自動で同期します", self.window_stub.toasts)
+        toggle.activate(None)  # OFF にする
+        self.assertFalse(self.ctx.auto_sync_enabled(NAME), "OFF にしても記録が OFF になりません")
+        self.assertFalse(toggle.get_state().get_boolean(), "menu のチェックが OFF になりません")
+        self.assertNotIn("自動同期 ON", page.header.note_label.get_text())
+        self.assertIn(f"「{NAME}」を Spotify と自動では同期しません", self.window_stub.toasts)
+
     def test_cards_get_their_art(self):
         """すべてのプレイリストのローカルのカードの絵: 取り込んだものは Spotify の絵、ほかは曲の絵
         (格子のカードは Python から誰も持っていないので、弱い参照で待つと絵が来なかった)。"""
@@ -1233,6 +1261,99 @@ class StaleRecordTest(ImportPageCase):
         plain = [Track(path="/music/a.flac"), Track(path="/music/b.flac")]
         self.assertIsNone(self.ctx.imported_record(self.name, plain))
         self.assertIsNotNone(self.ctx.imports.get(self.name))
+
+
+class AutoSyncTest(ImportFlowTest):
+    """「Spotify と自動同期」: 裏で読み直し、違っていれば静かに置き換える (sync.py)。"""
+
+    def import_and_enable(self, name: str) -> str:
+        result = si.fetch_list(URL)
+        self.save(name, result)
+        self.assertTrue(self.ctx.set_auto_sync(name, True))
+        self.window.toasts.clear()
+        self.fake.requests.clear()
+        return name
+
+    def test_sync_replaces_changed_and_keeps_auto_sync(self):
+        name = self.import_and_enable("自動同期")
+        fired = []
+        self.ctx.sync.connect("synced", lambda _s, n, new, old: fired.append((n, new, old)))
+        self.set_page(8, seed="new")  # 8 曲に変わった
+        done = []
+        self.ctx.sync.sync_one(name, done.append)
+        self.wait(lambda: done, 8, "同期が終わりません")
+        self.assertEqual(done, [True])
+        self.assertEqual(fired, [(name, 8, 6)], "置き換えた数・前の数を呼んでいません")
+        self.assertEqual([t["path"] for t in self.fake.local_playlists[name]],
+                         [t.path for t in self.fetched(8, seed="new").tracks])
+        record = self.ctx.imports.get(name)
+        self.assertTrue(record.auto_sync, "置き換えで自動同期が off に戻りました")
+        self.assertEqual(record.count, 8)
+        self.assertNotEqual(record.synced_at, "", "synced_at を更新していません")
+        self.assertEqual(self.ctx.spotify_imports_busy, set())
+        self.assertIn(f"「{name}」を Spotify と同期しました (8 曲)", self.window.toasts)
+
+    def test_sync_same_tracks_only_marks_synced(self):
+        name = self.import_and_enable("自動同期")
+        fired = []
+        self.ctx.sync.connect("synced", lambda _s, *a: fired.append(a))
+        done = []
+        self.ctx.sync.sync_one(name, done.append)  # 頁を変えない = 変わらない
+        self.wait(lambda: done, 8, "同期が終わりません")
+        self.assertEqual(done, [False], "変わっていないのに置き換えました")
+        self.assertEqual(fired, [], "変わっていないのに置き換えました")
+        self.assertEqual(len(self.fake.local_playlists[name]), 6)
+        self.assertFalse(self.fake.requests_for("playlist_delete"), "変わらないのに消しました")
+        record = self.ctx.imports.get(name)
+        self.assertTrue(record.auto_sync)
+        self.assertEqual(record.count, 6)
+        self.assertNotEqual(record.synced_at, "")
+
+    def test_sync_skips_while_busy(self):
+        name = self.import_and_enable("自動同期")
+        self.ctx.spotify_imports_busy.add(name)
+        done = []
+        self.ctx.sync.sync_one(name, done.append)
+        self.assertEqual(done, [False], "取り込み中なのに同期を始めました")
+        self.assertEqual(self.ctx.spotify_imports_busy, {name}, "取り込み中の印を消しました")
+
+    def test_sync_forgets_a_recreated_playlist(self):
+        """中身が別物 (TUI で作り直した) なら置き換えず、記録も自動同期も忘れる。"""
+        name = self.import_and_enable("自動同期")
+        # 取り込んだのはずっと前 (直後の取り込みには、後から届く古い曲一覧に備えた猶予がある)
+        self.ctx.imports.record(name, si.fetch_list(URL), now=time.time() - 10_000)
+        self.ctx.imports.set_auto_sync(name, True)
+        with self.fake.lock:
+            self.fake.local_playlists[name] = [{"path": "/music/a.flac", "title": "A"},
+                                               {"path": "/music/b.flac", "title": "B"}]
+        self.ctx.catalog.invalidate("local")
+        done = []
+        self.ctx.sync.sync_one(name, done.append)
+        self.wait(lambda: done, 8, "同期が終わりません")
+        self.assertEqual(done, [False])
+        self.assertIsNone(self.ctx.imports.get(name), "別物のプレイリストの記録を忘れていません")
+
+    def test_tick_only_polls_enabled_and_skips_busy(self):
+        enabled = self.import_and_enable("同期する")
+        self.import_and_enable("同期しない")
+        self.ctx.set_auto_sync("同期しない", False)
+        self.ctx.spotify_imports_busy.add(enabled)
+        picked = []
+        with mock.patch.object(self.ctx.sync, "sync_one", lambda name, cb=None: picked.append(name)):
+            self.ctx.sync._tick()
+        self.assertEqual(picked, [], "busy 中・無効なものを読みました")
+        self.ctx.spotify_imports_busy.discard(enabled)
+        with mock.patch.object(self.ctx.sync, "sync_one", lambda name, cb=None: picked.append(name)):
+            self.ctx.sync._tick()
+        self.assertEqual(picked, [enabled], "有効なものを読み直していません")
+
+    def test_start_stop_is_idempotent(self):
+        self.ctx.sync.start()
+        self.assertTrue(self.ctx.sync.running)
+        self.ctx.sync.start()  # 二重に始めてもタイマーを増やさない
+        self.ctx.sync.stop()
+        self.assertFalse(self.ctx.sync.running)
+        self.ctx.sync.stop()
 
 
 def close(dialog) -> None:

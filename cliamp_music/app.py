@@ -162,6 +162,8 @@ class MusicApp(Adw.Application):
         window.present()
         self._main_shown_once = True
         self._update_poll_interval()
+        if self.ctx is not None:
+            self.ctx.start_sync()
 
     def do_shutdown(self) -> None:
         if self.window is not None:
@@ -170,6 +172,7 @@ class MusicApp(Adw.Application):
             except Exception as exc:  # 保存の失敗で終了を止めない
                 log(f"窓の状態を保存できません: {exc}")
         if self.ctx is not None:
+            self.ctx.stop_sync()
             self.ctx.state.save()
             self.ctx.client.stop()
         Adw.Application.do_shutdown(self)

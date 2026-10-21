@@ -98,6 +98,10 @@ class AppContext(GObject.Object):
         # 取り込み・更新の最中のローカルのプレイリスト名と、最後に出した取り込みの窓 (試験・撮影が見る)
         self.spotify_imports_busy: set[str] = set()
         self.spotify_import_dialog = None
+        # Spotify との自動同期 (裏で読み直して置き換える)。init で作るが、start は窓の起動で呼ぶ。
+        from .sync import SpotifySync
+
+        self.sync = SpotifySync(self)
         self._local_playlists: list[str] = []
         self._local_playlists_loaded = False
         self._playlist_menus: deque[Gio.Menu] = deque(maxlen=32)
@@ -331,6 +335,36 @@ class AppContext(GObject.Object):
         except Exception as exc:  # 記録は飾り
             log(f"取り込みの記録を読めません: {exc}")
             return None
+
+    def start_sync(self) -> None:
+        """Spotify との自動同期を始める (窓の起動で一度呼ぶ。既に動いていれば何もしない)。"""
+        self.sync.start()
+
+    def stop_sync(self) -> None:
+        """自動同期を止める (アプリの終了で呼ぶ)。"""
+        self.sync.stop()
+
+    def set_auto_sync(self, name: str, enabled: bool) -> bool:
+        """取り込んだプレイリスト name の Spotify との自動同期を ON/OFF にする。
+
+        切り替えたか返す (記録が無ければ False)。ON にした直後は、次の定期の読み直しで
+        置き換える (すぐは待たない)。"""
+        try:
+            return self.imports.set_auto_sync(name, enabled)
+        except Exception as exc:  # 記録は飾り
+            log(f"自動同期を切り替えられません: {exc}")
+            return False
+
+    def auto_sync_enabled(self, name: str) -> bool:
+        record = self.import_record(name)
+        return bool(record is not None and record.auto_sync)
+
+    def auto_sync_count(self) -> int:
+        """自動同期を有効にしている取り込みのプレイリストの数。"""
+        try:
+            return len(self.imports.auto_sync_names())
+        except Exception:  # 記録は飾り
+            return 0
 
     def imported_record(self, name: str, tracks):
         """いまの曲 tracks から見て、ローカルのプレイリスト name が Spotify から取り込んだもののままなら、

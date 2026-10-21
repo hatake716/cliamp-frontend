@@ -651,6 +651,8 @@ class ImportRecord:
     count: int = 0
     truncated: bool = False
     total: int = 0
+    auto_sync: bool = False  # 裏で Spotify の公開ページを定期的に読み直して置き換える
+    synced_at: str = ""  # 自動同期で最後に置き換えた時刻 (RFC3339 UTC。手動更新では更新しない)
 
     def to_json(self) -> dict:
         out = {"url": self.url, "kind": self.kind, "id": self.id, "title": self.title, "subtitle": self.subtitle,
@@ -659,6 +661,10 @@ class ImportRecord:
             out["truncated"] = True
         if self.total:
             out["total"] = self.total
+        if self.auto_sync:
+            out["auto_sync"] = True
+        if self.synced_at:
+            out["synced_at"] = self.synced_at
         return out
 
     @classmethod
@@ -673,7 +679,8 @@ class ImportRecord:
         return cls(name=name, url=ref.url, kind=ref.kind, id=ref.id, title=_text(data.get("title")),
                    subtitle=_text(data.get("subtitle")), cover_url=_text(data.get("cover")),
                    imported_at=_text(data.get("imported_at")), count=max(0, _int(data.get("count"))),
-                   truncated=data.get("truncated") is True, total=max(0, _int(data.get("total"))))
+                   truncated=data.get("truncated") is True, total=max(0, _int(data.get("total"))),
+                   auto_sync=data.get("auto_sync") is True, synced_at=_text(data.get("synced_at")))
 
     @property
     def kind_label(self) -> str:
@@ -845,6 +852,32 @@ class ImportIndex:
 
     def names(self) -> list[str]:
         return list(self._loaded().playlists)
+
+    def auto_sync_names(self) -> list[str]:
+        """自動同期を有効にしている取り込みのプレイリスト名 (追加順)。"""
+        return [name for name, record in self._loaded().playlists.items() if record.auto_sync]
+
+    def set_auto_sync(self, name: str, enabled: bool, *, save: bool = True) -> bool:
+        """プレイリスト name の自動同期を ON/OFF にする。記録が無ければ False。changed を返す。"""
+        record = self.get(name)
+        if record is None or record.auto_sync == enabled:
+            return False
+        data = self._loaded()
+        data.playlists[name] = dc_replace(record, auto_sync=enabled)
+        if save:
+            self.save()
+        return True
+
+    def mark_synced(self, name: str, *, now: float | None = None, save: bool = True) -> bool:
+        """自動同期で置き換えたことを記録する (synced_at を更新。auto_sync はそのまま)。"""
+        record = self.get(name)
+        if record is None:
+            return False
+        data = self._loaded()
+        data.playlists[name] = dc_replace(record, synced_at=_rfc3339(now))
+        if save:
+            self.save()
+        return True
 
     def record(self, name: str, result: ImportedList, *, now: float | None = None, save: bool = True) -> ImportRecord:
         """取り込んだ (ローカルのプレイリスト name に result の曲を保存した) ことを覚えて保存する。"""

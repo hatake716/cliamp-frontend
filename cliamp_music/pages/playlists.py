@@ -101,10 +101,17 @@ IMPORTED_NOTE = "Spotify から取り込み · 曲は YouTube で探して再生
 
 
 def imported_note(record) -> str:
-    """取り込んだプレイリストの書き添え (公開ページの上限で切れていれば、そのことも)。"""
-    if record is not None and record.truncated and record.total > record.count:
-        return f"Spotify から取り込み (全 {record.total} 曲のうち最初の {record.count} 曲) · 曲は YouTube で探して再生します"
-    return IMPORTED_NOTE
+    """取り込んだプレイリストの書き添え (公開ページの上限で切れていれば、そのことも)。
+    自動同期を ON にしていれば、そのことも書き添える。"""
+    if record is None:
+        return IMPORTED_NOTE
+    if record.truncated and record.total > record.count:
+        base = f"Spotify から取り込み (全 {record.total} 曲のうち最初の {record.count} 曲) · 曲は YouTube で探して再生します"
+    else:
+        base = IMPORTED_NOTE
+    if record.auto_sync:
+        return base + " · 自動同期 ON"
+    return base
 
 
 def auth_note(ctx, provider: str) -> str:
@@ -682,10 +689,13 @@ class PlaylistDetailPage(PageBase):
             action.connect("activate", weak_call(self.enqueue_all, mode))
             action.set_enabled(bool(playable) and supports("enqueue"))
             group.add_action(action)
+        from gi.repository import GLib  # noqa: PLC0415 (Variant をここだけで使う)
+
         record = self.import_record
         if record is not None:
             spotify = Gio.Menu()
             spotify.append("Spotify から更新", "page.update-spotify")
+            spotify.append("Spotify と自動同期", "page.auto-sync")
             spotify.append("Spotify で開く", "page.open-spotify")
             menu.append_section(None, spotify)
             busy = self.playlist_id in getattr(self.ctx, "spotify_imports_busy", ())
@@ -693,6 +703,12 @@ class PlaylistDetailPage(PageBase):
             update.connect("activate", weak_call(self.update_from_spotify))
             update.set_enabled(not busy and supports("playlist_add") and supports("playlist_delete"))
             group.add_action(update)
+            # 自動同期は on/off を menu のチェックで示す (stateful action)。取り込みの最中は触れない
+            toggle = Gio.SimpleAction.new_stateful("auto-sync", None,
+                                                   GLib.Variant.new_boolean(bool(record.auto_sync)))
+            toggle.connect("change-state", weak_call(self._set_auto_sync))
+            toggle.set_enabled(not busy)
+            group.add_action(toggle)
             browse = Gio.SimpleAction.new("open-spotify", None)
             browse.connect("activate", weak_call(self.open_in_spotify))
             group.add_action(browse)
@@ -727,6 +743,16 @@ class PlaylistDetailPage(PageBase):
         updater = getattr(self.ctx, "update_spotify_import", None)
         if callable(updater) and self.import_record is not None:
             updater(self.playlist_id)
+
+    def _set_auto_sync(self, action, state) -> None:
+        """「Spotify と自動同期」を ON/OFF にする。ON にしたら、次の定期の読み直しで置き換える。"""
+        enabled = state.get_boolean()
+        setter = getattr(self.ctx, "set_auto_sync", None)
+        if not callable(setter) or not setter(self.playlist_id, enabled):
+            return
+        action.set_state(state)  # menu のチェックを実際の状態に合わせる
+        self._update_note()
+        self.ctx.toast(f"「{self.playlist_name}」を Spotify と{'自動で同期します' if enabled else '自動では同期しません'}")
 
     def open_in_spotify(self) -> None:
         record = self.import_record
