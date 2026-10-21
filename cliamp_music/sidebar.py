@@ -184,6 +184,9 @@ class Sidebar(Adw.Bin):
         updater = Gio.SimpleAction.new("update-spotify", GLib.VariantType.new("s"))
         updater.connect("activate", Sidebar._on_update_action, weakref.ref(self))
         self.menu_actions.add_action(updater)
+        sync_all = Gio.SimpleAction.new_stateful("auto-sync-all", None, GLib.Variant.new_boolean(False))
+        sync_all.connect("change-state", Sidebar._on_auto_sync_all_action, weakref.ref(self))
+        self.menu_actions.add_action(sync_all)
         self.insert_action_group("sidebar", self.menu_actions)
         self.context_menu: Gtk.PopoverMenu | None = None
         self.list.update_property([Gtk.AccessibleProperty.LABEL], ["サイドバー"])
@@ -341,9 +344,25 @@ class Sidebar(Adw.Bin):
         if callable(updater):
             updater(param.get_string())
 
+    @staticmethod
+    def _on_auto_sync_all_action(action, state, ref) -> None:
+        sidebar = ref()
+        if sidebar is None:
+            return
+        setter = getattr(sidebar.ctx, "set_auto_sync_all", None)
+        if not callable(setter):
+            return
+        enabled = state.get_boolean()
+        changed = setter(enabled)
+        action.set_state(state)
+        if sidebar.ctx is not None:
+            msg = (f"すべてのプレイリストを{'自動で同期します' if enabled else '自動では同期しません'}"
+                   if changed else "変更はありません")
+            sidebar.ctx.toast(msg)
+
     def context_menu_model(self, row: SidebarRow | None, *, header: bool = False) -> Gio.Menu | None:
         """row (「プレイリスト」の節の行) の右クリックのメニュー。節の外なら None。header なら row の上の
-        節の見出し (「プレイリスト」) のメニュー (取り込みだけ)。"""
+        節の見出し (「プレイリスト」) のメニュー (取り込みと一括自動同期)。"""
         if row is None or row.section != "playlists":
             return None
         store = self.ctx.store
@@ -353,6 +372,21 @@ class Sidebar(Adw.Bin):
         main.append(IMPORT_LABEL, "sidebar.import-spotify")
         menu.append_section(None, main)
         self.menu_actions.lookup_action("import-spotify").set_enabled(can_save)
+        if header:
+            # 「プレイリスト」見出しのメニュー: 一括自動同期の ON/OFF
+            sync_section = Gio.Menu()
+            sync_section.append("すべてのプレイリストを自動同期", "sidebar.auto-sync-all")
+            menu.append_section(None, sync_section)
+            # すべての取り込み済みプレイリストの auto_sync が ON ならチェックを付ける
+            try:
+                total = len(self.ctx.imports.names())
+                on_count = self.ctx.auto_sync_count()
+                all_enabled = total > 0 and on_count == total
+            except Exception:
+                all_enabled = False
+            sync_action = self.menu_actions.lookup_action("auto-sync-all")
+            sync_action.set_state(GLib.Variant.new_boolean(all_enabled))
+            sync_action.set_enabled(can_save and store.supports("playlist_delete"))
         name = row.params.get("id") if row.params.get("provider") == "local" and not header else None
         lookup = getattr(self.ctx, "import_record", None)
         if name and callable(lookup) and lookup(name) is not None:

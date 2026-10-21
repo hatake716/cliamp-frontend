@@ -868,6 +868,19 @@ class ImportIndex:
             self.save()
         return True
 
+    def set_auto_sync_all(self, enabled: bool) -> int:
+        """すべての取り込み済みプレイリストの自動同期を一括で ON/OFF にする。
+        変わった数を返す (0 なら何も変わっていない)。"""
+        data = self._loaded()
+        changed = 0
+        for name, record in data.playlists.items():
+            if record.auto_sync != enabled:
+                data.playlists[name] = dc_replace(record, auto_sync=enabled)
+                changed += 1
+        if changed:
+            self.save()
+        return changed
+
     def mark_synced(self, name: str, *, now: float | None = None, save: bool = True) -> bool:
         """自動同期で置き換えたことを記録する (synced_at を更新。auto_sync はそのまま)。"""
         record = self.get(name)

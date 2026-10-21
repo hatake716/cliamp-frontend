@@ -510,6 +510,26 @@ class IndexTest(unittest.TestCase):
         self.assertEqual(reloaded.auto_sync_names(), ["夜更かし"])
         self.assertEqual(reloaded.get("夜更かし").synced_at, "")
 
+    def test_set_auto_sync_all_toggles_every_record(self):
+        index = si.ImportIndex(self.path)
+        index.record("夜更かし", self.result, now=1000.0)
+        index.record("朝の支度", self.result, now=1001.0)
+        # ON: 2 件変わった
+        self.assertEqual(index.set_auto_sync_all(True), 2)
+        self.assertEqual(index.auto_sync_names(), ["夜更かし", "朝の支度"])
+        # 再度 ON: 0 件 (変わっていない)
+        self.assertEqual(index.set_auto_sync_all(True), 0)
+        # OFF: 2 件戻る
+        self.assertEqual(index.set_auto_sync_all(False), 2)
+        self.assertEqual(index.auto_sync_names(), [])
+        # 保存して読み直しても OFF のまま
+        reloaded = si.ImportIndex(self.path)
+        self.assertEqual(reloaded.auto_sync_names(), [])
+
+    def test_set_auto_sync_all_on_empty_index(self):
+        index = si.ImportIndex(self.path)
+        self.assertEqual(index.set_auto_sync_all(True), 0)
+
     def test_mark_synced_sets_synced_at_and_keeps_auto_sync(self):
         index = si.ImportIndex(self.path)
         index.record("夜更かし", self.result, now=1000.0)

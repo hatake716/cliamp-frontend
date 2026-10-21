@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import weakref
 from collections import deque
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 import gi
 
@@ -365,6 +365,20 @@ class AppContext(GObject.Object):
             return len(self.imports.auto_sync_names())
         except Exception:  # 記録は飾り
             return 0
+
+    def set_auto_sync_all(self, enabled: bool) -> int:
+        """すべての取り込み済みプレイリストの自動同期を一括で ON/OFF にする。
+        変わった数を返す (0 なら何も変わっていないか、記録を読めない)。"""
+        try:
+            return self.imports.set_auto_sync_all(enabled)
+        except Exception as exc:  # 記録は飾り
+            log(f"一括自動同期を切り替えられません: {exc}")
+            return 0
+
+    def sync_all_now(self, callback: Callable[[int, int], object] | None = None) -> None:
+        """すべての自動同期対象のプレイリストを直ちに Spotify から読み直す。
+        callback(同期を始めた数, 対象の総数)。"""
+        self.sync.sync_all(callback)
 
     def imported_record(self, name: str, tracks):
         """いまの曲 tracks から見て、ローカルのプレイリスト name が Spotify から取り込んだもののままなら、

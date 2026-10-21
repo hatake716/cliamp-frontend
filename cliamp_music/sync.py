@@ -109,6 +109,59 @@ class SpotifySync(GObject.Object):
         for name in due:
             self.sync_one(name)
 
+    def sync_all(self, callback: Callable[[int, int], object] | None = None) -> None:
+        """すべての自動同期対象を直ちに同期する。callback(同期を始めた数, 対象の総数)。
+
+        定期の tick と同じ条件 (接続・対応コマンド・busy を飛ばす) を使う。
+        対象が SYNC_BATCH を超える場合は、順次 queue に積む (1 度で全部の HTTP は投げない)。
+        """
+        ctx = self.ctx
+        if ctx is None:
+            if callback is not None:
+                callback(0, 0)
+            return
+        store = getattr(ctx, "store", None)
+        if store is None or not store.connected:
+            if callback is not None:
+                callback(0, 0)
+            return
+        if not store.supports("playlist_add") or not store.supports("playlist_delete"):
+            if callback is not None:
+                callback(0, 0)
+            return
+        try:
+            names = ctx.imports.auto_sync_names()
+        except Exception as exc:
+            log(f"一括同期の記録を読めません: {exc}")
+            if callback is not None:
+                callback(0, 0)
+            return
+        busy: set[str] = getattr(ctx, "spotify_imports_busy", set())
+        due = [n for n in names if n not in busy]
+        total = len(names)
+        started = min(len(due), SYNC_BATCH)
+        for name in due[:SYNC_BATCH]:
+            self.sync_one(name)
+        # 残りは順次処理 (前のバッチの完了を待つ)
+        if len(due) > SYNC_BATCH:
+            self._queue_remaining(due[SYNC_BATCH:], callback, started, total)
+        elif callback is not None:
+            callback(started, total)
+
+    def _queue_remaining(self, remaining: list[str], callback: Callable[[int, int], object] | None,
+                         started: int, total: int) -> None:
+        """sync_all で SYNC_BATCH に収まらなかった残り順次同期する。"""
+        if not remaining:
+            if callback is not None:
+                callback(started, total)
+            return
+        name, rest = remaining[0], remaining[1:]
+
+        def done(_ok: bool) -> None:
+            self._queue_remaining(rest, callback, started, total)
+
+        self.sync_one(name, callback=done)
+
     def sync_one(self, name: str, callback: Callable[[bool], object] | None = None) -> None:
         """プレイリスト name を読み直して、違っていれば静かに置き換える。
 

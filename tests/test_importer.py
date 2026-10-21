@@ -1026,7 +1026,8 @@ class SidebarMenuTest(ImportPageCase):
         self.assertIsNone(sidebar.list.get_row_at_y(int(y)), "見出しの上で行が取れます (試験の前提が違う)")
         row, is_header = sidebar.row_at(y)
         self.assertEqual((row.key, is_header), ("playlists", True))
-        self.assertEqual(menu_labels(sidebar.context_menu_model(all_row, header=True)), ["Spotify から取り込む…"])
+        self.assertEqual(menu_labels(sidebar.context_menu_model(all_row, header=True)),
+                         ["Spotify から取り込む…", "すべてのプレイリストを自動同期"])
         self.assertTrue(sidebar.popup_context_menu(all_row, 10, y, header=True))
         sidebar.context_menu.popdown()
         # 「ライブラリ」の見出しには出さない
@@ -1346,6 +1347,39 @@ class AutoSyncTest(ImportFlowTest):
         with mock.patch.object(self.ctx.sync, "sync_one", lambda name, cb=None: picked.append(name)):
             self.ctx.sync._tick()
         self.assertEqual(picked, [enabled], "有効なものを読み直していません")
+
+    def test_set_auto_sync_all_enables_all_then_disables(self):
+        """一括で全プレイリストの自動同期を ON/OFF にする。"""
+        self.import_and_enable("A")
+        self.import_and_enable("B")
+        self.ctx.set_auto_sync("B", False)  # B は off にする
+        changed = self.ctx.set_auto_sync_all(True)
+        self.assertEqual(changed, 1, "off の 1 件だけ変わるべき")
+        self.assertTrue(self.ctx.auto_sync_enabled("A"))
+        self.assertTrue(self.ctx.auto_sync_enabled("B"))
+        # 再度 ON: 0 件
+        self.assertEqual(self.ctx.set_auto_sync_all(True), 0)
+        # OFF
+        self.assertEqual(self.ctx.set_auto_sync_all(False), 2)
+        self.assertFalse(self.ctx.auto_sync_enabled("A"))
+        self.assertFalse(self.ctx.auto_sync_enabled("B"))
+
+    def test_sync_all_starts_multiple(self):
+        """sync_all で複数の対象を一度に同期する。"""
+        a = self.import_and_enable("A")
+        b = self.import_and_enable("B")
+        self.set_page(8, seed="new")
+        results = []
+        self.ctx.sync_all_now(lambda started, total: results.append((started, total)))
+        self.wait(lambda: len(self.fake.local_playlists.get(a, [])) == 8
+                  and len(self.fake.local_playlists.get(b, [])) == 8, 12, "一括同期が終わりません")
+        self.assertEqual(results[0][1], 2, "対象の総数が正しくありません")
+
+    def test_sync_all_no_targets(self):
+        """同期対象が無い場合 callback(0, 0) が呼ばれる。"""
+        results = []
+        self.ctx.sync_all_now(lambda started, total: results.append((started, total)))
+        self.assertEqual(results, [(0, 0)])
 
     def test_start_stop_is_idempotent(self):
         self.ctx.sync.start()

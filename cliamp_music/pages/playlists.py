@@ -96,6 +96,7 @@ LOCAL = "local"
 # これより長いリストは replace で送らず load_provider に任せる (要求 1 行は 8 MiB まで)
 REPLACE_MAX_TRACKS = 10000
 IMPORT_LABEL = "Spotify から取り込む…"
+SYNC_ALL_LABEL = "すべて同期"
 _SPOTIFY_ID = re.compile(r"[A-Za-z0-9]{22}")
 IMPORTED_NOTE = "Spotify から取り込み · 曲は YouTube で探して再生します"
 
@@ -173,6 +174,10 @@ class PlaylistsPage(PageBase):
         self.import_button.add_css_class("music-header-action")
         self.import_button.connect("clicked", weak_call(self.open_import))
         self.header_bar.pack_end(self.import_button)
+        self.sync_all_button = GlassButton(SYNC_ALL_LABEL, "music-sync-symbolic")
+        self.sync_all_button.add_css_class("music-header-action")
+        self.sync_all_button.connect("clicked", weak_call(self.sync_all))
+        self.header_bar.pack_end(self.sync_all_button)
         self.state = ContentStack("読み込み中…")
         self.sections: dict[str, _ProviderSection] = {}
         self.body.append(self.state)
@@ -188,6 +193,7 @@ class PlaylistsPage(PageBase):
     def load(self, force: bool = False) -> None:
         store = self.ctx.store
         self._update_import_button()
+        self._update_sync_all_button()
         if not store.connected:
             self.state.show_empty("music-radio-symbolic", OFFLINE_TITLE, OFFLINE_TEXT)
             return
@@ -217,6 +223,7 @@ class PlaylistsPage(PageBase):
 
     def _on_connection(self, *_args) -> None:
         self._update_import_button()
+        self._update_sync_all_button()
         if self.ctx.store.connected:
             self.load(force=False)
 
@@ -224,14 +231,39 @@ class PlaylistsPage(PageBase):
         store = self.ctx.store
         self.import_button.set_sensitive(store.connected and store.supports("playlist_add"))
 
+    def _update_sync_all_button(self) -> None:
+        """「すべて同期」のボタンを、対象があるときだけ有効にする。"""
+        count = self.ctx.auto_sync_count()
+        store = self.ctx.store
+        enabled = (store.connected
+                   and store.supports("playlist_add")
+                   and store.supports("playlist_delete")
+                   and count > 0)
+        self.sync_all_button.set_sensitive(enabled)
+
     def open_import(self) -> None:
         """「Spotify から取り込む」の窓を出す。"""
         opener = getattr(self.ctx, "open_spotify_import", None)
         if callable(opener):
             opener()
 
+    def sync_all(self) -> None:
+        """すべての自動同期対象のプレイリストを直ちに Spotify から読み直す。"""
+        syncer = getattr(self.ctx, "sync_all_now", None)
+        if not callable(syncer):
+            return
+
+        def done(started: int, total: int) -> None:
+            if started > 0:
+                self.ctx.toast(f"{started} 件のプレイリストの同期を始めました")
+            elif total == 0:
+                self.ctx.toast("自動同期の対象がありません")
+
+        syncer(done)
+
     def on_narrow_changed(self, narrow: bool) -> None:
         self.import_button.set_compact(narrow)
+        self.sync_all_button.set_compact(narrow)
 
     def _on_local_changed(self, *_args) -> None:
         if LOCAL in self.sections:
@@ -706,7 +738,7 @@ class PlaylistDetailPage(PageBase):
             # 自動同期は on/off を menu のチェックで示す (stateful action)。取り込みの最中は触れない
             toggle = Gio.SimpleAction.new_stateful("auto-sync", None,
                                                    GLib.Variant.new_boolean(bool(record.auto_sync)))
-            toggle.connect("change-state", weak_call(self._set_auto_sync))
+            toggle.connect("change-state", weak_handler(self._set_auto_sync))
             toggle.set_enabled(not busy)
             group.add_action(toggle)
             browse = Gio.SimpleAction.new("open-spotify", None)
@@ -751,6 +783,9 @@ class PlaylistDetailPage(PageBase):
         if not callable(setter) or not setter(self.playlist_id, enabled):
             return
         action.set_state(state)  # menu のチェックを実際の状態に合わせる
+        # 記録を書き直したので、表示用の記録も今の曲から読み直す (古いままだと注記が ON にならない)
+        if self.is_local:
+            self._record = imported_record(self.ctx, self.playlist_id, self._tracks)
         self._update_note()
         self.ctx.toast(f"「{self.playlist_name}」を Spotify と{'自動で同期します' if enabled else '自動では同期しません'}")
 
