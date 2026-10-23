@@ -19,6 +19,7 @@ import tempfile
 import unittest
 import weakref
 from pathlib import Path
+from unittest.mock import patch
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
@@ -411,6 +412,145 @@ class SearchPageTest(PageCase):
         page._clear_recent()
         self.assertEqual(self.ctx.state.recent_searches, [])
         self.assertFalse(page.recent_box.get_visible())
+
+    # --- TopCharts integration tests -------------------------------------------
+
+    def _make_charts(self, count=12, rank_order=None):
+        from chart_fixtures import make_chart_fetcher
+        from cliamp_music.charts import TopCharts
+        fetcher = make_chart_fetcher(count=count, rank_order=rank_order)
+        charts = TopCharts(fetcher=fetcher)
+        self.addCleanup(charts.stop)
+        return charts
+
+    def test_charts_constructor_does_not_start_fetch(self):
+        """ページ構築だけではチャート取得を開始しない。"""
+        from cliamp_music.charts import TopCharts
+
+        def fail_fetch_text(*args, **kwargs):
+            raise AssertionError("SearchPage が charts.fetch_text を呼んだ")
+
+        with patch("cliamp_music.charts.fetch_text", side_effect=fail_fetch_text):
+            charts = TopCharts(fetcher=lambda *args, **kwargs: "{}")
+            self.ctx.charts = charts
+            page = self.show(SearchPage(self.ctx))
+            run_loop(lambda: False, 0.05)
+
+        self.assertFalse(charts.fetching)
+        self.assertFalse(charts._started)
+        self.assertFalse(page.chart_status.get_visible())
+        self.assertTrue(page.categories.get_visible())
+
+    def test_charts_data_before_construction(self):
+        """データがページ構築前に揃っていてもカードが出る。"""
+        charts = self._make_charts(count=5, rank_order=[5, 1, 4, 2, 3])
+        # rank_order determines track identity order; source positions are ranks 1..5
+        charts.start_fetch()
+        self.wait(lambda: charts.has_data, 5, "チャートが揃わない")
+        self.ctx.charts = charts
+        page = self.show(SearchPage(self.ctx))
+        self.assertTrue(page.categories_header.get_visible(), "見出しが消えている")
+        self.assertFalse(page.categories.get_visible(), "カテゴリーが非表示になっていない")
+        self.assertTrue(page.charts_grid.get_visible(), "チャートグリッドが見えない")
+        self.assertTrue(page.chart_status.get_visible())
+        self.assertIn("日本", page.chart_status.get_text())
+        self.assertIn("取得:", page.chart_status.get_text())
+        self.assertIn("上位5曲", page.chart_status.get_text())
+        self.assertTrue(page.chart_link.get_visible())
+        for i in range(5):
+            child = page.charts_grid.get_child_at_index(i)
+            self.assertIsNotNone(child)
+            card = child.get_child()
+            self.assertIn(f"{i + 1}位", card.get_tooltip_text())
+
+    def test_charts_data_after_construction(self):
+        """ページ構築後に明示開始したデータが到着してもカードが出る。"""
+        charts = self._make_charts(count=3)
+        self.ctx.charts = charts
+        page = self.show(SearchPage(self.ctx))
+        self.assertTrue(page.categories.get_visible())
+        self.assertFalse(page.charts_grid.get_visible())
+        charts.start_fetch()
+        self.wait(lambda: page.charts_grid.get_visible(), 5, "チャートが後から届かない")
+        self.assertFalse(page.categories.get_visible())
+        self.assertTrue(page.categories_header.get_visible())
+        self.assertEqual(
+            page.charts_grid.get_child_at_index(0).get_child().get_tooltip_text(),
+            "1位 Synthetic Song 1 Synthetic Artist 1",
+        )
+
+    def test_chart_card_click_triggers_search(self):
+        charts = self._make_charts(count=3)
+        self.ctx.charts = charts
+        page = self.show(SearchPage(self.ctx))
+        charts.start_fetch()
+        self.wait(lambda: page.charts_grid.get_visible(), 5)
+        card = page.charts_grid.get_child_at_index(1).get_child()
+        card.emit("clicked")
+        self.wait(lambda: self.search_requests(), 3)
+        self.assertEqual(
+            self.search_requests()[-1]["query"],
+            "Synthetic Song 2 Synthetic Artist 2",
+        )
+
+    def test_chart_data_while_results_visible_does_not_switch(self):
+        """結果表示中にチャートデータが来ても結果から切り替えない。"""
+        charts = self._make_charts(count=3)
+        self.ctx.charts = charts
+        page = self.show(SearchPage(self.ctx))
+        page.set_query("星")
+        self.wait(lambda: page.results.state == "content")
+        charts.start_fetch()
+        self.wait(lambda: charts.has_data, 5)
+        self.assertFalse(page.browse.get_visible(), "結果表示中に browse に切り替わった")
+
+    def test_chart_failure_shows_categories_and_status(self):
+        from chart_fixtures import make_failure_fetcher
+        from cliamp_music.charts import TopCharts
+
+        charts = TopCharts(fetcher=make_failure_fetcher())
+        self.addCleanup(charts.stop)
+        self.ctx.charts = charts
+        page = self.show(SearchPage(self.ctx))
+        charts.start_fetch()
+        self.wait(lambda: bool(charts.error) and not charts.fetching, 5)
+        self.assertFalse(charts.fetching)
+        self.assertFalse(charts.has_data)
+        self.assertTrue(page.categories.get_visible(), "失敗時にカテゴリーが消えた")
+        self.assertTrue(page.categories_header.get_visible())
+        self.assertTrue(page.chart_status.get_visible())
+        self.assertIn("取得できませんでした", page.chart_status.get_text())
+        self.assertFalse(page.chart_link.get_visible())
+
+    def test_repeated_changed_does_not_duplicate(self):
+        charts = self._make_charts(count=4)
+        self.ctx.charts = charts
+        page = self.show(SearchPage(self.ctx))
+        charts.start_fetch()
+        self.wait(lambda: page.charts_grid.get_visible(), 5)
+        charts.emit("changed")
+        charts.emit("changed")
+        run_loop(lambda: False, 0.1)
+        idx = 0
+        while page.charts_grid.get_child_at_index(idx) is not None:
+            idx += 1
+        self.assertEqual(idx, 4, "カードが重複した")
+
+    def test_weak_callback_does_not_retain_removed_page(self):
+        from gi.repository import Adw
+
+        charts = self._make_charts(count=2)
+        self.ctx.charts = charts
+        page = SearchPage(self.ctx)
+        ref = weakref.ref(page)
+        self.show(page)
+        charts.start_fetch()
+        self.wait(lambda: charts.has_data, 5)
+        self.nav.replace([Adw.NavigationPage(title="空", tag="blank", child=Gtk.Label())])
+        run_loop(lambda: False, 0.2)
+        del page
+        gc.collect()
+        self.assertIsNone(ref(), "ページが charts の weak_call で保持されている")
 
 
 class NowPlayingTest(PageCase):

@@ -570,6 +570,19 @@ def install_spotify_fixtures(problems: list[str]):
         return web(request, timeout)
 
     spotify_import.urlopen = urlopen
+
+    # TopCharts の fetch_text を合成 JSON に差し替える (public/v0/charts API)
+    import chart_fixtures
+    from cliamp_music import charts as charts_mod
+    _chart_fetcher = chart_fixtures.make_chart_fetcher(count=12)
+
+    def _charts_fetch(url, *, user_agent=None, timeout=None):
+        if url != chart_fixtures.CHART_URL:
+            problems.append(f"知らないチャート URL を読もうとしました: {url}")
+            raise ValueError(url)
+        return _chart_fetcher(url, user_agent=user_agent, timeout=timeout)
+
+    charts_mod.fetch_text = _charts_fetch
     return web
 
 

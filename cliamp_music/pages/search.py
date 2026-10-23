@@ -9,6 +9,16 @@
 
 - 入力前: 「最近の検索」(丸いチップ、右に赤い「消去」) と「カテゴリーを探す」
   (16:9 のタイル。色の組はカテゴリーごとに固定)。タイルを押すとその語で検索。
+  「カテゴリーを探す」の見出しの下に Spotify JapanTop50 の状態表示を置く:
+  取得中は「Spotify のランキングを取得中…」、失敗時は「Spotify のランキングを取得できませんでした」
+  (生の例外は出さない)、成功時は「Spotify JapanTop50 · <retrievaltime> · 上位N曲」を出し、
+  カテゴリーのグリッドを非表示にしてチャートの MediaCard (size=140) を同じ位置に並べる。
+  見出し自体は常に見える。成功時にのみ公式チャートページへの LinkButton を出す。
+  チャート取得失敗または未完了の間はカテゴリータイルがそのまま見える (フォールバック)。
+  チャートのカードをクリックするとその曲名+アーティストで set_query する (既存の検索履歴・範囲の
+  意味論に従う。自動再生はしない)。
+  TopCharts の changed シグナルを weak_call で受け、スナップショットの (fetched_at, entries) タプルで
+  重複をガードする。start_fetch() はインスタンスごとに 1 度だけ。
 - 結果: 左に「トップの結果」、右に「曲」の最初の 4 行 (狭い幅では縦に積む)。
   その下に「すべての曲」。行のダブルクリック/Enter で結果全体を replace して
   その曲から再生 (出どころは Source(provider=範囲, name=「語」))。
@@ -54,6 +64,7 @@ from ..widgets import (  # noqa: E402
     CategoryTile,
     Chip,
     FillWidth,
+    MediaCard,
     SectionHeader,
     TrackList,
     TrackRow,
@@ -75,6 +86,8 @@ from .home import (  # noqa: E402
     weak_handler,
 )
 from .playlists import IMPORT_LABEL  # noqa: E402
+
+CHART_PAGE_URL = "https://open.spotify.com/playlist/37i9dQZEVXbKXQ4mDTEBXq"
 
 DEBOUNCE_MS = 600
 SEARCH_LIMIT = 25
@@ -212,6 +225,23 @@ class SearchPage(PageBase):
         self.inset(categories_header)
         categories_header.add_css_class("music-search-categories-header")
         self.browse.append(categories_header)
+        self.categories_header = categories_header
+
+        # チャート状態ラベル (見出しの下、常に見える)
+        self.chart_status = _label("", "music-card-subtitle", wrap=True)
+        self.chart_status.set_xalign(0.0)
+        self.chart_status.set_visible(False)
+        self.inset(self.chart_status)
+        self.browse.append(self.chart_status)
+
+        # 公式チャートページへのリンク (成功時のみ)
+        self.chart_link = Gtk.LinkButton(uri=CHART_PAGE_URL, label="Spotify Charts")
+        self.chart_link.set_visible(False)
+        self.chart_link.set_halign(Gtk.Align.START)
+        self.chart_link.set_margin_top(4)
+        self.inset(self.chart_link)
+        self.browse.append(self.chart_link)
+
         self.categories = make_grid(row_spacing=18, column_spacing=18, max_per_line=6)
         self.categories.set_margin_top(12)
         self.inset(self.categories)
@@ -219,6 +249,20 @@ class SearchPage(PageBase):
             tile = CategoryTile(title, colors, weak_handler(self._on_category))
             self.categories.append(tile)
         self.browse.append(self.categories)
+
+        # チャートの MediaCard (カテゴリーと同じ位置に置く。成功時のみ表示)
+        self.charts_grid = make_grid(row_spacing=18, column_spacing=18, max_per_line=6)
+        self.charts_grid.set_margin_top(12)
+        self.inset(self.charts_grid)
+        self.charts_grid.set_visible(False)
+        self.browse.append(self.charts_grid)
+        self._charts_shown = False
+        self._last_chart_key: tuple | None = None
+        # TopCharts の changed シグナルでチャートを埋める
+        charts = getattr(self.ctx, "charts", None)
+        if charts is not None:
+            charts.connect("changed", weak_call(self._fill_charts))
+        self._fill_charts()
         self.body.append(self.browse)
 
         # 結果
@@ -467,6 +511,67 @@ class SearchPage(PageBase):
             chip = Chip(query, weak_handler(self._on_chip), icon_name="music-recent-symbolic")
             self.recent_chips.append(chip)
         self.recent_box.set_visible(bool(searches))
+
+    def _fill_charts(self) -> None:
+        """TopCharts の changed で呼ばれる。状態表示とグリッドを更新する。"""
+        charts = getattr(self.ctx, "charts", None)
+        if charts is None:
+            return
+        if charts.fetching:
+            self.chart_status.set_text("Spotify のランキングを取得中…")
+            self.chart_status.set_visible(True)
+            self.chart_link.set_visible(False)
+            self.charts_grid.set_visible(False)
+            self.categories.set_visible(True)
+            self._charts_shown = False
+            return
+        if not charts.has_data:
+            if charts.error:
+                self.chart_status.set_text("Spotify のランキングを取得できませんでした")
+                self.chart_status.set_visible(True)
+            else:
+                self.chart_status.set_visible(False)
+            self.chart_link.set_visible(False)
+            self.charts_grid.set_visible(False)
+            self.categories.set_visible(True)
+            self._charts_shown = False
+            return
+        # 成功: 常に visibility/status を適用、カード再構築のみキーでガード
+        entries = charts.entries
+        key = (charts.fetched_at, tuple((e.rank, e.track.path, e.track.display_title, e.track.artist, e.track.meta) for e in entries))
+        count = len(entries)
+        self.chart_status.set_text(
+            f"Spotify 日本トップ50 · 上位{count}曲 · 取得: {charts.fetched_at}")
+        self.chart_status.set_visible(True)
+        self.chart_link.set_visible(True)
+        self._charts_shown = True
+        self.charts_grid.set_visible(True)
+        # カテゴリーのグリッドのみ非表示 (見出しは常に見える)
+        self.categories.set_visible(False)
+        if key == self._last_chart_key:
+            return
+        self._last_chart_key = key
+        clear_box(self.charts_grid)
+        for entry in entries:
+            track = entry.track
+            title = f"{entry.rank}位  {track.display_title or '不明な曲'}"
+            subtitle = track.artist or track.album or ""
+            card = MediaCard(
+                self.ctx.artwork, track, title, subtitle,
+                size=140, kind="track",
+                on_activate=weak_handler(self._on_chart_card),
+            )
+            accessible = f"{entry.rank}位 {track.display_title} {track.artist}"
+            card.set_tooltip_text(accessible)
+            card.update_property([Gtk.AccessibleProperty.LABEL], [accessible])
+            self.charts_grid.append(card)
+
+    def _on_chart_card(self, card) -> None:
+        """チャートのカードを押したらその曲名+アーティストで検索する。"""
+        track = getattr(card, "subject", None)
+        if track is not None:
+            query = f"{track.display_title} {track.artist}".strip()
+            self.set_query(query)
 
     # --- 検索 -------------------------------------------------------------------
 

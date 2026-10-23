@@ -100,8 +100,10 @@ class AppContext(GObject.Object):
         self.spotify_import_dialog = None
         # Spotify との自動同期 (裏で読み直して置き換える)。init で作るが、start は窓の起動で呼ぶ。
         from .sync import SpotifySync
+        from .charts import TopCharts
 
         self.sync = SpotifySync(self)
+        self.charts = TopCharts()
         self._local_playlists: list[str] = []
         self._local_playlists_loaded = False
         self._playlist_menus: deque[Gio.Menu] = deque(maxlen=32)
@@ -337,12 +339,17 @@ class AppContext(GObject.Object):
             return None
 
     def start_sync(self) -> None:
-        """Spotify との自動同期を始める (窓の起動で一度呼ぶ。既に動いていれば何もしない)。"""
+        """Spotify 自動同期とトップチャート取得を開始する (窓の起動で一度呼ぶ)。
+
+        既に動いていれば何もしない。両サービスは非同期で、完了時に UI へ通知する。
+        """
         self.sync.start()
+        self.charts.start_fetch()
 
     def stop_sync(self) -> None:
-        """自動同期を止める (アプリの終了で呼ぶ)。"""
+        """自動同期とトップチャート取得を停止する (アプリの終了で呼ぶ)。"""
         self.sync.stop()
+        self.charts.stop()
 
     def set_auto_sync(self, name: str, enabled: bool) -> bool:
         """取り込んだプレイリスト name の Spotify との自動同期を ON/OFF にする。

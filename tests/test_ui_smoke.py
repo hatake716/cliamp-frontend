@@ -155,6 +155,13 @@ class AppSmokeTest(unittest.TestCase):
         from cliamp_music.client import CliampClient
         from cliamp_music.protocol import Track
 
+        # TopCharts の fetch_text を合成 JSON に差し替える (ネットワークに出ない)
+        import chart_fixtures
+        from cliamp_music import charts as charts_mod
+        self._saved_charts_fetch = getattr(charts_mod, "fetch_text", None)
+        self._chart_fetcher = chart_fixtures.make_chart_fetcher(count=12)
+        charts_mod.fetch_text = self._chart_fetcher
+
         self.tmp = Path(tempfile.mkdtemp(prefix="cm-smoke-"))
         self.saved_env = {k: os.environ.get(k) for k in (
             "HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "CLIAMP_MUSIC_APP_ID",
@@ -220,6 +227,13 @@ class AppSmokeTest(unittest.TestCase):
     def tearDown(self):
         from cliamp_music import artwork, radio
         from cliamp_music.client import CliampClient
+        from cliamp_music import charts as charts_mod
+
+        # charts.fetch_text を復元
+        if self._saved_charts_fetch is not None:
+            charts_mod.fetch_text = self._saved_charts_fetch
+        elif hasattr(charts_mod, "fetch_text"):
+            del charts_mod.fetch_text
 
         self.log.capturing = False
         sys.stderr = self.saved_stderr
