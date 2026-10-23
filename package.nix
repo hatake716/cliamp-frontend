@@ -24,6 +24,7 @@
   libjxl,
   adwaita-icon-theme,
   hicolor-icon-theme,
+  macosDesktopSchema ? null,
 }:
 
 let
@@ -110,6 +111,7 @@ stdenvNoCC.mkDerivation {
     for file in \
       ${appDir}/cliamp_music/__main__.py \
       ${appDir}/cliamp_music/app.py \
+      ${appDir}/cliamp_music/glass.py \
       ${appDir}/cliamp_music/style/base.css \
       ${appDir}/cliamp_music/style/shell.css \
       ${appDir}/cliamp_music/style/pages.css \
@@ -131,7 +133,10 @@ stdenvNoCC.mkDerivation {
       --add-flags "-m cliamp_music" \
       --prefix PYTHONPATH : "$out/${appDir}" \
       "''${gappsWrapperArgs[@]}" \
-      --set GDK_PIXBUF_MODULE_FILE ${pixbufLoaders}
+      --set GDK_PIXBUF_MODULE_FILE ${pixbufLoaders} \
+      ${lib.optionalString (macosDesktopSchema != null) ''
+        --set MACOS_DESKTOP_SCHEMA_DIR ${macosDesktopSchema}/share/gnome-shell/extensions/macos-desktop@nixos.local/schemas \
+      ''}
   '';
 
   # 画面の要らない単体試験と、包んだ実行ファイルの自己診断。画面を使う

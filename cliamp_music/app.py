@@ -49,12 +49,33 @@ gi.require_version("Adw", "1")
 from gi.repository import Adw, Gdk, Gio, GLib, GObject, Gtk  # noqa: E402
 
 from . import APP_ID, APP_NAME, HERE, VERSION, log  # noqa: E402
+from . import glass  # noqa: E402
 
 CSS_FILES = ("base", "shell", "pages", "player")
 POLL_VISIBLE = 0.4
 POLL_HIDDEN = 1.5
 SEEK_STEP = 10.0
 VOLUME_STEP = 2.0
+
+# 面の地を Liquid Glass の濃さ (glass-tint) に追従させる provider の優先度。
+# style.css の provider (USER + 1) より 1 段上。
+GLASS_PRIORITY = Gtk.STYLE_PROVIDER_PRIORITY_USER + 2
+
+# 地となる面と、外観ごとの地の色。base.css / shell.css の同じ面の色と同じにする。
+GLASS_SURFACES: list[tuple[list[str], dict[str, tuple[int, int, int]]]] = [
+    # 窓の地 (本文のうしろ)。
+    (["window.music.music-window"],
+     {"light": (255, 255, 255), "dark": (28, 29, 33)}),
+    # サイドバーの地。
+    (["window.music overlay-split-view.music-split > .sidebar-pane",
+      "window.music overlay-split-view.music-split > widget.background",
+      "window.music overlay-split-view.music-panel-split > .sidebar-pane",
+      "window.music overlay-split-view.music-panel-split > widget.background"],
+     {"light": (242, 242, 246), "dark": (41, 43, 50)}),
+    # 再生バーの地。
+    (["window.music box.music-player-bar"],
+     {"light": (250, 250, 252), "dark": (48, 49, 57)}),
+]
 
 # (アクション名, ショートカット, 説明)
 SHORTCUTS = (
@@ -127,6 +148,7 @@ class MusicApp(Adw.Application):
         self.miniplayer = None
         self.equalizer = None
         self.css_errors: list[str] = []
+        self._glass: list[glass.GlassStyle] = []
         self._text_input_active = False
         self._main_shown_once = False
         self._quitting = False
@@ -145,6 +167,10 @@ class MusicApp(Adw.Application):
             for provider, _name in load_css(self.css_errors, settings=settings):
                 Gtk.StyleContext.add_provider_for_display(
                     display, provider, Gtk.STYLE_PROVIDER_PRIORITY_USER + 1)
+            # Liquid Glass の濃さ (設定 > 外観 のスライダー) に面の地を追従させる。
+            # glass.py を参照。スキーマが読めないとき (単体で動かしたときなど) は
+            # 空の list を返し、style.css の固定の地のまま動く。
+            self._glass = install_glass(display, settings)
 
         from .client import CliampClient
         from .context import AppContext
@@ -532,6 +558,24 @@ def load_css(errors: list[str] | None = None, settings: Gtk.Settings | None = No
     return providers
 
 
+def install_glass(display: Gdk.Display, gtk_settings: Gtk.Settings) -> list[glass.GlassStyle]:
+    """面の地を glass-tint に追従させる provider を display に足す。
+
+    スキーマが読めないときは空の list を返す (style.css の固定の地のまま動く)。
+    面のグループごとに GlassStyle を 1 つずつ作り、gtk_settings の外観に束ねる。
+    戻り値の list を生かしておけば、glass-tint の変更がすべての面に届く。
+    """
+    settings = glass.find_settings("music")
+    if settings is None:
+        return []
+    results: list[glass.GlassStyle] = []
+    for selectors, rgb in GLASS_SURFACES:
+        g = glass.install(display, settings, selectors, rgb, GLASS_PRIORITY)
+        if g is not None:
+            results.append(g)
+    return results
+
+
 def _package_modules() -> list[str]:
     names = []
     for info in pkgutil.walk_packages([HERE], prefix="cliamp_music."):
@@ -548,7 +592,7 @@ REQUIRED_MODULES = (
     "cliamp_music.widgets", "cliamp_music.window", "cliamp_music.sidebar", "cliamp_music.playerbar",
     "cliamp_music.panels", "cliamp_music.pages", "cliamp_music.app",
     "cliamp_music.fullscreen", "cliamp_music.miniplayer", "cliamp_music.equalizer",
-    "cliamp_music.spotify_import", "cliamp_music.importer",
+    "cliamp_music.spotify_import", "cliamp_music.importer", "cliamp_music.glass",
 )
 
 
