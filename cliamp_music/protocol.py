@@ -803,12 +803,16 @@ SPOTIFY_NOT_A_USER = ("サインインした Spotify のアカウントが、開
                       "アプリの利用者は 5 人まで)")
 _SPOTIFY_NOT_A_USER_RE = re.compile(r"\bnot a user of the developer app\b|\bthe user may not be registered\b",
                                     re.IGNORECASE)
-# cliamp の Spotify の tracks は Web API の 403 をどれも "spotify: playlist not accessible: only playlists you
-# own or collaborate on can be loaded" に言い換える (持ち主が Premium でないときも)
+# 古い cliamp の tracks は読めないプレイリストを専用の文言に言い換える。native 2.3.0 は
+# HTTP の本文をそのまま包むので、list tracks の 403 と本文の Forbidden を合わせて見る。
+# 検索・認証・scope 不足など別の 403 で公開ページへ切り替えない。
 SPOTIFY_NOT_ACCESSIBLE = ("このプレイリストは Spotify のライブラリから読めません (読めるのは自分のと共同編集の"
                           "プレイリストだけ)。公開プレイリストなら「Spotify から取り込む」で使えます")
-_SPOTIFY_NOT_ACCESSIBLE_RE = re.compile(_SPOTIFY_AT + r"spotify: playlist not accessible\b",
-                                        re.IGNORECASE | re.MULTILINE)
+_SPOTIFY_NOT_ACCESSIBLE_RE = re.compile(
+    r"spotify: playlist not accessible(?:: only playlists you own or collaborate on can be loaded)?",
+    re.IGNORECASE)
+_SPOTIFY_TRACKS_FORBIDDEN_RE = re.compile(
+    r"spotify: list tracks: http status 403 Forbidden:\s*(\{.*\})", re.IGNORECASE | re.DOTALL)
 _SPOTIFY_STREAMING_RE = re.compile(_SPOTIFY_AT + re.escape(SPOTIFY_STREAMING_UNAVAILABLE) + r"\b",
                                    re.IGNORECASE | re.MULTILINE)
 _GO_DURATION_PART = re.compile(r"([0-9]+(?:\.[0-9]*)?)(ns|us|µs|μs|ms|h|m|s)")
@@ -934,9 +938,25 @@ def is_spotify_not_a_user(text: str) -> bool:
 
 
 def is_spotify_not_accessible(text: str) -> bool:
-    """cliamp の Spotify の tracks が 403 を言い換えた "spotify: playlist not accessible: …" か。"""
-    text = _as_str(text)[:_CLASSIFY_MAX]
-    return is_spotify_error(text) and bool(_SPOTIFY_NOT_ACCESSIBLE_RE.search(text))
+    """Spotify がプレイリストの内容取得を拒否した誤りか (旧文言と native 2.3.0 の素の 403)。
+
+    生の HTTP 誤りは list tracks からのものだけ。本文が通常の Forbidden であるときに限り、
+    持ち主の Premium・アプリの利用者登録・scope 不足などの失敗と区別する。"""
+    text = _as_str(text).strip()
+    if len(text) > _CLASSIFY_MAX:
+        return False
+    if _SPOTIFY_NOT_ACCESSIBLE_RE.fullmatch(text):
+        return True
+    match = _SPOTIFY_TRACKS_FORBIDDEN_RE.fullmatch(text)
+    if match is None:
+        return False
+    try:
+        body = json.loads(match.group(1))
+    except ValueError:
+        return False
+    error = body.get("error") if isinstance(body, dict) else None
+    return (isinstance(error, dict) and error.get("status") == 403
+            and error.get("message") == "Forbidden" and not error.get("reason"))
 
 
 def describe_catalog_error(text: str) -> str:

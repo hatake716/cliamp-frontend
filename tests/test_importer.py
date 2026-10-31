@@ -952,6 +952,13 @@ class OwnerPremiumTest(ImportPageCase):
     def test_spotify_playlist_page_offers_to_import_it(self):
         from cliamp_music.pages.playlists import PlaylistDetailPage
 
+        # native 2.3.0 は Premium の理由を HTTP 本文に残す。旧 cliamp の汎用の
+        # "playlist not accessible" だけなら公開ページへ自動で切り替える (別の試験で確認)。
+        refusal = ('spotify: list tracks: http status 403 Forbidden: '
+                   '{"error":{"status":403,"message":"Active premium subscription required for the owner of the app"}}')
+        patcher = mock.patch.dict("fake_cliamp.SPOTIFY_OWNER_PREMIUM_ERRORS", {"tracks": refusal})
+        patcher.start()
+        self.addCleanup(patcher.stop)
         page = self.show(PlaylistDetailPage(self.ctx, provider="spotify", id=PID, name="架空"))
         self.wait(lambda: page.state.state == "empty")
         empty = page.state.empty

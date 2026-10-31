@@ -590,6 +590,64 @@ class SpotifyRefusals(unittest.TestCase):
         self.assertFalse(p.is_spotify_not_a_user(echo))
         self.assertEqual(p.describe_catalog_error(echo), "")
 
+    def test_playlist_not_accessible_accepts_native_and_legacy_errors(self):
+        body = '{"error": {"status": 403, "message": "Forbidden" } }'
+        for text in (
+                f"spotify: list tracks: http status 403 Forbidden: {body}",
+                'spotify: list tracks: http status 403 Forbidden: {\n"error": {\n'
+                '"message": "Forbidden", "status": 403\n}}',
+                "spotify: playlist not accessible: only playlists you own or collaborate on can be loaded",
+                "spotify: playlist not accessible"):
+            with self.subTest(text=text):
+                self.assertTrue(p.is_spotify_not_accessible(text))
+                self.assertEqual(Response(False, {}, text, "error").message, p.SPOTIFY_NOT_ACCESSIBLE)
+
+    def test_playlist_not_accessible_rejects_other_403_reasons(self):
+        prefix = "spotify: list tracks: http status 403 Forbidden: "
+        for message, description in (
+                ("Active premium subscription required for the owner of the app", p.SPOTIFY_OWNER_PREMIUM),
+                ("Check settings on developer.spotify.com/dashboard, the user may not be registered.",
+                 p.SPOTIFY_NOT_A_USER),
+                ("Insufficient client scope", ""),
+                ("Missing required scope", ""),
+                ("Forbidden because the user is not authorized", "")):
+            text = prefix + json.dumps({"error": {"status": 403, "message": message}})
+            with self.subTest(message=message):
+                self.assertFalse(p.is_spotify_not_accessible(text))
+                self.assertEqual(p.describe_catalog_error(text), description)
+        # 理由が別に付く拒否、壊れた本文や違う HTTP status から推測しない。
+        for body in (
+                '{"error":{"status":403,"message":"Forbidden","reason":"insufficient_scope"}}',
+                '{"error":{"status":401,"message":"Forbidden"}}',
+                '{"error":{"status":"403","message":"Forbidden"}}',
+                '{"error":{"message":"Forbidden"}}',
+                '{"error":"Forbidden"}',
+                '{"status":403,"message":"Forbidden"}',
+                '{"error":{"status":403,"message":"Forbidden"}',
+                '[]', 'null', 'Forbidden'):
+            with self.subTest(body=body):
+                self.assertFalse(p.is_spotify_not_accessible(prefix + body))
+
+    def test_playlist_not_accessible_does_not_match_queries_or_other_operations(self):
+        raw = ('spotify: list tracks: http status 403 Forbidden: '
+               '{"error":{"status":403,"message":"Forbidden"}}')
+        legacy = "spotify: playlist not accessible: only playlists you own or collaborate on can be loaded"
+        for text in (
+                raw.replace("spotify:", "youtube:", 1),
+                raw.replace("list tracks", "search"),
+                raw.replace("list tracks", "list playlists"),
+                raw.replace("list tracks", "your music"),
+                raw.replace("403 Forbidden:", "401 Unauthorized:", 1),
+                f"resolving yt-dlp ytsearch20:{raw}: exit status 1",
+                f'spotify: search: query "{raw}" failed',
+                f'spotify: search: query "{legacy}" failed',
+                f"spotify: search: {legacy}",
+                f'open /music/{legacy}/a.flac: no such file or directory',
+                legacy + ": Insufficient client scope",
+                raw + " trailing text", "", None):
+            with self.subTest(text=text):
+                self.assertFalse(p.is_spotify_not_accessible(text))
+
     def test_quota_exceeded(self):
         """開発者の利用枠を使い切った (429 の reason "QUOTA_EXCEEDED")。ふつうの回数の制限とは別に言う。"""
         base = "Spotify の開発者向けの利用枠を使い切りました"

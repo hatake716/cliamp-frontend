@@ -27,7 +27,8 @@ Premium でない」で読めないとき (その説明を書く) は、節に�
 「Spotify から更新」(読み直し、確かめてから置き換える)・「Spotify で開く」を足す。カードは副題を
 「Spotify · N 曲」、絵を Spotify の絵にする。取り込んだものかは記録 (名前で引く) だけでなく曲でも
 確かめる (AppContext.imported_record。TUI で消して同じ名前で作り直したものは別物として記録を忘れる)。
-Spotify のプレイリストの詳細が同じ理由で読めないときは、そのプレイリストを取り込むボタンを出す。
+Spotify のプレイリストの曲が所有・共同編集の制限で読めないときは、公開ページから自動で読む。
+公開ページの上限で切れていれば取得範囲を書き添え、表示した曲を再生・シャッフルに使う。
 """
 
 from __future__ import annotations
@@ -52,7 +53,7 @@ from ..protocol import (  # noqa: E402
     is_spotify_owner_premium_required,
     is_youtube_bridge,
 )
-from ..spotify_import import SpotifyRef  # noqa: E402
+from ..spotify_import import EMBED_TRACK_CAP, ImportedList, SpotifyImportError, SpotifyRef  # noqa: E402
 from ..widgets import (  # noqa: E402
     CapsuleButton,
     GlassButton,
@@ -86,6 +87,7 @@ from .home import (  # noqa: E402
     set_local_playlist_art,
     set_playlist_art,
     shuffle_provider,
+    shuffle_tracks,
     total_duration,
     weak_call,
     weak_handler,
@@ -431,6 +433,7 @@ class PlaylistDetailPage(PageBase):
         self._dialog = None
         # 取り込んだもの (のまま) なら、その記録 (曲が届いたときに確かめる)
         self._record = None
+        self._public_list: ImportedList | None = None
 
         self.header = DetailHeader(ctx, on_shuffle=weak_call(self.shuffle), on_play=weak_call(self.play_first),
                                    menu_factory=weak_call(self._menu))
@@ -478,6 +481,8 @@ class PlaylistDetailPage(PageBase):
     # --- 読み込み ---------------------------------------------------------------
 
     def load(self, force: bool = False) -> None:
+        self._serial += 1
+        serial = self._serial
         store = self.ctx.store
         if not store.connected:
             self._show_problem("music-radio-symbolic", OFFLINE_TITLE, OFFLINE_TEXT)
@@ -487,8 +492,6 @@ class PlaylistDetailPage(PageBase):
             return
         if not self._tracks:
             self.state.show_loading()
-        self._serial += 1
-        serial = self._serial
         if not self.is_local and store.supports("providers"):
             # 鳴らし方 (Web API だけの Spotify は YouTube で探して鳴らす) を確かめる
             self.ctx.catalog.providers(weak_handler(self._on_providers), force=force)
@@ -500,6 +503,8 @@ class PlaylistDetailPage(PageBase):
                 if result.needs_auth:
                     self._show_problem("music-note-list-symbolic", "サインインが必要です",
                                        auth_note(self.ctx, self.provider))
+                elif self.spotify_url and is_spotify_not_accessible(result.error):
+                    self._load_public_playlist(serial)
                 elif is_spotify_owner_premium_required(result.error) or is_spotify_not_accessible(result.error):
                     # 開発者アプリの持ち主が Premium でない・Spotify が読ませない。公開プレイリストなら
                     # このまま取り込める (Spotify の Web API を通さずに公開の頁から読む)
@@ -518,9 +523,33 @@ class PlaylistDetailPage(PageBase):
                 else:
                     self._show_problem("music-note-list-symbolic", "プレイリストを読めませんでした", result.message)
                 return
+            self._public_list = None
             self._show(result)
 
         self.ctx.catalog.tracks(self.provider, self.playlist_id, done, force=force)
+
+    def _load_public_playlist(self, serial: int) -> None:
+        """API が曲の取得を断った公開プレイリストを、取り込みと同じ worker で読む。"""
+        from ..importer import fetch_async
+
+        if not self._tracks:
+            self.state.show_loading("Spotify の公開ページを読み込み中…")
+
+        def done(result: ImportedList | SpotifyImportError) -> None:
+            if serial != self._serial:
+                return
+            if not self.ctx.store.connected:
+                # 隠れている間は接続シグナルを見ていない。再表示で取り直せるようにする。
+                self._stale = True
+                return
+            if isinstance(result, SpotifyImportError):
+                self._show_problem("music-note-list-symbolic", "プレイリストを読めませんでした", result.message,
+                                   button_label="もう一度読む", on_button=weak_call(self.load, True))
+                return
+            self._public_list = result
+            self._show(list(result.tracks))
+
+        fetch_async(SpotifyRef("playlist", self.playlist_id), done)
 
     def on_resync(self) -> None:
         if self.is_local:
@@ -596,6 +625,15 @@ class PlaylistDetailPage(PageBase):
             self.header.set_subtitle((record.subtitle or "Spotify") if record is not None
                                      else provider_label(self.ctx, self.provider))
             return
+        if self._public_list is not None:
+            result = self._public_list
+            note = f"Spotify の公開ページから表示 · {WEB_ONLY_NOTE}"
+            if result.truncated:
+                extent = (f"全 {result.total} 曲のうち最初の {result.count} 曲" if result.total > result.count
+                          else f"最初の {result.count} 曲 (公開ページは {EMBED_TRACK_CAP} 曲まで)")
+                note += f" · {extent}"
+            self.header.set_note(note)
+            return
         self.header.set_note(WEB_ONLY_NOTE if self._tracks and self.plays_via_youtube else "")
 
     def _show_problem(self, icon: str, title: str, text: str, *, button_label: str | None = None,
@@ -603,6 +641,7 @@ class PlaylistDetailPage(PageBase):
         self._tracks = []
         self._keys = None
         self._record = None
+        self._public_list = None
         self.rows.build([])
         self.header.set_info("")
         self.header.set_note("")
@@ -705,6 +744,10 @@ class PlaylistDetailPage(PageBase):
 
     def shuffle(self) -> None:
         """シャッフルを入れて無作為な曲から再生する。"""
+        if self._tracks and self.ctx.store.supports("replace") and len(self._tracks) <= REPLACE_MAX_TRACKS:
+            source = Source(provider=self.provider, id=self.playlist_id, name=self.playlist_name)
+            shuffle_tracks(self.ctx, self._tracks, source)
+            return
         shuffle_provider(self.ctx, self.provider, self.playlist_id, len(self._tracks), self.playlist_name)
 
     def _menu(self):
