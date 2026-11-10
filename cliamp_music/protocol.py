@@ -814,6 +814,11 @@ SPOTIFY_NOT_ACCESSIBLE = ("このプレイリストは Spotify のライブラ�
 _SPOTIFY_NOT_ACCESSIBLE_RE = re.compile(
     r"spotify: playlist not accessible(?:: only playlists you own or collaborate on can be loaded)?",
     re.IGNORECASE)
+# cliamp 2.4.0 の external/spotify/tracks.go は、他人のプレイリストの 403 をこう言い直す ("http status 403: <本文の
+# message>" は apiError)。本文が素の "Forbidden" のときだけ (持ち主が Premium でないなどの 403 は別の断り)
+_SPOTIFY_NOT_OWNED_RE = re.compile(
+    r"spotify: Spotify lets apps read only playlists you own or collaborate on\..*: http status 403: Forbidden",
+    re.IGNORECASE | re.DOTALL)
 _SPOTIFY_TRACKS_FORBIDDEN_RE = re.compile(
     r"spotify: list tracks: http status 403 Forbidden:\s*(\{.*\})", re.IGNORECASE | re.DOTALL)
 _SPOTIFY_STREAMING_RE = re.compile(_SPOTIFY_AT + re.escape(SPOTIFY_STREAMING_UNAVAILABLE) + r"\b",
@@ -941,14 +946,14 @@ def is_spotify_not_a_user(text: str) -> bool:
 
 
 def is_spotify_not_accessible(text: str) -> bool:
-    """Spotify がプレイリストの内容取得を拒否した誤りか (旧文言と native 2.3.0 の素の 403)。
+    """Spotify がプレイリストの内容取得を拒否した誤りか (旧文言、native 2.3.0 の素の 403、2.4.0 の言い直し)。
 
     生の HTTP 誤りは list tracks からのものだけ。本文が通常の Forbidden であるときに限り、
     持ち主の Premium・アプリの利用者登録・scope 不足などの失敗と区別する。"""
     text = _as_str(text).strip()
     if len(text) > _CLASSIFY_MAX:
         return False
-    if _SPOTIFY_NOT_ACCESSIBLE_RE.fullmatch(text):
+    if _SPOTIFY_NOT_ACCESSIBLE_RE.fullmatch(text) or _SPOTIFY_NOT_OWNED_RE.fullmatch(text):
         return True
     match = _SPOTIFY_TRACKS_FORBIDDEN_RE.fullmatch(text)
     if match is None:

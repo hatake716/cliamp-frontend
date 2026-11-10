@@ -34,6 +34,9 @@ LEGACY_FORBIDDEN = ("spotify: playlist not accessible: only playlists you own or
                     "can be loaded")
 NATIVE_FORBIDDEN = ('spotify: list tracks: http status 403 Forbidden: '
                     '{"error":{"status":403,"message":"Forbidden"}}')
+# cliamp 2.4.0 (2026-11-10 に実機で、検索で見つけた他人のプレイリストを開いて出た文言そのまま)
+NATIVE_240_FORBIDDEN = ("spotify: Spotify lets apps read only playlists you own or collaborate on. Add the tracks "
+                        "to your own playlist in Spotify, then open that playlist: http status 403: Forbidden")
 OWNER_PREMIUM = ('spotify: list tracks: http status 403 Forbidden: '
                  '{"error":{"status":403,"message":"Active premium subscription required for the owner of the app"}}')
 PUBLIC_NOTE = "Spotify の公開ページから表示 · 曲は YouTube で探して再生します"
@@ -58,7 +61,7 @@ def tearDownModule():  # noqa: N802
 
 class SpotifyPlaylistAccessErrorTest(unittest.TestCase):
     def test_legacy_and_native_playlist_forbidden_are_recognized(self):
-        for error in (LEGACY_FORBIDDEN, NATIVE_FORBIDDEN):
+        for error in (LEGACY_FORBIDDEN, NATIVE_FORBIDDEN, NATIVE_240_FORBIDDEN):
             with self.subTest(error=error):
                 self.assertTrue(is_spotify_not_accessible(error))
 
@@ -67,6 +70,10 @@ class SpotifyPlaylistAccessErrorTest(unittest.TestCase):
             'spotify: search: http status 403 Forbidden: {"error":{"status":403,"message":"Forbidden"}}',
             'navidrome: list tracks: http status 403 Forbidden',
             'spotify: list tracks: http status 401 Unauthorized',
+            # 2.4.0 の言い直しでも、本文が素の Forbidden でなければ別の断り
+            "spotify: Spotify lets apps read only playlists you own or collaborate on. Add the tracks to your "
+            "own playlist in Spotify, then open that playlist: http status 403: Active premium subscription "
+            "required for the owner of the app",
         ):
             with self.subTest(error=error):
                 self.assertFalse(is_spotify_not_accessible(error))
