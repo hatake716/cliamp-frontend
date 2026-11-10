@@ -22,6 +22,11 @@
 - 結果: 左に「トップの結果」、右に「曲」の最初の 4 行 (狭い幅では縦に積む)。
   その下に「すべての曲」。行のダブルクリック/Enter で結果全体を replace して
   その曲から再生 (出どころは Source(provider=範囲, name=「語」))。
+- YouTube と Spotify の範囲では、曲と並べてプレイリストも探す (cliamp の search_playlists。無い cliamp
+  では探さない)。「曲」の段と「すべての曲」の間に「プレイリスト」の節 (MediaCard の格子) を置き、
+  届いた順に出す (曲の検索を待たせない)。押すとプレイリストの詳細を開く (YouTube は provider "url" で
+  id はプレイリストの URL、Spotify は provider "spotify")。プレイリストの検索の失敗は節を隠すだけ。
+  曲が 0 件でもプレイリストがあれば、プレイリストの節だけを出す。
 - 検索中はスピナー、失敗は理由を、該当なしは「結果がありません」を空状態で出す。
   Spotify が検索の件数を断ったとき (cliamp 1.50.0 の friendlySearchError "spotify: search blocked —
   your client_id is too new…"、元の 400 "Invalid limit"、パッチの "Spotify refused a page of N results"。
@@ -51,6 +56,7 @@ from ..protocol import (  # noqa: E402
     SPOTIFY_OWNER_PREMIUM,
     SPOTIFY_SEARCH_BLOCKED,
     SPOTIFY_SEARCH_BLOCKED_TITLE,
+    PlaylistInfo,
     Response,
     Source,
     Track,
@@ -62,6 +68,7 @@ from ..protocol import (  # noqa: E402
 from ..widgets import (  # noqa: E402
     Artwork,
     CategoryTile,
+    format_count,
     Chip,
     FillWidth,
     MediaCard,
@@ -95,6 +102,11 @@ SEARCH_LIMIT = 25
 SPOTIFY_DEBOUNCE_MS = 900
 SPOTIFY_SEARCH_LIMIT = 20
 TOP_SONGS = 4
+# プレイリストの節: 1 回に頼む数 (Spotify は 1 回の検索が 10 件まで。1 回で済ませる) とカードの大きさ
+PLAYLIST_LIMIT = 10
+PLAYLIST_CARD = 150
+# プレイリストも探す範囲 (ライブラリは対象外)
+PLAYLIST_SCOPES = frozenset({"youtube", "spotify"})
 
 # (範囲の名前, 表示)。spotify は providers に検索できる spotify があるときだけ出す。
 SCOPES = (("youtube", "YouTube"), ("spotify", "Spotify"), ("library", "ライブラリ"))
@@ -168,6 +180,12 @@ class SearchPage(PageBase):
         self._results: list[Track] = []
         self._results_query = ""
         self._results_scope = ""
+        # 今の検索の答え (None はまだ届いていない)。曲は list か Response、プレイリストは list
+        self._track_outcome = None
+        self._playlist_hits: list[PlaylistInfo] | None = None
+        # 曲・プレイリストを出し終えた検索の serial (後から届いた方だけを出し直す)
+        self._tracks_serial = -1
+        self._playlists_serial = -1
         self._serial = 0
         self._timer = 0
         self._suppress_changed = False
@@ -289,6 +307,14 @@ class SearchPage(PageBase):
         self.top_row.append(top_column)
         self.top_row.append(songs_column)
         content.append(self.top_row)
+
+        self.playlists_header = SectionHeader("プレイリスト")
+        self.playlists_header.add_css_class("music-search-playlists-header")
+        self.inset(self.playlists_header)
+        content.append(self.playlists_header)
+        self.playlists_grid = self._new_playlists_grid()
+        content.append(self.playlists_grid)
+        self._set_playlists_visible(False)
 
         self.all_header = SectionHeader("すべての曲")
         self.all_header.add_css_class("music-search-all-header")
@@ -606,11 +632,19 @@ class SearchPage(PageBase):
         self.results.set_visible(True)
         self.results.show_loading()
         self.scroll_to_top()
+        self._track_outcome = None
+        searches_playlists = scope in PLAYLIST_SCOPES and self.ctx.store.supports("search_playlists")
+        self._playlist_hits = None if searches_playlists else []
 
         def done(result) -> None:
             if serial != self._serial:
                 return
             self._show_results(query, scope, result)
+
+        def playlists_done(result) -> None:
+            if serial != self._serial:
+                return
+            self._show_playlists(query, scope, result)
 
         catalog = self.ctx.catalog
         if scope == "library":
@@ -620,6 +654,10 @@ class SearchPage(PageBase):
             # 利用枠を減らさない)
             limit = SPOTIFY_SEARCH_LIMIT if scope == "spotify" else SEARCH_LIMIT
             catalog.search(scope, query, done, limit, force=force, lane="search-page")
+            if searches_playlists:
+                # 曲とは別の lane (同じ lane だと曲の検索を捨ててしまう)
+                catalog.search_playlists(scope, query, playlists_done, PLAYLIST_LIMIT, force=force,
+                                         lane="search-page-playlists")
 
     def open_import(self) -> None:
         """「Spotify から取り込む」の窓を出す。"""
@@ -628,6 +666,73 @@ class SearchPage(PageBase):
             opener()
 
     def _show_results(self, query: str, scope: str, result) -> None:
+        self._track_outcome = result
+        self._render(query, scope)
+
+    def _show_playlists(self, query: str, scope: str, result) -> None:
+        # 失敗 (yt-dlp・Spotify の断り) は節を出さないだけ。理由は曲の検索の側が言う
+        self._playlist_hits = [] if isinstance(result, Response) else list(result)
+        self._render(query, scope)
+
+    def _set_playlists_visible(self, visible: bool) -> None:
+        self.playlists_header.set_visible(visible)
+        self.playlists_grid.set_visible(visible)
+
+    def _new_playlists_grid(self) -> Gtk.FlowBox:
+        grid = make_grid(row_spacing=18, column_spacing=18, max_per_line=6)
+        grid.add_css_class("music-search-playlists")
+        grid.set_margin_top(12)
+        self.inset(grid)
+        return grid
+
+    def _fill_playlists(self, hits: list[PlaylistInfo]) -> None:
+        # 格子は作り直す (表示中の FlowBox の子を入れ替えると、前の行の高さのまま割り付けて
+        # "Allocation height too small" になることがあった)
+        old = self.playlists_grid
+        self.playlists_grid = self._new_playlists_grid()
+        self.results.content.insert_child_after(self.playlists_grid, old)
+        self.results.content.remove(old)
+        for info in hits:
+            subject = info.image or ("placeholder", f"{info.provider}:{info.id}", "playlist")
+            details = [part for part in (info.owner, format_count(info.track_count) if info.track_count else "")
+                       if part]
+            subtitle = " · ".join(details) or provider_label(self.ctx, info.provider)
+            card = MediaCard(self.ctx.artwork, subject, info.name, subtitle, size=PLAYLIST_CARD,
+                             kind="playlist", on_activate=weak_handler(self._on_playlist_card))
+            card.playlist_info = info
+            self.playlists_grid.append(card)
+        self._set_playlists_visible(bool(hits))
+
+    def _on_playlist_card(self, card) -> None:
+        """プレイリストのカード: 詳細を開く (語は最近の検索に足す)。"""
+        info = getattr(card, "playlist_info", None)
+        if info is None:
+            return
+        if self._query:
+            self.ctx.state.add_recent_search(self._query)
+        self.ctx.navigate("playlist", provider=info.provider, id=info.id, name=info.name)
+
+    @property
+    def results_playlists(self) -> list[PlaylistInfo]:
+        return [card.playlist_info for card in self._grid_children(self.playlists_grid)]
+
+    @staticmethod
+    def _grid_children(grid: Gtk.FlowBox) -> list:
+        out = []
+        child = grid.get_first_child()
+        while child is not None:
+            inner = child.get_child() if isinstance(child, Gtk.FlowBoxChild) else child
+            if inner is not None and hasattr(inner, "playlist_info"):
+                out.append(inner)
+            child = child.get_next_sibling()
+        return out
+
+    def _render(self, query: str, scope: str) -> None:
+        """曲とプレイリストの答えを合わせて出す。曲が届くまでは読み込み中のまま。"""
+        result = self._track_outcome
+        hits = self._playlist_hits
+        if result is None:
+            return
         if isinstance(result, Response):
             if result.needs_auth:
                 label = provider_label(self.ctx, scope)
@@ -656,14 +761,36 @@ class SearchPage(PageBase):
                 self.results.show_empty("music-search-symbolic", "検索できませんでした", result.message)
             return
         tracks = list(result)
-        if not tracks:
-            self.results.show_empty("music-search-symbolic", "結果がありません",
-                                    f"「{query}」に一致する曲は見つかりませんでした。"
-                                    "綴りを確かめるか、別の語や範囲で探してください。")
-            return
-        self._results = tracks
+        if hits is None:
+            self._set_playlists_visible(False)
+        elif self._playlists_serial != self._serial:
+            self._playlists_serial = self._serial
+            self._fill_playlists(hits)
         self._results_query = query
         self._results_scope = scope
+        if not tracks:
+            self._results = []
+            if hits is None:
+                return  # プレイリストの答えを待つ (読み込み中のまま)
+            if not hits:
+                what = "曲やプレイリスト" if scope in PLAYLIST_SCOPES else "曲"
+                self.results.show_empty("music-search-symbolic", "結果がありません",
+                                        f"「{query}」に一致する{what}は見つかりませんでした。"
+                                        "綴りを確かめるか、別の語や範囲で探してください。")
+                return
+            self.top_row.set_visible(False)
+            self.all_header.set_visible(False)
+            self.all_songs.set_visible(False)
+            self.results.show_content()
+            return
+        self.top_row.set_visible(True)
+        self.all_header.set_visible(True)
+        self.all_songs.set_visible(True)
+        if self._tracks_serial == self._serial:
+            self.results.show_content()
+            return  # 曲は出してある (プレイリストが後から届いた)
+        self._tracks_serial = self._serial
+        self._results = tracks
         clear_box(self.top_slot)
         self.top_slot.append(_TopResult(self.ctx, tracks[0], weak_call(self._play_index, 0)))
         clear_box(self.top_songs)

@@ -43,7 +43,7 @@ STATE_COMMANDS = frozenset(LEGACY_COMMANDS - {"plugin.call"} | {
 CATALOG_COMMANDS = frozenset({
     "providers", "playlists", "tracks", "search", "load_provider", "lyrics",
     "history", "playlist_add", "playlist_delete", "playlist_remove_track",
-    "plugin.call",
+    "search_playlists", "plugin.call",
 })
 
 # 拡張 IPC (api 1) のすべてのコマンド。
@@ -553,6 +553,9 @@ class PlaylistInfo:
     track_count: int = 0
     duration: int = 0
     section: str = ""
+    # search_playlists の答えだけが持つ: 作った人と絵の URL (無ければ "")
+    owner: str = ""
+    image: str = ""
 
 
 @dataclass(frozen=True)
@@ -1247,6 +1250,30 @@ def parse_playlists(d: Any, provider: str) -> list[PlaylistInfo]:
             track_count=max(0, _as_int(item.get("track_count"))),
             duration=max(0, _as_int(item.get("duration"))),
             section=_as_str(item.get("section")),
+        ))
+    return out
+
+
+def parse_playlist_hits(d: Any) -> list[PlaylistInfo]:
+    """search_playlists の答え。項目ごとに開くときのプロバイダー (YouTube は "url" で id は
+    プレイリストの URL、Spotify は "spotify") を持つ。同じプレイリストは 1 つにまとめる。"""
+    out = []
+    seen = set()
+    for item in _as_list(_as_dict(d).get("playlists")):
+        item = _as_dict(item)
+        provider = _as_str(item.get("provider"))
+        pid = _as_str(item.get("id"))
+        if not provider or not pid or (provider, pid) in seen:
+            continue
+        seen.add((provider, pid))
+        image = _as_str(item.get("image"))
+        out.append(PlaylistInfo(
+            provider=provider,
+            id=pid,
+            name=_as_str(item.get("name")) or pid,
+            track_count=max(0, _as_int(item.get("track_count"))),
+            owner=_as_str(item.get("owner")),
+            image=image if image.startswith(("https://", "http://")) else "",
         ))
     return out
 

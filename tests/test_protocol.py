@@ -336,6 +336,29 @@ class ParseOthers(unittest.TestCase):
         self.assertEqual(p.parse_tracks({"ok": True}), [])
 
 
+class ParsePlaylistHits(unittest.TestCase):
+    def test_hits_keep_their_own_provider(self):
+        hits = p.parse_playlist_hits({"playlists": [
+            {"provider": "url", "id": "https://www.youtube.com/playlist?list=PL1", "name": "夜の曲",
+             "owner": "someone", "image": "https://i.ytimg.com/vi/x/hq720.jpg"},
+            {"provider": "spotify", "id": "37i9dQZF1DX", "name": "", "track_count": 50,
+             "image": "javascript:alert(1)"},
+            {"provider": "url", "id": "https://www.youtube.com/playlist?list=PL1", "name": "重複"},
+            {"provider": "", "id": "x"},
+            {"provider": "spotify"},
+            "junk",
+        ]})
+        self.assertEqual(len(hits), 2)
+        self.assertEqual((hits[0].provider, hits[0].name, hits[0].owner), ("url", "夜の曲", "someone"))
+        self.assertEqual(hits[0].image, "https://i.ytimg.com/vi/x/hq720.jpg")
+        self.assertEqual((hits[1].provider, hits[1].name, hits[1].track_count), ("spotify", "37i9dQZF1DX", 50))
+        self.assertEqual(hits[1].image, "", "http(s) でない絵の URL を通しました")
+        self.assertEqual(p.parse_playlist_hits({"ok": True}), [])
+
+    def test_search_playlists_waits_like_a_catalog_command(self):
+        self.assertIn("search_playlists", p.CATALOG_COMMANDS)
+
+
 class Helpers(unittest.TestCase):
     def test_volume_slider_mapping_is_linear_in_db(self):
         """再生バーとフルスクリーンの音量のつまみは同じ換算 (-6 dB は 2/3 の位置)。"""

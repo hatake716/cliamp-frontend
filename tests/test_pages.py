@@ -302,6 +302,72 @@ class SearchPageTest(PageCase):
         self.assertEqual(self.search_requests()[-1]["query"], "雨 & <傘>")
         self.assertEqual(self.ctx.state.recent_searches[0], "雨 & <傘>")
 
+    def playlist_cards(self, page):
+        grid = page.playlists_grid
+        return [grid.get_child_at_index(i).get_child() for i in range(len(page.results_playlists))]
+
+    def test_youtube_search_includes_playlists(self):
+        """YouTube の範囲では曲と並べてプレイリストも探し (10 件)、押すと詳細を開く。"""
+        page = self.show(SearchPage(self.ctx))
+        page.set_query("夜")
+        self.wait(lambda: page.results.state == "content" and page.playlists_grid.get_visible(),
+                  message="プレイリストの節が出ません")
+        request = self.requests("search_playlists")[-1]
+        self.assertEqual((request["provider"], request["query"], request["limit"]), ("youtube", "夜", 10))
+        self.assertTrue(page.playlists_header.get_visible())
+        self.assertEqual(len(page.results_tracks), 25, "曲の結果が出ていません")
+        hits = page.results_playlists
+        self.assertEqual(len(hits), 6)
+        self.assertTrue(all(h.provider == "url" and h.id.startswith("https://www.youtube.com/playlist?list=")
+                            for h in hits))
+        card = self.playlist_cards(page)[1]
+        self.assertIn(hits[1].owner, card.subtitle_label.get_text())
+        card.emit("clicked")
+        self.assertEqual(self.window_stub.pages[-1],
+                         ("playlist", {"provider": "url", "id": hits[1].id, "name": hits[1].name}))
+        self.assertEqual(self.ctx.state.recent_searches[0], "夜")
+        # 開いた先 (provider "url") で曲が読める
+        detail = self.show(PlaylistDetailPage(self.ctx, provider="url", id=hits[1].id, name=hits[1].name))
+        self.wait(lambda: len(detail.list.rows()) == 12, message="YouTube のプレイリストの曲が出ません")
+
+    def test_playlist_search_failure_only_hides_the_section(self):
+        page = self.show(SearchPage(self.ctx))
+        page.set_query("plfail 夜")
+        self.wait(lambda: self.requests("search_playlists") and page.results.state == "content")
+        run_loop(lambda: False, 0.3)
+        self.assertEqual(len(page.results_tracks), 25)
+        self.assertFalse(page.playlists_grid.get_visible())
+        self.assertFalse(page.playlists_header.get_visible())
+
+    def test_playlists_shown_when_no_song_matches(self):
+        """曲が 0 件でもプレイリストがあれば、プレイリストの節だけを出す。次の検索で曲の段は戻る。"""
+        page = self.show(SearchPage(self.ctx))
+        search = self.ctx.catalog.search
+        self.ctx.catalog.search = lambda _p, _q, cb, *_a, **_k: GLib.idle_add(lambda: cb([]) and False)
+        page.set_query("夜")
+        self.wait(lambda: page.results.state == "content", message="プレイリストだけの結果が出ません")
+        self.assertTrue(page.playlists_grid.get_visible())
+        self.assertFalse(page.top_row.get_visible())
+        self.assertFalse(page.all_songs.get_visible())
+        self.ctx.catalog.search = search
+        page.set_query("朝")
+        self.wait(lambda: page.results.state == "content" and page.top_row.get_visible()
+                  and page.results_playlists and page.results_playlists[0].name.startswith("朝"))
+        self.assertTrue(page.all_songs.get_visible())
+
+    def test_no_songs_and_no_playlists_is_empty(self):
+        page = self.show(SearchPage(self.ctx))
+        page.set_query("noresults")
+        self.wait(lambda: page.results.state == "empty")
+        self.assertEqual(len(self.requests("search_playlists")), 1)
+
+    def test_library_scope_does_not_search_playlists(self):
+        page = self.show(SearchPage(self.ctx))
+        page.set_scope("library")
+        page.set_query("夜")
+        run_loop(lambda: False, 0.5)
+        self.assertEqual(self.requests("search_playlists"), [])
+
     def test_spotify_scope_waits_longer_and_asks_for_20(self):
         """Spotify の範囲は入力停止を 0.9 秒待ち (開発者の利用枠を分け合うので打ちながらの検索を減らす)、
         1 回に 20 件を頼む (Web API は 1 回 10 件まで。cliamp が 2 回に分ける)。Enter は待たない。"""
@@ -889,6 +955,23 @@ class WebOnlySpotifyTest(PageCase):
         self.assertTrue(all(t["path"].startswith("ytsearch1:") for t in replace["tracks"]))
         self.assertEqual(replace["tracks"][2]["meta"]["spotify.bridge"], "youtube")
         self.assertEqual(replace["tracks"][2]["meta"]["spotify.id"], tracks[2].spotify_id)
+
+    def test_spotify_search_includes_playlists(self):
+        """Spotify の範囲でもプレイリストを探し、押すと Spotify のプレイリストの詳細を開く。"""
+        page = self.show(SearchPage(self.ctx))
+        self.wait(lambda: page.scopes.get_n_toggles() == 3, message="Spotify の範囲が出ません")
+        page.set_scope("spotify")
+        page.set_query("夜明け")
+        self.wait(lambda: page.results.state == "content" and page.playlists_grid.get_visible(),
+                  message="Spotify のプレイリストの節が出ません")
+        request = self.requests("search_playlists")[-1]
+        self.assertEqual((request["provider"], request["query"], request["limit"]), ("spotify", "夜明け", 10))
+        hits = page.results_playlists
+        self.assertEqual([h.id for h in hits], ["37i9dQZF1DXfake0001", "37i9dQZF1DXfake0002"])
+        self.assertTrue(all(h.provider == "spotify" for h in hits))
+        page.playlists_grid.get_child_at_index(0).get_child().emit("clicked")
+        self.assertEqual(self.window_stub.pages[-1][1]["provider"], "spotify")
+        self.assertEqual(self.window_stub.pages[-1][1]["id"], "37i9dQZF1DXfake0001")
 
     def test_spotify_search_restriction_is_explained(self):
         """Spotify が検索の件数を断ったとき (パッチの "Spotify refused a page of 10 results")。"""

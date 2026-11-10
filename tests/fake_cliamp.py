@@ -94,11 +94,12 @@ API1_COMMANDS = LEGACY_COMMANDS + (
     "capabilities", "seek_to", "playlist", "play_index", "replace", "enqueue",
     "queue_edit", "remove", "providers", "playlists", "tracks", "search",
     "load_provider", "lyrics", "history", "playlist_add", "playlist_delete",
-    "playlist_remove_track",
+    "playlist_remove_track", "search_playlists",
 )
 CATALOG = frozenset({
     "providers", "playlists", "tracks", "search", "load_provider", "lyrics",
     "history", "playlist_add", "playlist_delete", "playlist_remove_track",
+    "search_playlists",
 })
 
 # cliamp の ui/model/eq_presets.go と同じ並び。
@@ -1684,6 +1685,16 @@ class FakeCliamp:
         vid = (query.get("v") or [""])[0]
         if parts.hostname in ("youtu.be",):
             vid = parts.path.strip("/")
+        playlist_id = (query.get("list") or [""])[0]
+        if not vid and playlist_id and parts.path.rstrip("/") == "/playlist":
+            # 検索のプレイリスト (search_playlists の YouTube の答え) を開いたとき
+            rng = random.Random(playlist_id)
+            others = [dict(t) for t in self.library if "youtube" in t["path"]]
+            rng.shuffle(others)
+            for track in others[:12]:
+                track["path"] = "https://www.youtube.com/watch?v=" + track["path"].rsplit("v=", 1)[1]
+                track["stream"] = True
+            return others[:12]
         if not vid:
             return None
         seed = next((t for t in self.library if t["path"].endswith("v=" + vid)), None)
@@ -1823,6 +1834,42 @@ class FakeCliamp:
                  "title": template.format(q=query), "artist": rng.choice(UPLOADERS),
                  "duration": rng.randint(120, 420), "stream": True}, f"{query}|{i}"))
         return {"ok": True, "tracks": tracks}
+
+    def _cmd_search_playlists(self, req, now):
+        """本物 (パッチの catalog_playlist_search.go) と同じ形: YouTube は provider "url" で id は
+        プレイリストの URL、Spotify は provider "spotify"。"__fail__" で失敗、"noresults" で 0 件。"""
+        provider = str(req.get("provider") or "") or "youtube"
+        query = str(req.get("query") or "").strip()
+        if not query:
+            return {"ok": False, "error": "search_playlists requires a query"}
+        try:
+            limit = int(req.get("limit") or 10)
+        except (TypeError, ValueError):
+            limit = 10
+        limit = max(1, min(30, limit if limit > 0 else 10))
+        if provider not in ("youtube", "yt", "ytmusic", "spotify"):
+            if provider in ("radio", "soundcloud", "local"):
+                return {"ok": False, "error": f"provider {provider} does not support playlist search"}
+            return self._unknown_provider(provider)
+        if "__fail__" in query or "plfail" in query.lower():
+            return {"ok": False, "error": "yt-dlp: ERROR: [youtube:search] unable to download"}
+        if "noresults" in query.lower() or "該当なし" in query:
+            return {"ok": True, "playlists": []}
+        if provider == "spotify":
+            refused = self._spotify_session_or_refusal("search")
+            if refused is not None:
+                return refused
+            hits = [{"provider": "spotify", "id": pid, "name": f"{query} · {name}", "owner": "Spotify",
+                     "track_count": len(tracks)}
+                    for pid, (name, _section, tracks) in self.spotify_lists.items() if pid != "YOUR MUSIC"]
+            return {"ok": True, "playlists": hits[:limit]}
+        rng = random.Random("ytpl|" + query)
+        hits = []
+        for i in range(min(limit, 6)):
+            pid = "PL" + fake_youtube_id(f"{query}|pl|{i}")
+            hits.append({"provider": "url", "id": f"https://www.youtube.com/playlist?list={pid}",
+                         "name": f"{query} プレイリスト {i + 1}", "owner": rng.choice(UPLOADERS)})
+        return {"ok": True, "playlists": hits}
 
     def _cmd_load_provider(self, req, now):
         provider = str(req.get("provider") or "")

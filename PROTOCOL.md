@@ -139,8 +139,8 @@ radio の `l:0` は組み込みの cliamp radio。`tracks` では中の M3U を 
 | `to` | int (ポインタ) | `queue_edit move` の移動先 |
 | `provider` | string | カタログ系 |
 | `id` | string | カタログ系 |
-| `query` | string | `search` |
-| `limit` | int | `search` / `history` / `playlist` |
+| `query` | string | `search` / `search_playlists` |
+| `limit` | int | `search` / `search_playlists` / `history` / `playlist` |
 | `artist`, `title` | string | `lyrics` |
 | `mode` | string | `enqueue` / `queue_edit` |
 | `tracks` | [TrackInfo] | `replace` / `enqueue` / `playlist_add` |
@@ -280,6 +280,7 @@ TrackInfo の `path` のまま) を付けると、cliamp はその曲か確か�
 | `playlists` | `provider` | `playlists` / `needs_auth` (`radio` は TUI の局検索の状態に関わらず、検索していないときと同じ一覧 (`l:` 登録局、`f:` お気に入り、`c:` TUI が読み込んだ Radio Browser の局) を返す) |
 | `tracks` | `provider`, `id` | `tracks` / `needs_auth` |
 | `search` | `provider` (省略で `youtube`), `query`, `limit` (既定 25、最大 50) | `tracks` |
+| `search_playlists` | `provider` (省略で `youtube`), `query`, `limit` (既定 10、最大 30) | `playlists` ([PlaylistHit]、該当なしは `[]`)。下の「プレイリストの検索」 |
 | `load_provider` | `provider`, `id`, `index`, `name` | `total`, `gen` (`tracks` の結果で `replace` する。`source` は `{provider, id, name}`。`index` が範囲外なら何も替えずに `index out of range`)。プロバイダーに取り直させて添字で選ぶので、GUI は見えている並びがあるときは `replace` で送る (見た後でリストが変わっていても、見た曲を鳴らすため) |
 | `lyrics` | `artist`, `title` | `lyrics`, `synced` / `error: "not found"` |
 | `history` | `limit` (既定 50) | `tracks` (新しい順、`played_at` 付き) |
@@ -298,6 +299,24 @@ URL へ展開する。
 `track index N out of range`。tests/test_conformance.py が偽と本物の両方で確かめる。
 Spotify の Web API が長い待ちを求めたとき (下) は `… spotify: rate limited by Spotify; retry after 24h0m0s`、
 開発者の割り当てを使い切ったとき (下) は `… spotify: Spotify quota exceeded for this developer account; retry after 1h0m0s`。
+
+#### プレイリストの検索 (`search_playlists`)
+
+cliamp 2.4.0 の移植パッチ (/etc/nixos の pkgs/patches/cliamp-2.4.0-gui-ipc.patch、`catalog_playlist_search.go`)
+で足したコマンド。capabilities の `commands` に無い cliamp には送らない。
+
+PlaylistHit: `{"provider", "id", "name", "owner"?, "track_count"?, "image"?}`。項目の
+`provider` と `id` はそのまま `tracks` / `load_provider` に渡せる (検索の範囲とは別)。
+
+- `youtube` (と `yt` / `ytmusic`): yt-dlp の `https://www.youtube.com/results?search_query=<語>&sp=EgIQAw==`
+  (種類: 再生リスト) を `--flat-playlist` で読む。先頭に混じるチャンネルは捨てる。項目は
+  `provider: "url"`、`id: "https://www.youtube.com/playlist?list=<ID>"`。`track_count` は出ないことが多い。
+  `image` は動画の 16:9 のサムネイル。
+- `spotify`: `/v1/search?type=playlist` を Development Mode の規則どおり 10 件ずつ (既定の 10 件なら 1 回)。
+  `track_count` は 2026 年 2 月からの `items.total` (古い `tracks.total` も読む)。誤りの文言は
+  `search` と同じ `spotify: search: …` (利用枠・回数の制限の型付きの誤りも同じ)。持ち主のものでない
+  プレイリストの `tracks` は Development Mode では断られることがある (GUI は公開ページへ退避する)。
+- そのほかの Searcher でないプロバイダーは `provider <key> does not support playlist search`。
 
 ### Spotify の Web API だけの接続 (`playback: "youtube"`)
 

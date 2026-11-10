@@ -50,6 +50,7 @@ from .protocol import (
     is_spotify_error,
     is_spotify_owner_premium_required,
     parse_lyrics,
+    parse_playlist_hits,
     parse_playlists,
     parse_providers,
     parse_tracks,
@@ -67,13 +68,13 @@ SEARCH_TTL = 600.0
 LYRICS_TTL = 1800.0
 LYRICS_MISS_TTL = 600.0
 # 覚えておく数の上限 (種類ごと)。期限より先にこれを超えたら古いものから捨てる
-CACHE_CAPS = {"search": 200, "lyrics": 300, "tracks": 100}
+CACHE_CAPS = {"search": 200, "search_playlists": 200, "lyrics": 300, "tracks": 100}
 # 期限切れをまとめて捨てる目安 (件数と間隔)
 SWEEP_ENTRIES = 256
 SWEEP_SECONDS = 60.0
 # カタログ系の初回にセッションを作り、その後で providers の playback が変わりうるプロバイダー
 LAZY_SESSION_PROVIDERS = frozenset({"spotify"})
-_SESSION_KINDS = frozenset({"playlists", "tracks", "search"})
+_SESSION_KINDS = frozenset({"playlists", "tracks", "search", "search_playlists"})
 _PROVIDERS_KEY = ("providers",)
 # 「持ち主が Premium でない」「利用枠を使い切った」のように、そのプロバイダーのどの呼び出しも同じに
 # 断られる失敗を覚える時間。Premium にした後で Spotify が断りを解いたら早く気づけるよう短め
@@ -321,6 +322,20 @@ class Catalog:
         limit = max(1, min(50, int(limit)))
         key = ("search", provider, fold_text(query), limit)
         self._fetch(key, SEARCH_TTL, "search", self._tracks, callback, force=force, lane=lane,
+                    provider=provider, query=query, limit=limit)
+
+    def search_playlists(self, provider: str, query: str,
+                         callback: Callable[[list[PlaylistInfo] | Response], object],
+                         limit: int = 10, *, force: bool = False, lane: str | None = None) -> None:
+        """query に合うプレイリスト (provider は検索の範囲 youtube / spotify)。答えの項目は開くときの
+        プロバイダーを持つ (YouTube は "url")。lane は search と同じ (曲の検索とは別の lane にする)。"""
+        query = (query or "").strip()
+        if not query:
+            self._later(callback, [])
+            return
+        limit = max(1, min(30, int(limit)))
+        key = ("search_playlists", provider, fold_text(query), limit)
+        self._fetch(key, SEARCH_TTL, "search_playlists", parse_playlist_hits, callback, force=force, lane=lane,
                     provider=provider, query=query, limit=limit)
 
     def lyrics(self, artist: str, title: str, callback: Callable[[Lyrics | None], object]) -> None:
