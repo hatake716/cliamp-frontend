@@ -682,6 +682,8 @@ class SearchPage(PageBase):
         grid = make_grid(row_spacing=18, column_spacing=18, max_per_line=6)
         grid.add_css_class("music-search-playlists")
         grid.set_margin_top(12)
+        # 下の「すべての曲」の見出しとの間 (上の段の .music-search-top の margin-bottom と同じ)
+        grid.set_margin_bottom(30)
         self.inset(grid)
         return grid
 
