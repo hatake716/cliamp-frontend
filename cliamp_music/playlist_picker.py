@@ -268,7 +268,7 @@ def present_picker(ctx, tracks: Iterable[Track]) -> Adw.AlertDialog | None:
             added, created, detail = value if value is not None else (0, False, error)
             report("youtube-account", added, created, detail)
 
-        run_async(work, done)
+        run_async(work, done, keep_running=True)
 
     source.connect("notify::selected", load)
     dest.connect("notify::selected", update_save)

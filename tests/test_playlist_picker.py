@@ -82,7 +82,7 @@ class DestinationTest(unittest.TestCase):
     def test_youtube_existing_target_and_private_creation(self):
         for new in (False, True):
             with self.subTest(new=new), patch.object(self.picker, "account") as api, patch.object(
-                    self.picker, "run_async", side_effect=lambda fn, done: done(fn(), None)):
+                    self.picker, "run_async", side_effect=lambda fn, done, **_kw: done(fn(), None)) as worker:
                 api.is_connected.return_value = True
                 api.list_playlists.return_value = [("PLexisting","公開リスト")]
                 api.create_playlist.return_value = "PLcreated"
@@ -94,6 +94,7 @@ class DestinationTest(unittest.TestCase):
                     self.name.set_text("非公開テスト")
                 self.assertTrue(self.dialog.get_response_enabled("add"))
                 self.dialog.emit("response", "add")
+                self.assertTrue(worker.call_args.kwargs.get("keep_running"))
                 api.add_tracks.assert_called_once_with("PLcreated" if new else "PLexisting", ["abcdef12345"])
                 if new:
                     api.create_playlist.assert_called_once_with("非公開テスト")

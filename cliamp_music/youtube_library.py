@@ -10,7 +10,7 @@ from gi.repository import Gio, GLib, Gtk
 from . import youtube_account
 
 
-def run_async(work, callback):
+def run_async(work, callback, *, keep_running=False):
     """結果かエラーを一度だけメインスレッドに戻す。"""
     def wrapper():
         try:
@@ -26,7 +26,7 @@ def run_async(work, callback):
 
         GLib.idle_add(idle_callback)
 
-    thread = threading.Thread(target=wrapper, daemon=True)
+    thread = threading.Thread(target=wrapper, daemon=not keep_running)
     thread.start()
 
 
