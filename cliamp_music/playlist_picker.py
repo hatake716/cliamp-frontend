@@ -11,6 +11,7 @@ gi.require_version("Adw", "1")
 from gi.repository import Adw, Gtk  # noqa: E402
 
 from . import youtube_account as account
+from .recording_review import RecordingReview, target_id
 from .protocol import Track, valid_playlist_name
 from .youtube_library import connect_youtube, run_async
 
@@ -35,12 +36,12 @@ def _eligible(ctx, source: str, tracks: tuple[Track, ...]) -> tuple[bool, str]:
     if source == "spotify":
         if not ctx.store.supports("spotify_save"):
             return False, "Spotify に保存できません"
-        if not all(t.spotify_id for t in tracks):
-            return False, "Spotify の ID が無い曲があります"
+        if not all(t.spotify_id or t.youtube_id for t in tracks):
+            return False, "Spotify または YouTube Music の曲を選んでください"
         return True, ""
     if source == "youtube":
-        if not all(t.youtube_id for t in tracks):
-            return False, "YouTube の動画 ID が無い曲があります"
+        if not all(t.spotify_id or t.youtube_id for t in tracks):
+            return False, "Spotify または YouTube Music の曲を選んでください"
         return True, ""
     return False, "このサービスでは追加できません"
 
@@ -93,6 +94,9 @@ def present_picker(ctx, tracks: Iterable[Track]) -> Adw.AlertDialog | None:
     status.set_visible(False)
     box.append(status)
 
+    review_container = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+    box.append(review_container)
+    review = None
     dialog.set_extra_child(box)
 
     state = {
@@ -124,6 +128,8 @@ def present_picker(ctx, tracks: Iterable[Track]) -> Adw.AlertDialog | None:
             valid = bool(name) and len(name) <= 150
             if state["source"] == "local":
                 valid = valid_playlist_name(name) and name not in state["local_names"]
+        if review is not None:
+            valid = valid and bool(review.confirmed)
         dialog.set_response_enabled("add", valid)
 
     def message(text: str) -> None:
@@ -131,6 +137,11 @@ def present_picker(ctx, tracks: Iterable[Track]) -> Adw.AlertDialog | None:
         status.set_visible(bool(text))
 
     def load(*_args) -> None:
+        nonlocal review
+        if review is not None:
+            review.cancel()
+            review_container.remove(review)
+            review = None
         state["gen"] += 1
         gen = state["gen"]
         key = state["source"] = current_source()
@@ -148,6 +159,7 @@ def present_picker(ctx, tracks: Iterable[Track]) -> Adw.AlertDialog | None:
         message("読み込み中…")
 
         def finish(rows, error=None) -> None:
+            nonlocal review
             if state["closed"] or gen != state["gen"]:
                 return
             if error or rows is None:
@@ -159,6 +171,12 @@ def present_picker(ctx, tracks: Iterable[Track]) -> Adw.AlertDialog | None:
             dest.set_visible(True)
             connect.set_visible(key == "youtube")
             message("")
+            if key in ("spotify", "youtube"):
+                missing = [t for t in tracks if not target_id(t, key)]
+                if missing:
+                    review = RecordingReview(ctx, tracks, key, update_save)
+                    review_container.append(review)
+                    review.start()
             update_save()
 
         if key == "local":
@@ -214,9 +232,13 @@ def present_picker(ctx, tracks: Iterable[Track]) -> Adw.AlertDialog | None:
     def on_response(_d, response: str) -> None:
         if state["closed"]:
             return
+        save_tracks = review.confirmed if review is not None else tracks
+        was_valid = dialog.get_response_enabled("add")
         state["closed"] = True
         ctx.playlist_picker = None
-        if response != "add" or state["busy"] or not state["ready"] or not dialog.get_response_enabled("add"):
+        if review is not None:
+            review.cancel()
+        if response != "add" or state["busy"] or not state["ready"] or not was_valid or not save_tracks:
             return
         source_key = state["source"]
         sel = dest.get_selected()
@@ -231,7 +253,7 @@ def present_picker(ctx, tracks: Iterable[Track]) -> Adw.AlertDialog | None:
             name = dest_name
 
         if source_key == "local":
-            ctx.add_to_playlist(name, tracks)
+            ctx.add_to_playlist(name, save_tracks)
             return
 
         def report(provider, added, created, error=""):
@@ -248,7 +270,7 @@ def present_picker(ctx, tracks: Iterable[Track]) -> Adw.AlertDialog | None:
                 report("spotify", response.get("added", 0), new and bool(response.get("id")),
                        response.message if not response.ok else "")
 
-            payload = [Track(path="spotify:track:" + t.spotify_id) for t in tracks]
+            payload = [Track(path="spotify:track:" + t.spotify_id) for t in save_tracks]
             kwargs = {"name": name} if new else {"id": dest_id}
             ctx.client.request("spotify_save", done, tracks=payload, **kwargs)
             return
@@ -260,7 +282,7 @@ def present_picker(ctx, tracks: Iterable[Track]) -> Adw.AlertDialog | None:
                 if new:
                     target_id = account.create_playlist(name)
                     created = True
-                return account.add_tracks(target_id, [t.youtube_id for t in tracks]), created, ""
+                return account.add_tracks(target_id, [t.youtube_id for t in save_tracks]), created, ""
             except account.YouTubeAccountError as exc:
                 return exc.added, created, str(exc)
 

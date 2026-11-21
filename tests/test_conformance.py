@@ -824,8 +824,8 @@ class _Conformance(_Calls):
         ids = [p["id"] for p in self.ok("playlists", provider="local")["playlists"]]
         self.assertNotIn(name, ids, "最後の曲を外すとプレイリストのファイルごと消える")
 
-    def test_playlist_add_drops_live_and_meta(self):
-        """ローカルのプレイリスト (TOML) は live と meta を持てない。URL の曲は stream に戻る。"""
+    def test_playlist_add_drops_live_and_art(self):
+        """ローカルのプレイリスト (TOML) は live と art を持てない。URL の曲は stream に戻る。"""
         name = self._scratch()
         station = {"path": DUMMY_STREAM.format(8), "title": "Station", "stream": True, "live": True,
                    "meta": {"art": "file:///nonexistent/favicon.png"}}
@@ -834,19 +834,42 @@ class _Conformance(_Calls):
         self.ok("playlist_delete", name=name)
         self.assertEqual(back, [{"path": station["path"], "title": "Station", "stream": True}])
 
-    def test_playlist_add_keeps_bridged_spotify_tracks_without_meta(self):
-        """「Spotify から取り込む」の曲 (YouTube で探して鳴らす形) もローカルのプレイリストに足せる。
-        TOML に残るのは path・title・artist・album・duration だけで meta は落ち、path が yt-dlp の検索式なので
-        読み戻すと stream が立つ (GUI は落ちた Spotify の曲 ID を自分の表で付け直す)。"""
+    def test_playlist_add_persists_valid_spotify_ids_and_bridge(self):
+        """有効な Spotify ID と bridge は TOML に残り、stream は読み戻し時に立つ。"""
         name = self._scratch()
-        bridged = {"path": "ytsearch1:Queen David Bowie Under Pressure", "title": "Under Pressure",
-                   "artist": "Queen, David Bowie", "album": "Hot Space", "duration": 248,
-                   "meta": {"spotify.id": "2aoo2jlRnM3A0NyLQqMN2f", "spotify.bridge": "youtube"}}
-        self.ok("playlist_add", name=name, tracks=[bridged])
+        track = {"path": "ytsearch1:Test Artist Test Song", "title": "Test Song", "artist": "Test Artist",
+                 "album": "Test Album", "duration": 100,
+                 "meta": {"spotify.id": "2aoo2jlRnM3A0NyLQqMN2f", "spotify.album_id": "4aoo2jlRnM3A0NyLQqMN2f",
+                          "spotify.bridge": "youtube", "unknown_key": "drop_me"}}
+        self.ok("playlist_add", name=name, tracks=[track])
         back = self.ok("tracks", provider="local", id=name)["tracks"]
         self.ok("playlist_delete", name=name)
-        self.assertEqual(back, [{"path": bridged["path"], "title": "Under Pressure", "artist": "Queen, David Bowie",
-                                 "album": "Hot Space", "duration": 248, "stream": True}])
+        self.assertEqual(back, [{"path": track["path"], "title": "Test Song", "artist": "Test Artist",
+                                 "album": "Test Album", "duration": 100, "stream": True,
+                                 "meta": {"spotify.id": "2aoo2jlRnM3A0NyLQqMN2f",
+                                          "spotify.album_id": "4aoo2jlRnM3A0NyLQqMN2f",
+                                          "spotify.bridge": "youtube"}}])
+
+    def test_playlist_add_drops_invalid_ids_and_bridge(self):
+        """無効な ID や bridge は保存されない。"""
+        name = self._scratch()
+        track = {"path": "ytsearch1:Invalid", "title": "Invalid", "duration": 100,
+                 "meta": {"spotify.id": "invalid", "spotify.bridge": "youtube"}}
+        self.ok("playlist_add", name=name, tracks=[track])
+        back = self.ok("tracks", provider="local", id=name)["tracks"]
+        self.ok("playlist_delete", name=name)
+        self.assertEqual(back, [{"path": track["path"], "title": "Invalid", "duration": 100, "stream": True}])
+
+    def test_playlist_add_persists_valid_album_id_standalone(self):
+        """有効な album_id 単独でも保存される。"""
+        name = self._scratch()
+        track = {"path": "ytsearch1:Album Only", "title": "Album Only", "duration": 100,
+                 "meta": {"spotify.album_id": "4aoo2jlRnM3A0NyLQqMN2f"}}
+        self.ok("playlist_add", name=name, tracks=[track])
+        back = self.ok("tracks", provider="local", id=name)["tracks"]
+        self.ok("playlist_delete", name=name)
+        self.assertEqual(back, [{"path": track["path"], "title": "Album Only", "duration": 100, "stream": True,
+                                 "meta": {"spotify.album_id": "4aoo2jlRnM3A0NyLQqMN2f"}}])
 
     def test_playlist_edit_errors(self):
         tracks = self.library(1)

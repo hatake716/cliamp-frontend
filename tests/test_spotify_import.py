@@ -474,7 +474,7 @@ class IndexTest(unittest.TestCase):
         got = reloaded.get("夜更かし")
         self.assertEqual((got.kind, got.id, got.title, got.count, got.cover_url),
                          ("playlist", PID, "夜更かし", 6, self.result.cover_url))
-        # ローカルの TOML から読み戻した曲 (meta が無い) に ID を付け直す
+        # 旧形式のローカル TOML から読み戻した曲に ID を付け直す
         original = self.result.tracks[1]
         stored = Track(path=original.path, title=original.title, artist=original.artist, duration=original.duration,
                        stream=True)

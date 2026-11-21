@@ -1,7 +1,7 @@
 """「Spotify から取り込む」(importer.py と、ページ・サイドバー・store・カタログの取り込みまわり) の試験。
 
 Spotify の頁は tests/spotify_fixtures.py の架空のもの (spotify_import.urlopen を差し替える)。cliamp は
-偽 (tests/fake_cliamp.py)。偽は本物と同じく、ローカルのプレイリストに足した曲の meta を落とす。
+偽 (tests/fake_cliamp.py)。現在の形式での Spotify ID の保存と、旧形式からの復元を試す。
 
 前半 (ImportFlowTest) は窓を出さない。後半 (DialogTest など) は X の画面 (Xvfb の :10 以上) が要り、
 無ければ飛ばす:
@@ -167,19 +167,21 @@ class ImportFlowTest(WebMixin, unittest.TestCase):
         self.assertIn(f"「{NAME}」を取り込みました (6 曲)", self.window.toasts)
         self.assertEqual(self.window.pages[-1], ("playlist", {"provider": "local", "id": NAME, "name": NAME}))
         self.assertIn(NAME, self.ctx.local_playlists)
-        # cliamp へは cliamp の Web API だけの Spotify と同じ形 (meta 付き) で送り、偽は本物と同じく meta を落とす
+        # YouTube で再生する Spotify の曲を送り、現行のプレイリストが曲 ID と橋渡しの印を保存する。
         sent = self.fake.requests_for("playlist_add")[-1]["tracks"]
         self.assertEqual([t["path"] for t in sent], [t.path for t in result.tracks])
         self.assertTrue(all(t["meta"]["spotify.bridge"] == "youtube" for t in sent))
         stored = self.fake.local_playlists[NAME]
-        self.assertTrue(all("meta" not in t for t in stored))
+        self.assertTrue(all("meta" in t for t in stored))
         self.assertEqual(stored[0], {"path": "ytsearch1:青い灯台 夜明けのバス停", "title": "夜明けのバス停",
-                                     "artist": "青い灯台", "duration": 214, "stream": True})
+                                     "artist": "青い灯台", "duration": 214, "stream": True,
+                                     "meta": {"spotify.id": result.tracks[0].spotify_id,
+                                              "spotify.bridge": "youtube"}})
         # 表に書いた
         record = self.ctx.imports.get(NAME)
         self.assertEqual((record.url, record.count, record.title), (f"https://open.spotify.com/playlist/{PID}", 6, NAME))
         self.assertTrue(os.path.exists(self.ctx.imports.path))
-        # ローカルのプレイリストとして読み戻すと、meta は無いが ID を付け直す
+        # ローカルのプレイリストを読み戻しても、Spotify の絵とリンクに使う ID が得られる。
         box = []
         self.ctx.catalog.tracks("local", NAME, box.append, force=True)
         self.wait(lambda: box)
@@ -331,6 +333,10 @@ class ImportFlowTest(WebMixin, unittest.TestCase):
         再生バー・次に再生・履歴の曲は Spotify の曲として絵とリンクを持つ。"""
         result = si.fetch_list(URL)
         self.save(NAME, result)
+        # この曲 ID が保存される前の版が書いたリストを再現する。
+        with self.fake.lock:
+            for item in self.fake.local_playlists[NAME]:
+                item.pop("meta", None)
         store = self.ctx.store
         self.ctx.load_provider("local", NAME, 1, NAME)
         self.wait(lambda: store.status.track is not None and store.status.track.path == result.tracks[1].path, 8)
@@ -342,7 +348,7 @@ class ImportFlowTest(WebMixin, unittest.TestCase):
                          f"{SPOTIFY_OEMBED}https://open.spotify.com/track/{result.tracks[1].spotify_id}")
         self.wait(lambda: len(store.playlist.tracks) == 6 and store.playlist.tracks[0].path == result.tracks[0].path)
         self.assertTrue(all(is_youtube_bridge(t) for t in store.playlist.tracks))
-        # 履歴 (history.toml にも meta は残らない)
+        # Spotify の ID が無い旧形式の履歴にも対応する。
         with self.fake.lock:
             self.fake.history.insert(0, (history_track(result.tracks[2].to_wire()), "2026-09-27T01:00:00Z"))
         store.refresh_history()

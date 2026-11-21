@@ -50,9 +50,8 @@
   owner of the app" を返し、cliamp は本物と同じ文脈で包む: playlists は "spotify: your music: http status
   403 Forbidden: {…}"、search は "spotify: search: http status 403 Forbidden: {…}"、tracks は上流の言い換え
   "spotify: playlist not accessible: only playlists you own or collaborate on can be loaded"。
-- ローカルのプレイリストに足した曲は、YouTube で探して鳴らす Spotify の曲 (path "ytsearch1:…"、meta
-  の spotify.id / spotify.bridge 付き) でも TOML の欄 (path・title・artist・album…) だけが残り、meta は
-  落ちる。読み戻すと path が yt-dlp の検索式なので stream が立つ (本物と同じ)。名前 + ".toml" が
+- ローカルのプレイリストは有効な Spotify の曲・アルバム ID と、曲 ID に対応する spotify.bridge を保存する。
+  「ytsearch1:…」形式の曲は、読み戻すと stream が立つ。名前 + ".toml" が
   255 バイトを超える playlist_add は、本物 (os.OpenFile) と同じ "open …: file name too long" で断る。
 
 試験の道具: `isolate_display()` (利用者の画面に繋がない)、`temp_socket_path()`、
@@ -399,7 +398,24 @@ def history_track(track: dict) -> dict:
 
 
 def local_track(track: dict) -> dict:
-    return _persisted(track, _LOCAL_FIELDS)
+    out = _persisted(track, _LOCAL_FIELDS)
+    if track.get("stream"):
+        out["stream"] = True
+    meta = track.get("meta") or {}
+    sid = meta.get("spotify.id")
+    aid = meta.get("spotify.album_id")
+    valid_sid = isinstance(sid, str) and sid.isascii() and sid.isalnum() and len(sid) == 22
+    valid_aid = isinstance(aid, str) and aid.isascii() and aid.isalnum() and len(aid) == 22
+    new_meta = {}
+    if valid_sid:
+        new_meta["spotify.id"] = sid
+    if valid_aid:
+        new_meta["spotify.album_id"] = aid
+    if valid_sid and meta.get("spotify.bridge") == "youtube":
+        new_meta["spotify.bridge"] = "youtube"
+    if new_meta:
+        out["meta"] = new_meta
+    return out
 
 
 def go_json(obj) -> bytes:

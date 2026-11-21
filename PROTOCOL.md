@@ -59,15 +59,16 @@ GUI から cliamp へ曲を渡すとき (`replace` / `enqueue` / `playlist_add`)
 戻る (`stream` / `live` / `meta` / `path_raw` を含めて往復で失われない)。GUI が自分で
 作る曲 (Radio Browser の局など) は `{"path": url, "title": 名前, "stream": true, "live": true}`。
 
-ただしファイルに書くもの (`playlist_add` のローカルのプレイリストの TOML、TUI が記録する
-`history` の history.toml) は往復で欠ける:
+このPCの cliamp 2.4.0 がローカルプレイリストに保存する欄は次のとおり。
 
-- ローカルのプレイリストに残るのは path (UTF-8 でない名前もそのまま)・title・artist・album・
-  genre・year・track_number・duration・feed・bookmark。`history` はさらに feed と
-  bookmark も持たない。
-- このPCの 2.4.0 版は保存時に、有効な `spotify.id`・`spotify.album_id` と、曲 ID に対応する `spotify.bridge=youtube` を残す。
-  その他の `meta`・`live`・`unplayable` は保存対象外。`stream` は持ち越さず、読み戻すときに path が
-  URL (http(s) か yt-dlp の検索式) かで決め直す。
+- `playlist_add` は path・title・artist・album・genre・year・track_number・duration（TOML では
+  `duration_secs`）・feed・bookmark を保存する。UTF-8 でない path の元のバイト列も保つ。
+- `spotify.id` と `spotify.album_id` はそれぞれ独立に、ASCII の英数字 22 文字なら保存する。
+  `spotify.bridge=youtube` は有効な `spotify.id` がある場合に保存する。その他の `meta`、
+  `live`、`unplayable` は API 1 のこの操作で保存しない。
+- URL と yt-dlp の検索式は読み戻すと `stream` が立つ。その他のパスでは明示した `stream=true` が残る。
+- `history` は別の経路で `played_at` と再生した曲の情報を記録する。現行の履歴には feed や
+  プロバイダーのメタデータも入りうる。以前に記録された曲は Spotify の ID を持たない場合がある。
 - そのため GUI はラジオの局 (live) を「プレイリストに追加」させない (読み戻すと局の絵も
   「ライブ」の印も失う)。
 

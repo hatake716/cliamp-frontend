@@ -9,6 +9,7 @@ from html.parser import HTMLParser
 from gi.repository import GLib
 
 from . import spotify_import
+from .local_album import can_resolve_local, resolve_local_album
 from .protocol import Track, Response, youtube_id_of
 
 
@@ -18,7 +19,7 @@ def can_resolve_album(track: Track) -> bool:
     aid = track.meta_get("spotify.album_id")
     if spotify_import.is_spotify_id(aid):
         return True
-    return bool(track.path and (track.spotify_id or track.youtube_id))
+    return can_resolve_local(track) or bool(track.path and (track.spotify_id or track.youtube_id))
 
 
 class _MetaParser(HTMLParser):
@@ -65,6 +66,8 @@ def _resolve_spotify_ref(track: Track) -> spotify_import.SpotifyRef:
 def resolve_album(track: Track) -> tuple[Track, ...]:
     if not track:
         raise ValueError("トラックがありません")
+    if can_resolve_local(track):
+        return resolve_local_album(track)
     if track.youtube_id and not track.spotify_id:
         return _resolve_youtube(track)
     ref = _resolve_spotify_ref(track)
