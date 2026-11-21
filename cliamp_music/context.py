@@ -26,6 +26,7 @@ from .client import CliampClient  # noqa: E402
 from .protocol import (  # noqa: E402
     RECENTLY_PLAYED,
     STALE,
+    PlaylistInfo,
     Response,
     Source,
     Track,
@@ -74,6 +75,7 @@ class AppContext(GObject.Object):
     __gsignals__ = {
         "local-playlists-changed": (GObject.SignalFlags.RUN_FIRST, None, ()),
         "providers-changed": (GObject.SignalFlags.RUN_FIRST, None, ()),
+        "saved-playlists-changed": (GObject.SignalFlags.RUN_FIRST, None, ()),
         "account-playlists-changed": (GObject.SignalFlags.RUN_FIRST, None, (str,)),
     }
 
@@ -90,6 +92,7 @@ class AppContext(GObject.Object):
         self.artwork = artwork or ArtworkLoader()
         self.radio = radio or RadioBrowser()
         self.state = state or GuiState()
+        self._pending_account_saves: set[tuple[str, str]] = set()
         # 取り込んだ Spotify のプレイリストの記録 (ファイルは初めて使うときに読む)
         self.imports = imports or ImportIndex(default_index_path(getattr(self.state, "path", None)))
         if hasattr(self.catalog, "track_hook"):
@@ -135,10 +138,12 @@ class AppContext(GObject.Object):
         if window is not None and hasattr(window, "navigate"):
             window.navigate(page_id, **params)
 
-    def toast(self, text: str):
+    def toast(self, text: str, *, action_uri: str | None = None):
         """窓に平文のトーストを出す (窓が無ければログへ)。窓が返したトーストを返す。"""
         window = self.window
         if window is not None and hasattr(window, "toast"):
+            if action_uri is not None and hasattr(window, "toast_for_uri"):
+                return window.toast_for_uri(text, action_uri)
             return window.toast(text)
         log(text)
         return None
@@ -274,6 +279,34 @@ class AppContext(GObject.Object):
             # 覚えているカタログの結果を捨ててから取り直す
             self.catalog.invalidate()
             self.refresh_local_playlists()
+
+    def saved_playlists(self) -> list[PlaylistInfo]:
+        """Return the list of saved playlists."""
+        return self.state.saved_playlists()
+
+    def is_playlist_saved(self, provider: str, identifier: str) -> bool:
+        """Check if a playlist is saved."""
+        return self.state.is_playlist_saved(provider, identifier)
+
+    def set_playlist_saved(self, playlist_hit: PlaylistInfo, saved: bool) -> bool:
+        """Save or remove a playlist."""
+        if not isinstance(playlist_hit, PlaylistInfo):
+            return False
+
+        before = self.is_playlist_saved(playlist_hit.provider, playlist_hit.id)
+        success = self.state.set_playlist_saved(playlist_hit, saved)
+
+        if not success:
+            if saved:
+                self.toast("プレイリストを保存できませんでした")
+            else:
+                self.toast("プレイリストの保存を解除できませんでした")
+            return False
+
+        if before != saved:
+            self.emit("saved-playlists-changed")
+
+        return True
 
     def choose_playlist(self, tracks: Iterable[Track]):
         from .playlist_picker import present_picker
@@ -441,6 +474,11 @@ class AppContext(GObject.Object):
         clipboard.set(text)  # gdk_clipboard_set_value (文字列は GValue に包まれる)
         if done_text:
             self.toast(done_text)
+
+    def save_playlist_to_account(self, info) -> None:
+        from .account_bookmarks import save_playlist_to_account
+
+        save_playlist_to_account(self, info)
 
     def open_uri(self, uri: str) -> None:
         """既定のブラウザなどで開く。"""

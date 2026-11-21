@@ -43,7 +43,7 @@ STATE_COMMANDS = frozenset(LEGACY_COMMANDS - {"plugin.call"} | {
 CATALOG_COMMANDS = frozenset({
     "providers", "playlists", "tracks", "search", "load_provider", "lyrics",
     "history", "playlist_add", "playlist_delete", "playlist_remove_track",
-    "search_playlists", "spotify_destinations", "spotify_save", "plugin.call",
+    "search_playlists", "spotify_destinations", "spotify_save", "save_playlist_to_library", "plugin.call",
 })
 
 # 拡張 IPC (api 1) のすべてのコマンド。
@@ -556,6 +556,46 @@ class PlaylistInfo:
     # search_playlists の答えだけが持つ: 作った人と絵の URL (無ければ "")
     owner: str = ""
     image: str = ""
+
+
+def public_playlist_key(provider: str, identifier: str) -> tuple[str, str] | None:
+    """ブックマークの一意な識別キーを算出する。
+
+    Spotify と YouTube の URL/ID を正規化し、(provider, key) を返す。
+    不正な入力や非対応プロバイダは None を返す。
+    """
+    if provider == "spotify":
+        if isinstance(identifier, str) and identifier.isascii() and identifier.isalnum():
+            return ("spotify", identifier)
+        return None
+
+    if provider == "url":
+        if not isinstance(identifier, str):
+            return None
+        try:
+            parsed = urlsplit(identifier)
+            port = parsed.port
+            host = parsed.hostname
+        except ValueError:
+            return None
+
+        if parsed.scheme != "https" or host not in ("youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com"):
+            return None
+
+        if parsed.username is not None or parsed.password is not None or port not in (None, 443):
+            return None
+        path = parsed.path.rstrip("/")
+        if path not in {"/playlist", "/watch"}:
+            return None
+        qs = parse_qs(parsed.query, keep_blank_values=True)
+        if "list" not in qs or len(qs["list"]) != 1:
+            return None
+        list_id = qs["list"][0]
+        if not list_id or not re.fullmatch(r"[A-Za-z0-9_-]+", list_id):
+            return None
+        return ("url", list_id)
+
+    return None
 
 
 @dataclass(frozen=True)

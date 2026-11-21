@@ -26,7 +26,7 @@ try:
     from cliamp_music.artwork import ArtworkLoader
     from cliamp_music.client import CliampClient
     from cliamp_music.context import AppContext
-    from cliamp_music.protocol import Track, mix_url
+    from cliamp_music.protocol import PlaylistInfo, Track, mix_url
     from cliamp_music.radio import RadioBrowser
     from cliamp_music.state import GuiState
 
@@ -122,6 +122,20 @@ class Delegation(ContextTest):
             self.ctx.toast("窓なし")
             self.ctx.navigate("home")
         log.assert_called_once_with("窓なし")
+
+    def test_saved_playlist_signal_follows_committed_changes_only(self):
+        hit = PlaylistInfo("url", "https://youtube.com/playlist?list=PLrock", "Rock")
+        snapshots = []
+        self.ctx.connect("saved-playlists-changed", lambda ctx: snapshots.append(ctx.saved_playlists()))
+        self.assertTrue(self.ctx.set_playlist_saved(hit, True))
+        self.assertTrue(self.ctx.set_playlist_saved(hit, True))
+        with mock.patch.object(self.ctx.state, "save", return_value=False):
+            self.assertFalse(self.ctx.set_playlist_saved(hit, False))
+        self.assertEqual(snapshots, [[hit]])
+        self.assertTrue(self.ctx.is_playlist_saved(hit.provider, hit.id))
+        self.assertTrue(self.window.toasts)
+        self.assertTrue(self.ctx.set_playlist_saved(hit, False))
+        self.assertEqual(snapshots, [[hit], []])
 
     def test_parts_are_created(self):
         ctx = AppContext(client=CliampClient(self.path + ".none"), state=GuiState(temp_dir("cm-ctx-") + "/s.json"),

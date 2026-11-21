@@ -16,6 +16,43 @@ from cliamp_music import youtube_account as yt
 
 
 class YouTubeAccountTest(unittest.TestCase):
+    def test_library_save(self):
+        try:
+            import requests
+            from ytmusicapi import YTMusic
+        except ImportError:
+            self.skipTest("ytmusicapi is optional")
+
+        reqs = []
+
+        def dispatch(_session, req, **kwargs):
+            if req.method == "GET":
+                self.assertNotIn("Authorization", req.headers)
+                return mock.Mock(status_code=200, text='ytcfg.set({"VISITOR_DATA":"visitor"});')
+            self.assertEqual(req.method, "POST")
+            self.assertEqual(urllib.parse.urlsplit(req.url).netloc, "music.youtube.com")
+            self.assertEqual(urllib.parse.urlsplit(req.url).path, "/youtubei/v1/like/like")
+            self.assertEqual(json.loads(req.body)["target"], {"playlistId": "PLtest_1"})
+            self.assertEqual(req.headers["Authorization"], "Bearer fixture")
+            reqs.append(req)
+            return mock.Mock(status_code=200, text='{"responseContext":{}}')
+
+        with (
+            mock.patch.object(requests.Session, "send", autospec=True, side_effect=dispatch),
+            mock.patch.object(yt, "_get_access_token", return_value="fixture") as token,
+            mock.patch.object(YTMusic, "get_library_playlists", return_value=[{"playlistId": "PLtest_1"}]) as read,
+        ):
+            for bad in ("", "PLtest_1\n", "https://example.invalid/list", "x" * 129):
+                with self.subTest(bad=bad):
+                    with self.assertRaises(yt.YouTubeAccountError):
+                        yt.save_playlist_to_library(bad)
+            self.assertFalse(token.called)
+            self.assertIsNone(yt.save_playlist_to_library("PLtest_1"))
+            read.return_value = []
+            with self.assertRaises(yt.YouTubeAccountError):
+                yt.save_playlist_to_library("PLtest_1")
+        self.assertEqual(len(reqs), 2)
+
     def test_google_desktop_oauth(self):
         with tempfile.TemporaryDirectory() as root, mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": root}):
             client = Path(root) / "desktop-client.json"

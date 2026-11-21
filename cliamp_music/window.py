@@ -145,7 +145,7 @@ class MusicWindow(Adw.ApplicationWindow):
         self._we_fullscreened = False
         self._starting = None
         self._first_connection_seen = False
-        self._toast_last: tuple[str, float] | None = None
+        self._toast_last: tuple[tuple[str, str | None], float] | None = None
         self._navigating = False
 
         self.add_css_class("music")
@@ -567,6 +567,9 @@ class MusicWindow(Adw.ApplicationWindow):
     # --- トースト ------------------------------------------------------------------
 
     def toast(self, text: str) -> Adw.Toast | None:
+        return self.toast_for_uri(text, None)
+
+    def toast_for_uri(self, text: str, action_uri: str | None) -> Adw.Toast | None:
         """平文のトースト (曲名に & や < が入るのでマークアップにしない)。出した Adw.Toast を返す。
 
         長い文 (長い曲名とプレイリスト名を含むもの) で窓の幅いっぱいに広がらないよう、
@@ -575,9 +578,10 @@ class MusicWindow(Adw.ApplicationWindow):
         if not text:
             return None
         now = GLib.get_monotonic_time() / 1e6
-        if self._toast_last is not None and self._toast_last[0] == text and now - self._toast_last[1] < 1.5:
+        key = (text, action_uri)
+        if self._toast_last is not None and self._toast_last[0] == key and now - self._toast_last[1] < 1.5:
             return None
-        self._toast_last = (text, now)
+        self._toast_last = (key, now)
         toast = Adw.Toast.new("")
         toast.set_use_markup(False)
         toast.set_title(text)

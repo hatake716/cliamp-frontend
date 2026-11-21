@@ -76,6 +76,7 @@ from ..widgets import (  # noqa: E402
     TrackList,
     TrackRow,
 )
+from .playlist_save import playlist_card_with_save
 from .home import (  # noqa: E402
     SIDE,
     UNSUPPORTED_TITLE,
@@ -702,7 +703,7 @@ class SearchPage(PageBase):
             card = MediaCard(self.ctx.artwork, subject, info.name, subtitle, size=PLAYLIST_CARD,
                              kind="playlist", on_activate=weak_handler(self._on_playlist_card))
             card.playlist_info = info
-            self.playlists_grid.append(card)
+            self.playlists_grid.append(playlist_card_with_save(self.ctx, card, info))
         self._set_playlists_visible(bool(hits))
 
     def _on_playlist_card(self, card) -> None:
@@ -712,7 +713,7 @@ class SearchPage(PageBase):
             return
         if self._query:
             self.ctx.state.add_recent_search(self._query)
-        self.ctx.navigate("playlist", provider=info.provider, id=info.id, name=info.name)
+        self.ctx.navigate("playlist", provider=info.provider, id=info.id, name=info.name, playlist_info=info)
 
     @property
     def results_playlists(self) -> list[PlaylistInfo]:

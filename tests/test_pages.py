@@ -63,7 +63,7 @@ if HAVE_DISPLAY:
     from cliamp_music.pages.radio import RadioPage
     from cliamp_music.pages.recent import RecentPage
     from cliamp_music.pages.search import SearchPage
-    from cliamp_music.protocol import SPOTIFY_SEARCH_BLOCKED_TITLE, Response, Track, is_youtube_bridge, parse_tracks
+    from cliamp_music.protocol import SPOTIFY_SEARCH_BLOCKED_TITLE, PlaylistInfo, Response, Track, is_youtube_bridge, parse_tracks
     from cliamp_music.state import GuiState
 
 SKIP = "X の画面 (Xvfb の :10 以上の DISPLAY) がありません"
@@ -304,7 +304,7 @@ class SearchPageTest(PageCase):
 
     def playlist_cards(self, page):
         grid = page.playlists_grid
-        return [grid.get_child_at_index(i).get_child() for i in range(len(page.results_playlists))]
+        return [grid.get_child_at_index(i).get_child().card for i in range(len(page.results_playlists))]
 
     def test_youtube_search_includes_playlists(self):
         """YouTube の範囲では曲と並べてプレイリストも探し (10 件)、押すと詳細を開く。"""
@@ -324,11 +324,80 @@ class SearchPageTest(PageCase):
         self.assertIn(hits[1].owner, card.subtitle_label.get_text())
         card.emit("clicked")
         self.assertEqual(self.window_stub.pages[-1],
-                         ("playlist", {"provider": "url", "id": hits[1].id, "name": hits[1].name}))
+                         ("playlist", {"provider": "url", "id": hits[1].id, "name": hits[1].name,
+                                       "playlist_info": hits[1]}))
         self.assertEqual(self.ctx.state.recent_searches[0], "夜")
         # 開いた先 (provider "url") で曲が読める
         detail = self.show(PlaylistDetailPage(self.ctx, provider="url", id=hits[1].id, name=hits[1].name))
         self.wait(lambda: len(detail.list.rows()) == 12, message="YouTube のプレイリストの曲が出ません")
+
+    def test_playlist_save_destinations_and_detail_metadata(self):
+        page = self.show(SearchPage(self.ctx))
+        page.set_query("雨")
+        self.wait(lambda: page.results.state == "content" and page.results_playlists)
+        hits = [
+            PlaylistInfo("spotify", "37i9dQZF1DXcBWIGoYBM5M", "雨の音", track_count=12,
+                         owner="音楽部", image=Path(self.art_dir, "cover-0.png").as_uri()),
+            PlaylistInfo("url", "https://www.youtube.com/playlist?list=PL12345678901234567890123456789012",
+                         "雨の音", track_count=9, owner="DJ", image=Path(self.art_dir, "cover-1.png").as_uri()),
+        ]
+        for info, service in zip(hits, ("Spotify", "YouTube Music")):
+            with self.subTest(service=service), patch.object(self.ctx, "save_playlist_to_account",
+                                                            create=True) as save_account:
+                page._fill_playlists([info])
+                tile = page.playlists_grid.get_child_at_index(0).get_child()
+                menu = tile.save_button
+                self.assertIs(tile.get_child(), tile.card)
+                self.assertIs(menu.get_parent(), tile)
+                self.wait(lambda: menu.get_mapped() and menu.get_width() > 0)
+                ok, position = menu.compute_bounds(tile)
+                self.assertTrue(ok)
+                x = position.get_x() + position.get_width() / 2
+                y = position.get_y() + position.get_height() / 2
+                target = tile.pick(x, y, Gtk.PickFlags.DEFAULT)
+                self.assertTrue(target == menu or target.is_ancestor(menu))
+                target = tile.pick(tile.get_width() / 2, tile.art.get_height() / 2, Gtk.PickFlags.DEFAULT)
+                self.assertTrue(target == tile.card or target.is_ancestor(tile.card))
+                self.assertTrue(menu.grab_focus())
+                self.assertIn(service, menu.account_button.get_label())
+                self.assertEqual(menu.local_button.get_label(), "このPCに保存")
+                menu.popup()
+                self.wait(menu.local_button.get_mapped)
+                self.assertTrue(menu.local_button.grab_focus())
+                self.assertTrue(menu.local_button.activate())
+                self.wait(lambda: self.ctx.is_playlist_saved(info.provider, info.id))
+                self.assertIn("保存を解除", menu.local_button.get_label())
+                self.assertIn(info, self.ctx.saved_playlists())
+                self.assertEqual(self.window_stub.pages, [])
+                save_account.assert_not_called()
+                menu.popup()
+                self.wait(menu.account_button.get_mapped)
+                self.assertTrue(menu.account_button.grab_focus())
+                self.assertTrue(menu.account_button.activate())
+                self.wait(lambda: bool(save_account.call_count))
+                save_account.assert_called_once_with(info)
+                self.assertEqual(self.window_stub.pages, [])
+                tile.card.emit("clicked")
+                page_id, params = self.window_stub.pages.pop()
+                self.assertEqual(page_id, "playlist")
+                self.assertEqual(params["playlist_info"], info)
+                detail = self.show(PlaylistDetailPage(self.ctx, **params))
+                detail_menu = detail.save_button
+                self.assertIn("保存を解除", detail_menu.local_button.get_label())
+                self.assertIn(service, detail_menu.account_button.get_label())
+                detail_menu.popup()
+                self.wait(detail_menu.local_button.get_mapped)
+                self.assertTrue(detail_menu.local_button.activate())
+                self.wait(lambda: not self.ctx.is_playlist_saved(info.provider, info.id))
+                save_account.assert_called_once_with(info)
+                detail_menu.popup()
+                self.wait(detail_menu.account_button.get_mapped)
+                self.assertTrue(detail_menu.account_button.activate())
+                self.wait(lambda: save_account.call_count == 2)
+                self.assertEqual(self.window_stub.pages, [])
+                self.assertEqual(self.requests("replace"), [])
+                self.show(page)
+                self.assertEqual(menu.local_button.get_label(), "このPCに保存")
 
     def test_playlist_search_failure_only_hides_the_section(self):
         page = self.show(SearchPage(self.ctx))
@@ -722,6 +791,50 @@ class NowPlayingEditTest(PageCase):
 
 
 class PlaylistsTest(PageCase):
+    def test_saved_grid(self):
+        a = PlaylistInfo("spotify", "abc", "Same", 2, owner="one")
+        b = PlaylistInfo("url", "https://music.youtube.com/playlist?list=PLabc", "Same", 3, owner="two")
+        for info in (a, b):
+            self.assertTrue(self.ctx.set_playlist_saved(info, True))
+        page = self.show(PlaylistsPage(self.ctx))
+        for i, info in enumerate((a, b)):
+            overlay = page.saved_grid.get_child_at_index(i).get_child()
+            self.assertEqual(overlay.card.playlist_info, info)
+            overlay.card.emit("clicked")
+            self.assertEqual(self.window_stub.pages[-1], ("playlist", {
+                "provider": info.provider, "id": info.id, "name": info.name, "playlist_info": info,
+            }))
+        with patch.object(type(self.ctx.store), "supports", return_value=False):
+            page.load()
+            self.assertTrue(page.saved_section.get_visible())
+            self.assertEqual(page.state.state, "empty")
+        for _ in range(2):
+            page.saved_grid.get_child_at_index(0).get_child().save_button.local_button.emit("clicked")
+        self.assertEqual(self.ctx.saved_playlists(), [])
+        self.assertFalse(page.saved_section.get_visible())
+
+    def test_sidebar_saved_identity(self):
+        from cliamp_music.sidebar import Sidebar
+
+        info = PlaylistInfo("url", "https://music.youtube.com/playlist?list=PLabc", "Focus")
+        self.ctx.set_playlist_saved(info, True)
+        self.wait(lambda: "Focus" in self.ctx.local_playlists)
+        sidebar = Sidebar(self.ctx, lambda *_: None)
+        sidebar._provider_order = ["ytmusic", "spotify"]
+        sidebar._provider_lists = {
+            "ytmusic": [PlaylistInfo("ytmusic", "PLabc", "dupe")],
+            "spotify": [PlaylistInfo("spotify", "abc", "distinct")],
+        }
+        rows = sidebar._wanted_playlist_rows()
+        titles = [title for title, params, art in rows]
+        self.assertEqual(titles.count("Focus"), 2)
+        self.assertNotIn("dupe", titles)
+        self.assertIn("distinct", titles)
+        with patch.object(type(self.ctx.store), "supports", return_value=False):
+            offline = sidebar._wanted_playlist_rows()
+            self.assertEqual(len(offline), 1)
+            self.assertEqual(offline[0][1]["playlist_info"], info)
+
     def test_grid_sections_and_navigation(self):
         page = self.show(PlaylistsPage(self.ctx))
         self.wait(lambda: "local" in page.sections and page.sections["local"].keys
@@ -969,7 +1082,7 @@ class WebOnlySpotifyTest(PageCase):
         hits = page.results_playlists
         self.assertEqual([h.id for h in hits], ["37i9dQZF1DXfake0001", "37i9dQZF1DXfake0002"])
         self.assertTrue(all(h.provider == "spotify" for h in hits))
-        page.playlists_grid.get_child_at_index(0).get_child().emit("clicked")
+        page.playlists_grid.get_child_at_index(0).get_child().card.emit("clicked")
         self.assertEqual(self.window_stub.pages[-1][1]["provider"], "spotify")
         self.assertEqual(self.window_stub.pages[-1][1]["id"], "37i9dQZF1DXfake0001")
 

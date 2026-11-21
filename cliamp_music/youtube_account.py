@@ -575,3 +575,40 @@ def add_tracks(playlist_id: str, video_ids: Iterable[str]) -> int:
         added += 1
 
     return added
+
+
+def save_playlist_to_library(playlist_id: str) -> None:
+    if not isinstance(playlist_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", playlist_id):
+        raise YouTubeAccountError("無効なプレイリストIDです")
+    try:
+        from ytmusicapi import YTMusic
+        from ytmusicapi.helpers import initialize_headers
+        import requests
+    except ImportError:
+        raise YouTubeAccountError("依存関係の読み込みに失敗しました") from None
+
+    class _NoRedirectSession(requests.Session):
+        def request(self, method, url, **kwargs):
+            kwargs["allow_redirects"] = False
+            kwargs["timeout"] = HTTP_TIMEOUT
+            return super().request(method, url, **kwargs)
+
+    auth = dict(initialize_headers())
+    auth["Authorization"] = "Bearer " + _get_access_token()
+    auth["X-Goog-Request-Time"] = str(int(time.time()))
+
+    try:
+        with _NoRedirectSession() as session:
+            yt = YTMusic(auth=auth, requests_session=session)
+            resp = yt.rate_playlist(playlist_id, "LIKE")
+            if not isinstance(resp, dict) or "error" in resp:
+                raise YouTubeAccountError("YouTube Music で保存結果を確認してください")
+            lib = yt.get_library_playlists(limit=None)
+            if not isinstance(lib, list) or not any(
+                isinstance(p, dict) and p.get("playlistId") == playlist_id for p in lib
+            ):
+                raise YouTubeAccountError("YouTube Music で保存結果を確認してください")
+    except YouTubeAccountError:
+        raise
+    except Exception:
+        raise YouTubeAccountError("YouTube Music で保存結果を確認してください") from None

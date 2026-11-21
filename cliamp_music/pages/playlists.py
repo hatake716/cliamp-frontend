@@ -65,6 +65,7 @@ from ..widgets import (  # noqa: E402
     TrackRow,
     format_count,
 )
+from .playlist_save import PlaylistSaveButton, playlist_card_with_save
 from .home import (  # noqa: E402
     DETAIL_LIST_SIDE,
     OFFLINE_TEXT,
@@ -187,10 +188,12 @@ class PlaylistsPage(PageBase):
         self.sections: dict[str, _ProviderSection] = {}
         self._native_ytmusic = False
         self._section_versions = {}
+        self._build_saved_section()
         self.body.append(self.state)
         self._serial = 0
         self.watch(ctx.store, "connection-changed", self._on_connection)
         if isinstance(ctx, GObject.Object):
+            self.watch(ctx, "saved-playlists-changed", self._on_saved_changed)
             self.watch(ctx, "local-playlists-changed", self._on_local_changed)
             if GObject.signal_lookup("account-playlists-changed", type(ctx)):
                 self.watch(ctx, "account-playlists-changed", self._on_account_changed)
@@ -199,7 +202,67 @@ class PlaylistsPage(PageBase):
 
     # --- 読み込み ---------------------------------------------------------------
 
+    def _build_saved_section(self) -> None:
+        self.saved_section = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.saved_section.add_css_class("music-playlists-section")
+        header = SectionHeader("このPCに保存したプレイリスト")
+        self.saved_section.append(self.inset(header))
+        saved_grid = AdaptiveGrid(min_size=150, max_size=200)
+        saved_grid.add_css_class("music-playlists-grid")
+        self.saved_grid = saved_grid
+        self.saved_section.append(self.inset(saved_grid))
+        self._saved_infos = None
+        self.body.append(self.saved_section)
+        self._on_saved_changed()
+
+    def _on_saved_changed(self, *_args) -> None:
+        infos = tuple(self.ctx.saved_playlists())
+        if infos == self._saved_infos:
+            return
+        self._saved_infos = infos
+        grid = self.saved_grid
+        child = grid.get_first_child()
+        while child:
+            next_child = child.get_next_sibling()
+            grid.remove(child)
+            child = next_child
+        self.saved_section.set_visible(bool(infos))
+        for info in infos:
+            subject = info.image or ("placeholder", f"{info.provider}:{info.id}", "playlist")
+            service = "Spotify" if info.provider == "spotify" else "YouTube Music"
+            parts = [service]
+            if info.owner:
+                parts.append(info.owner)
+            if info.track_count:
+                parts.append(format_count(info.track_count))
+            subtitle = " · ".join(parts)
+            card = MediaCard(
+                self.ctx.artwork,
+                subject,
+                info.name,
+                subtitle,
+                CARD,
+                kind="playlist",
+                on_activate=weak_handler(self._on_saved_card),
+            )
+            card.playlist_info = info
+            grid.append_card(playlist_card_with_save(self.ctx, card, info))
+
+    def _on_saved_card(self, card):
+        info = card.playlist_info
+        self.ctx.navigate(
+            "playlist",
+            provider=info.provider,
+            id=info.id,
+            name=info.name,
+            playlist_info=info,
+        )
+
+    def on_resync(self):
+        self._on_saved_changed()
+
     def load(self, force: bool = False) -> None:
+        self._on_saved_changed()
         store = self.ctx.store
         self._update_import_button()
         self._update_sync_all_button()
@@ -474,7 +537,8 @@ class PlaylistDetailPage(PageBase):
     PAGE_ID = "playlist"
     TITLE = "プレイリスト"
 
-    def __init__(self, ctx, provider: str = "", id: str = "", name: str = "", **_params):
+    def __init__(self, ctx, provider: str = "", id: str = "", name: str = "",
+                 *, playlist_info: PlaylistInfo | None = None, **_params):
         playlist_id = id or name or ""
         playlist_name = name or id or ""
         super().__init__(ctx, title=playlist_name or self.TITLE)
@@ -492,6 +556,12 @@ class PlaylistDetailPage(PageBase):
 
         self.header = DetailHeader(ctx, on_shuffle=weak_call(self.shuffle), on_play=weak_call(self.play_first),
                                    menu_factory=weak_call(self._menu))
+        self.save_button = None
+        if (playlist_info is not None and playlist_info.provider in {"url", "spotify"}
+                and (playlist_info.provider, playlist_info.id) == (self.provider, self.playlist_id)):
+            self.save_button = PlaylistSaveButton(ctx, playlist_info)
+            self.save_button.set_valign(Gtk.Align.CENTER)
+            self.header.buttons.insert_child_after(self.save_button, self.header.play_button)
         self.header.set_title(self.playlist_name or self.TITLE)
         self.header.set_subtitle(provider_label(ctx, self.provider))
         self.header.set_info("")

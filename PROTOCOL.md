@@ -288,6 +288,7 @@ TrackInfo の `path` のまま) を付けると、cliamp はその曲か確か�
 | `history` | `limit` (既定 50) | `tracks` (新しい順、`played_at` 付き) |
 | `playlist_add` | `name`, `tracks` | `{ok}` (ローカルのプレイリスト `~/.config/cliamp/playlists/<name>.toml` に追加。無ければ作る。TOML に残る欄は上の「型」を参照。`<name>.toml` が 255 バイト (NAME_MAX) を超える名前は `open …/<name>.toml: file name too long`。GUI は名前 250 バイトまでに抑える) |
 | `spotify_destinations` | なし | `playlists`（編集できる Spotify プレイリストの `id` と `name`） |
+| `save_playlist_to_library` | `provider="spotify"`, `id`（元のプレイリストの ID） | サインイン中の Spotify ライブラリに元のプレイリストを保存する。同一 ID を再度指定できる。GUI は `capabilities.commands` を確認してから呼び出す。 |
 | `spotify_save` | 既存の `id` または新規の `name`、`tracks` | `id`、確定した `added`、`skipped`。作成は非公開。途中で失敗したときも、作成済みの ID と確定件数を返す |
 | `playlist_delete` | `name` | `{ok}` (無ければ `remove …/<name>.toml: no such file or directory`) |
 | `playlist_remove_track` | `name`, `index`, `path` | `{ok}` (`path` は上の「添字の確かめ」)。**最後の曲を外すと、プレイリストのファイルごと消える** (external/local の RemoveTrack)。その後の `tracks` は `open …/<name>.toml: no such file or directory`、`playlists` にも出ない |

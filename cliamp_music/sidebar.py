@@ -39,7 +39,7 @@ gi.require_version("Adw", "1")
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk, Pango  # noqa: E402
 
 from .pages import Bindings, page_key  # noqa: E402
-from .protocol import SPOTIFY_OWNER_PREMIUM, Response, is_spotify_owner_premium_required  # noqa: E402
+from .protocol import SPOTIFY_OWNER_PREMIUM, Response, is_spotify_owner_premium_required, public_playlist_key  # noqa: E402
 from .widgets import Artwork  # noqa: E402
 
 # (ページ ID, 表示名, 記号, 節)
@@ -87,7 +87,7 @@ class SidebarRow(Gtk.ListBoxRow):
     __gtype_name__ = "CliampMusicSidebarRow"
 
     def __init__(self, page_id: str, title: str, *, icon_name: str | None = None, section: str = "",
-                 params: dict | None = None, art: tuple | None = None, loader=None, tooltip: str | None = None):
+                 params: dict | None = None, art: str | tuple | None = None, loader=None, tooltip: str | None = None):
         super().__init__()
         self.page_id = page_id
         self.params = dict(params or {})
@@ -207,6 +207,7 @@ class Sidebar(Adw.Bin):
         self.set_child(view)
 
         self._bindings = Bindings(self, on_rebind=self._rebuild_all)
+        self._bindings.add(ctx, "saved-playlists-changed", self._on_local_playlists)
         self._bindings.add(ctx, "local-playlists-changed", self._on_local_playlists)
         self._bindings.add(ctx.store, "connection-changed", self._on_connection)
         self._rebuild_playlists()
@@ -549,15 +550,35 @@ class Sidebar(Adw.Bin):
 
     def _wanted_playlist_rows(self) -> list[tuple[str, dict, str]]:
         out = []
-        store = self.ctx.store
-        if store.connected and store.supports("playlists"):
+        online = self.ctx.store.connected and self.ctx.store.supports("playlists")
+        seen = set()
+
+        if online:
             for name in self.ctx.local_playlists:
                 out.append((name, {"provider": "local", "id": name, "name": name}, f"local:{name}"))
+
+        for info in self.ctx.saved_playlists():
+            params = {"provider": info.provider, "id": info.id, "name": info.name}
+            params["playlist_info"] = info
+            art_key = f"{info.provider}:{info.id}"
+            key = public_playlist_key(info.provider, info.id)
+            if key:
+                seen.add(key)
+            out.append((info.name or info.id, params, art_key))
+
+        if online:
             for key in self._provider_order:
                 for info in self._provider_lists.get(key, []):
-                    out.append((info.name or info.id,
-                                {"provider": info.provider or key, "id": info.id, "name": info.name or info.id},
-                                f"{info.provider or key}:{info.id}"))
+                    provider = info.provider or key
+                    identity = public_playlist_key(provider, info.id) or (provider, info.id)
+                    if provider in ("ytmusic", "yt", "youtube", "youtube-account"):
+                        identity = public_playlist_key("url", info.id) or ("url", info.id)
+                    if identity in seen:
+                        continue
+                    seen.add(identity)
+                    name = info.name or info.id
+                    out.append((name, {"provider": provider, "id": info.id, "name": name}, f"{provider}:{info.id}"))
+
         return out
 
     def _rebuild_playlists(self) -> None:
@@ -576,7 +597,8 @@ class Sidebar(Adw.Bin):
         self._playlist_rows = []
         for title, params, art_key in wanted:
             row = SidebarRow("playlist", title, section="playlists", params=params,
-                             art=("placeholder", art_key, "playlist"), loader=self.ctx.artwork)
+                             art=getattr(params.get("playlist_info"), "image", "") or ("placeholder", art_key, "playlist"),
+                             loader=self.ctx.artwork)
             self.list.append(row)
             self._playlist_rows.append(row)
         if action:

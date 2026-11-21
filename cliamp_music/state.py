@@ -1,7 +1,7 @@
 """アプリ自身の保存値 (~/.local/state/cliamp-music/state.json)。
 
-再生の状態は cliamp が持つので、ここには画面の都合 (最近の検索、窓の大きさ、
-開いていた右パネルなど) だけを置く。壊れていても読めなくても既定値で起動する。
+再生の状態は cliamp が持つので、ここには検索から保存したプレイリストの参照と画面設定
+(最近の検索、窓の大きさ、開いていた右パネルなど) を置く。壊れていても読めなくても既定値で起動する。
 書き込みは一時ファイルに書いてから置き換える (途中で落ちても壊れない)。
 """
 
@@ -10,10 +10,11 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+from dataclasses import asdict
 from typing import Any
 
 from . import log
-from .protocol import fold_text
+from .protocol import PlaylistInfo, fold_text, parse_playlist_hits, public_playlist_key
 
 MAX_RECENT_SEARCHES = 12
 RIGHT_PANELS = ("", "lyrics", "queue")
@@ -43,6 +44,7 @@ class GuiState:
         self.window_height: int = 760
         self.window_maximized: bool = False
         self.extra: dict[str, Any] = {}
+        self._saved_playlists: dict[tuple[str, str], PlaylistInfo] = {}
         self.load()
 
     # --- 読み書き -----------------------------------------------------------------
@@ -59,6 +61,7 @@ class GuiState:
         if not isinstance(data, dict):
             log(f"{self.path} の形が違うので既定値で始めます")
             return
+        self._load_saved_playlists(data.get("saved_playlists", []))
         searches = data.get("recent_searches")
         if isinstance(searches, list):
             self.recent_searches = [s for s in searches if isinstance(s, str) and s.strip()][:MAX_RECENT_SEARCHES]
@@ -90,6 +93,7 @@ class GuiState:
             "window_height": int(self.window_height),
             "window_maximized": bool(self.window_maximized),
             "extra": self.extra,
+            "saved_playlists": [asdict(hit) for hit in self._saved_playlists.values()],
         }
 
     def save(self) -> bool:
@@ -116,6 +120,67 @@ class GuiState:
                     os.unlink(tmp)
                 except OSError:
                     pass
+
+    def _load_saved_playlists(self, raw: object) -> None:
+        """
+        保存済みプレイリストを canonical key でインデックス化して復元する。
+        不正な型や重複は無視し、最初の有効な要素のみ保持する。
+        """
+        self._saved_playlists = {}
+        if not isinstance(raw, list):
+            return
+
+        for hit in parse_playlist_hits({"playlists": raw}):
+            key = public_playlist_key(hit.provider, hit.id)
+            if key is None:
+                continue
+            if key not in self._saved_playlists:
+                self._saved_playlists[key] = hit
+
+    def saved_playlists(self) -> list[PlaylistInfo]:
+        """保存済みプレイリストの新しいリストを挿入順で返す。"""
+        return list(self._saved_playlists.values())
+
+    def is_playlist_saved(self, provider: str, identifier: str) -> bool:
+        """指定 provider/id が保存済みかどうかを canonical key で判定する。"""
+        key = public_playlist_key(provider, identifier)
+        if key is None:
+            return False
+        return key in self._saved_playlists
+
+    def set_playlist_saved(self, hit: PlaylistInfo, saved: bool) -> bool:
+        """
+        プレイリストの保存状態を変更し、永続化に成功すれば True を返す。
+        不正な入力や IO 失敗時は False を返す。
+        """
+        if not isinstance(hit, PlaylistInfo):
+            return False
+
+        key = public_playlist_key(hit.provider, hit.id)
+        if key is None:
+            return False
+
+        current = self._saved_playlists.get(key)
+        if saved:
+            if current is not None:
+                return True
+        else:
+            if current is None:
+                return True
+
+        previous = self._saved_playlists
+        new_dict = dict(previous)
+        if saved:
+            new_dict[key] = hit
+        else:
+            new_dict.pop(key, None)
+
+        self._saved_playlists = new_dict
+        if not self.save():
+            self._saved_playlists = previous
+            return False
+
+        return True
 
     # --- 最近の検索 -----------------------------------------------------------------
 

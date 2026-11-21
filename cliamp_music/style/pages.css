@@ -163,6 +163,21 @@ window.music menubutton.music-circle-menu > button:active,
 window.music menubutton.music-circle-menu > button:checked { background-color: var(--m-fill-active); }
 window.music menubutton.music-circle-menu > button:disabled { color: var(--m-tertiary); }
 
+window.music menubutton.playlist-card-save > button {
+  background-color: var(--m-glass);
+  color: var(--m-key-text);
+  box-shadow: var(--m-glass-small-shadow);
+}
+
+window.music menubutton.playlist-card-save > button:hover {
+  background-color: var(--m-glass-hover);
+}
+
+window.music menubutton.playlist-card-save > button:active,
+window.music menubutton.playlist-card-save > button:checked {
+  background-color: var(--m-glass-active);
+}
+
 /* ------------------------------------------------------------------
  * 検索
  * ------------------------------------------------------------------ */

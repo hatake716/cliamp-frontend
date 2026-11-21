@@ -14,6 +14,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from cliamp_music import state as state_mod  # noqa: E402
+from cliamp_music.protocol import PlaylistInfo
 from cliamp_music.state import GuiState  # noqa: E402
 
 
@@ -27,6 +28,44 @@ class GuiStateTest(unittest.TestCase):
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
         with open(self.path, "w", encoding="utf-8") as handle:
             handle.write(text)
+
+    def test_saved_playlists_survive_restart_and_deduplicate_youtube_urls(self):
+        spotify = PlaylistInfo("spotify", "4dwAa9994411BByyLLxxaa", "週末", 12, owner="作者", image="https://example.com/a")
+        youtube = PlaylistInfo("url", "https://music.youtube.com/playlist?list=PLtest_1", "ランニング", 3)
+        alias = PlaylistInfo("url", "https://www.youtube.com/watch?v=123&list=PLtest_1", "別表示")
+        self.write(json.dumps({"recent_searches": ["以前の検索"], "extra": {"unchanged": 4}}))
+        state = GuiState(self.path)
+        self.assertEqual(state.saved_playlists(), [])
+        for item in (spotify, youtube, alias):
+            self.assertTrue(state.set_playlist_saved(item, True))
+        self.assertEqual(state.saved_playlists(), [spotify, youtube])
+        reloaded = GuiState(self.path)
+        self.assertEqual(reloaded.recent_searches, ["以前の検索"])
+        self.assertEqual(reloaded.get("unchanged"), 4)
+        self.assertEqual(reloaded.saved_playlists(), [spotify, youtube])
+        self.assertTrue(reloaded.is_playlist_saved(alias.provider, alias.id))
+        self.assertTrue(reloaded.set_playlist_saved(alias, False))
+        self.assertEqual(GuiState(self.path).saved_playlists(), [spotify])
+
+    def test_saved_playlist_write_failure_restores_order_and_previous_disk_value(self):
+        state = GuiState(self.path)
+        first, second = (PlaylistInfo("spotify", key, key) for key in ("first", "second"))
+        for item in (first, second):
+            self.assertTrue(state.set_playlist_saved(item, True))
+        with mock.patch.object(os, "replace", side_effect=OSError("readonly")), mock.patch.object(state_mod, "log"):
+            self.assertFalse(state.set_playlist_saved(first, False))
+            self.assertFalse(state.set_playlist_saved(PlaylistInfo("spotify", "third", "third"), True))
+        self.assertEqual(state.saved_playlists(), [first, second])
+        self.assertEqual(GuiState(self.path).saved_playlists(), [first, second])
+
+    def test_saved_playlist_load_ignores_invalid_refs_and_duplicates(self):
+        urls = ["file:///tmp/test", "https://youtube.com:bad/playlist?list=PLtest",
+                "https://youtube.com.evil.invalid/playlist?list=PLtest", "https://youtube.com/playlist?list="]
+        a = {"provider": "url", "id": "https://youtube.com/playlist?list=PLtest", "name": "正本"}
+        b = {"provider": "url", "id": "https://music.youtube.com/playlist?list=PLtest", "name": "別名"}
+        self.write(json.dumps({"saved_playlists": [a, b, *[dict(a, id=url) for url in urls],
+                                                  {"provider": "local", "id": "does-not-belong"}]}))
+        self.assertEqual(GuiState(self.path).saved_playlists(), [PlaylistInfo("url", a["id"], "正本")])
 
     def test_defaults_when_missing(self):
         state = GuiState(self.path)

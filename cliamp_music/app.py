@@ -150,6 +150,7 @@ class MusicApp(Adw.Application):
         self.css_errors: list[str] = []
         self._glass: list[glass.GlassStyle] = []
         self._text_input_active = False
+        self._pending_account_saves = 0
         self._main_shown_once = False
         self._quitting = False
 
@@ -290,7 +291,21 @@ class MusicApp(Adw.Application):
             return
         GLib.idle_add(self._quit_idle)
 
+    def begin_account_save(self) -> None:
+        self._pending_account_saves += 1
+        self.hold()
+
+    def end_account_save(self) -> None:
+        if self._pending_account_saves <= 0:
+            return
+        self._pending_account_saves -= 1
+        if self._pending_account_saves == 0:
+            self._quit_if_nothing_visible()
+        self.release()
+
     def _quit_idle(self) -> bool:
+        if self._pending_account_saves > 0:
+            return GLib.SOURCE_REMOVE
         if not any(w.get_visible() for w in self.get_windows()):
             self.quit_app()
         return GLib.SOURCE_REMOVE

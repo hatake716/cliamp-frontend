@@ -50,7 +50,10 @@ CONNECT_TIMEOUT = 3.0
 MAX_WORKERS = 4  # カタログの列
 READ_WORKERS = 2  # 状態の読み取りの列
 # 先に送るカタログ系 (利用者が押した操作。裏の読み込みの後ろに並ばせない)
-URGENT_CATALOG = frozenset({"load_provider", "playlist_add", "playlist_delete", "playlist_remove_track", "spotify_save"})
+URGENT_CATALOG = frozenset({
+    "load_provider", "playlist_add", "playlist_delete", "playlist_remove_track", "spotify_save",
+    "save_playlist_to_library",
+})
 
 
 def default_socket_path() -> str:
