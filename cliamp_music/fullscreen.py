@@ -36,6 +36,8 @@ from .artwork import placeholder_colors  # noqa: E402
 from .protocol import (  # noqa: E402
     VOLUME_MIN_DB,
     Lyrics,
+    Response,
+    lyrics_query,
     Status,
     Track,
     format_time,
@@ -165,28 +167,7 @@ def time_texts(position: float, duration: float) -> tuple[str, str]:
 
 
 def lyrics_subject(status: Status) -> tuple[str, str] | None:
-    """歌詞を探す (アーティスト, 曲名)。探せないときは None。
-
-    ラジオ (live) は ICY の曲名が「アーティスト - 曲名」の形のときだけ探す。
-    """
-    track = status.track
-    if track is None:
-        return None
-    icy = (status.stream_title or "").strip()
-    if icy:
-        for sep in (" - ", " – ", " — ", " / "):
-            if sep in icy:
-                artist, title = icy.split(sep, 1)
-                artist, title = artist.strip(), title.strip()
-                if artist and title:
-                    return artist, title
-        return None
-    if track.live:
-        return None
-    title = track.title.strip() or track.display_title
-    if not title:
-        return None
-    return track.artist.strip(), title
+    return lyrics_query(status.track, status.stream_title)
 
 
 def _attach_app(window: Gtk.Window, app) -> None:
@@ -1878,6 +1859,7 @@ class FullscreenPlayer(Gtk.Box):
             if mode == "queue":
                 self.queue.refresh()
             else:
+                self._lyrics_key = None
                 self._refresh_lyrics()
 
     def _on_switch(self, button: Gtk.ToggleButton, mode: str) -> None:
@@ -2015,6 +1997,7 @@ class FullscreenPlayer(Gtk.Box):
         store = self.ctx.store
         status = store.status
         subject = lyrics_subject(status)
+
         if status.state == "offline":
             key = ("offline",)
         elif status.track is None:
@@ -2024,12 +2007,16 @@ class FullscreenPlayer(Gtk.Box):
         elif subject is None:
             key = ("live",) if status.is_live else ("none",)
         else:
-            key = ("lyrics",) + subject
+            # key に spotify_id を含める
+            key = ("lyrics", *subject, status.track.spotify_id, status.is_live)
+
         if key == self._lyrics_key:
             return
+
         self._lyrics_key = key
         self._lyrics_token += 1
         token = self._lyrics_token
+
         if key[0] != "lyrics":
             self.lyrics.set_lyrics(None)
             self._show_lyrics_message({
@@ -2039,23 +2026,33 @@ class FullscreenPlayer(Gtk.Box):
                 "live": "この放送の歌詞はありません",
             }[key[0]])
             return
-        self._show_lyrics_message("")
 
-        def done(lyrics: Lyrics | None) -> None:
-            if token != self._lyrics_token or not self._active:
+        self._show_lyrics_message("歌詞を探しています…")
+
+        def done(result: Lyrics | None | Response) -> None:
+            if token != self._lyrics_token or not self._active or self._mode != "lyrics":
                 return
-            if lyrics is None or not lyrics.lines:
+
+            if isinstance(result, Response):
+                self.lyrics.set_lyrics(None)
+                self._show_lyrics_message("歌詞を取得できませんでした。歌詞を開き直すと再試行できます。")
+                return
+
+            if result is None or not result.lines:
                 self.lyrics.set_lyrics(None)
                 self._show_lyrics_message("歌詞が見つかりません")
                 return
+
+            lyrics = result
             if self.ctx.store.status.is_live and lyrics.synced:
                 # ラジオでは曲の中の位置が分からないので、時刻は使わずに並べるだけにする
                 lyrics = Lyrics(lines=list(lyrics.lines), synced=False)
+
             self.lyrics.set_position(self.ctx.store.position_now())
             self.lyrics.set_lyrics(lyrics)
             self._lyrics_stack.set_visible_child_name("lines")
 
-        self.ctx.catalog.lyrics(subject[0], subject[1], done)
+        self.ctx.catalog.lyrics_result(subject[0], subject[1], done, spotify_id=status.track.spotify_id)
 
     def _show_lyrics_message(self, text: str) -> None:
         _set_text(self.lyrics_message, text)

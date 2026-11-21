@@ -33,6 +33,7 @@ let
   pythonEnv = python3.withPackages (pythonPackages: [
     pythonPackages.pygobject3
     pythonPackages.mutagen
+    pythonPackages.ytmusicapi
   ]);
   appId = "org.nixos.Music";
   appDir = "share/${appId}";

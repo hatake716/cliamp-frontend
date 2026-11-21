@@ -7,7 +7,7 @@
 - 22px/700 の行。今の行は明るく、他は 3 次色。今の行を上から 1/3 に保って滑らかに送る。
   行を押すとその時刻へ seek_to。同期していない歌詞は全行同じ色で送らない。
 - 状態: 読み込み中 / 見つからない / 同期なし / 拡張なし (api 0) / ラジオ (ICY の曲名で探す)。
-- 曲ごとに結果を覚える (最大 64 曲)。
+- 検索結果は全画面と共通のカタログで保持する。
 
 次に再生 (フルスクリーンの UpNextView と Apple の「次に再生」と同じ組み立て):
 - 上に横長のカプセル「シャッフル」「リピート」(オンで赤の塗り)。
@@ -30,7 +30,6 @@ from __future__ import annotations
 
 import time
 import weakref
-from collections import OrderedDict
 
 import gi
 
@@ -39,10 +38,9 @@ gi.require_version("Adw", "1")
 from gi.repository import Adw, GLib, Gtk, Pango  # noqa: E402
 
 from .pages import Bindings  # noqa: E402
-from .protocol import Lyrics, Track, track_key  # noqa: E402
+from .protocol import Lyrics, Response, Track, lyrics_query, track_key  # noqa: E402
 from .widgets import EmptyState, LoadingState, SectionHeader, TrackList, TrackRow  # noqa: E402
 
-LYRICS_CACHE_SIZE = 64
 HISTORY_ROWS = 10
 # 次に再生の行を一度に作る数 (残りは idle で少しずつ)
 QUEUE_SYNC_ROWS = 30
@@ -58,40 +56,6 @@ CURRENT_LINE_FRACTION = 1 / 3
 def _animations_enabled(widget: Gtk.Widget) -> bool:
     settings = widget.get_settings() or Gtk.Settings.get_default()
     return bool(settings is None or settings.get_property("gtk-enable-animations"))
-
-
-def split_icy_title(text: str) -> tuple[str, str]:
-    """ICY の曲名 "Artist - Title" を (アーティスト, 曲名) に。区切りが無ければ ("", 全体)。"""
-    text = (text or "").strip()
-    for sep in (" - ", " – ", " — ", " / "):
-        if sep in text:
-            artist, title = text.split(sep, 1)
-            if artist.strip() and title.strip():
-                return artist.strip(), title.strip()
-    return "", text
-
-
-def lyrics_query(track: Track | None, stream_title: str = "") -> tuple[str, str] | None:
-    """歌詞を探す (アーティスト, 曲名)。探せなければ None。
-
-    ラジオ (live) は ICY の曲名から。YouTube などで artist が無く曲名が
-    "Artist - Title" の形ならそれを分ける。"""
-    if track is None:
-        return None
-    if track.live or (track.stream and stream_title.strip()):
-        if not stream_title.strip():
-            return None
-        artist, title = split_icy_title(stream_title)
-        return (artist, title) if title else None
-    title = (track.title or "").strip()
-    artist = (track.artist or "").strip()
-    if not title:
-        return None
-    if not artist:
-        guessed_artist, guessed_title = split_icy_title(title)
-        if guessed_artist:
-            return guessed_artist, guessed_title
-    return artist, title
 
 
 def _label(text: str, css: str | tuple[str, ...] = (), *, wrap: bool = False, xalign: float = 0.0) -> Gtk.Label:
@@ -158,9 +122,7 @@ class LyricsPanel(Gtk.Box):
         self.add_css_class("music-panel")
         self.add_css_class("music-lyrics-panel")
         self._active = False
-        self._cache: OrderedDict[tuple[str, str], Lyrics | None] = OrderedDict()
-        self._query: tuple[str, str] | None = None
-        self._shown_query: tuple[str, str] | None = None
+        self._query: tuple | None = None
         self._lyrics: Lyrics | None = None
         self._lines: list[_LyricLine] = []
         self._current = -2
@@ -238,6 +200,9 @@ class LyricsPanel(Gtk.Box):
         self._active = active
         if active:
             self._refresh(force_scroll=True)
+        else:
+            self._token += 1
+            self._query = None
         self._update_ticking()
 
     def _on_map(self) -> None:
@@ -261,81 +226,102 @@ class LyricsPanel(Gtk.Box):
         if self._visible_now():
             self._refresh()
 
-    def _on_status(self, _store) -> None:
-        if not self._visible_now():
-            return
-        st = self.ctx.store.status
-        # ラジオは曲名 (ICY) が変われば探し直す
-        if st.track is not None and (st.track.live or st.track.stream):
-            query = lyrics_query(st.track, st.stream_title)
-            if query != self._query:
-                self._refresh()
-                return
-        if self._lyrics is not None and self._lyrics.synced:
-            self._update_current()
+    def _on_status(self, _store):
+        if self._visible_now():
+            self._refresh()
+            if self._lyrics and self._lyrics.synced:
+                self._update_current()
 
-    def _on_state(self, _store) -> None:
-        self._update_ticking()
-
-    def _refresh(self, force_scroll: bool = False) -> None:
+    def _refresh(self, force_scroll=False, *, force=False):
         store = self.ctx.store
+        status = store.status
+        track = status.track
+
         if not store.connected:
+            key = ("offline",)
+        elif not store.supports("lyrics"):
+            key = ("unsupported",)
+        elif not track:
+            key = ("none",)
+        else:
+            query = lyrics_query(track, status.stream_title)
+            if query is None:
+                key = ("live",) if status.is_live else ("untitled",)
+            else:
+                artist, title = query
+                key = ("lyrics", artist, title, track.spotify_id, status.is_live)
+
+        if not force and key == self._query:
+            if force_scroll and self._lyrics:
+                self._current = -2
+                self._update_current(animate=False)
+            return
+
+        self._query = key
+        self._token += 1
+        token = self._token
+
+        if key[0] == "offline":
             self._show_empty("music-lyrics-symbolic", "cliamp に接続していません", None)
             return
-        if not store.supports("lyrics"):
+        if key[0] == "unsupported":
             self._show_empty("music-lyrics-symbolic", "歌詞を表示できません",
                              "拡張 IPC の無い cliamp からは歌詞を取れません。")
             return
-        st = store.status
-        track = st.track
-        if track is None:
+        if key[0] == "none":
             self._show_empty("music-lyrics-symbolic", "再生していません", None)
             return
-        query = lyrics_query(track, st.stream_title)
-        self._query = query
-        if query is None:
+        if key[0] in ("live", "untitled"):
             if track.live:
                 self._show_empty("music-radio-symbolic", "ラジオの歌詞",
                                  "この局は曲名を送っていないため、歌詞を探せません。")
             else:
                 self._show_empty("music-lyrics-symbolic", "歌詞が見つかりません", None)
             return
-        if query == self._shown_query and self._lyrics is not None:
-            if force_scroll:
-                self._current = -2
-                self._update_current(animate=False)
-            return
-        if query in self._cache:
-            self._cache.move_to_end(query)
-            self._show_lyrics(query, self._cache[query])
-            return
-        self._token += 1
-        token = self._token
-        self._shown_query = None
+
+        artist, title = key[1], key[2]
+        spotify_id = key[3]
+
         self._lyrics = None
+        self._clear_lines()
         self.stack.set_visible_child_name("loading")
-        me = weakref.ref(self)
+        self.empty.set_button(None)
 
-        def done(lyrics: Lyrics | None) -> None:
-            this = me()
-            if this is None:
+        def done(result):
+            this = ref()
+            if this is None or not this._active:
                 return
-            this._cache[query] = lyrics
-            while len(this._cache) > LYRICS_CACHE_SIZE:
-                this._cache.popitem(last=False)
-            if token != this._token or this._query != query:
+            if key != this._query or token != this._token:
                 return
-            this._show_lyrics(query, lyrics)
 
-        self.ctx.catalog.lyrics(query[0], query[1], done)
+            if isinstance(result, Response):
+                this._show_empty("music-lyrics-symbolic", "歌詞を取得できませんでした", result.message)
+                this.empty.set_button("再試行", lambda: this._refresh(force=True))
+                return
+
+            if not result or not result.lines:
+                this._show_empty("music-lyrics-symbolic", "歌詞が見つかりません", None)
+                this.empty.set_button("再検索", lambda: this._refresh(force=True))
+                return
+
+            if status.is_live and result.synced:
+                result = Lyrics(lines=result.lines, synced=False)
+
+            this._show_lyrics((artist, title), result)
+
+        ref = weakref.ref(self)
+        self.ctx.catalog.lyrics_result(artist, title, done, spotify_id=spotify_id, force=force)
+
+    def _on_state(self, _store) -> None:
+        self._update_ticking()
 
     def _show_empty(self, icon: str, title: str, description: str | None) -> None:
         self._token += 1
-        self._shown_query = None
         self._lyrics = None
         self._clear_lines()
         self.empty.set_icon_name(icon)
         self.empty.set_title(title)
+        self.empty.set_button(None)
         self.empty.set_description(description)
         self.stack.set_visible_child_name("empty")
         self._update_ticking()
@@ -349,7 +335,6 @@ class LyricsPanel(Gtk.Box):
             else:
                 self._show_empty("music-lyrics-symbolic", "歌詞が見つかりません", None)
             return
-        self._shown_query = query
         self._lyrics = lyrics
         self._clear_lines()
         for i, line in enumerate(lyrics.lines):

@@ -339,18 +339,42 @@ class Catalog:
                     provider=provider, query=query, limit=limit)
 
     def lyrics(self, artist: str, title: str, callback: Callable[[Lyrics | None], object]) -> None:
-        """歌詞。見つからない・失敗は None (見つからない結果も 10 分覚える)。"""
+        """レガシー互換ラッパー。Lyrics または None をコールバックへ渡す。"""
+        def _wrapper(result: Lyrics | None | Response) -> object:
+            if isinstance(result, Response):
+                return callback(None)
+            return callback(result)
+        self.lyrics_result(artist, title, _wrapper)
 
-        def miss(response: Response):
+    def lyrics_result(
+        self,
+        artist: str,
+        title: str,
+        callback: Callable[[Lyrics | None | Response], object],
+        *,
+        spotify_id: str | None = None,
+        force: bool = False,
+    ) -> None:
+        """未収録は None、一時的な取得失敗は Response を返す。"""
+        def miss(response: Response) -> tuple[None, float] | None:
             if response.error == "not found":
-                return None, LYRICS_MISS_TTL
-            return None, 0.0
+                return (None, LYRICS_MISS_TTL)
+            return None
 
-        def done(result):
-            callback(result if isinstance(result, Lyrics) else None)
-
-        self._fetch(("lyrics", artist or "", title or ""), LYRICS_TTL, "lyrics", parse_lyrics, done,
-                    miss=miss, artist=artist or None, title=title or None)
+        key = ("lyrics", artist or "", title or "", spotify_id or "")
+        path = ("spotify:track:" + spotify_id) if spotify_id else None
+        self._fetch(
+            key,
+            LYRICS_TTL,
+            "lyrics",
+            parse_lyrics,
+            callback,
+            force=force,
+            miss=miss,
+            artist=artist or None,
+            title=title or None,
+            path=path,
+        )
 
     def history(self, callback: Callable[[list[Track] | Response], object], limit: int = 50, *,
                 force: bool = False) -> None:

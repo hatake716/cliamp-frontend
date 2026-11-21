@@ -321,6 +321,7 @@ class NowPlayingListPage(PageBase):
         section.append("プレイリストとして保存…", "page.save")
         menu.append_section(None, section)
         group = Gio.SimpleActionGroup()
+        self.append_playlist_choice(menu, group, self.ctx.store.playlist.tracks)
         reveal = Gio.SimpleAction.new("reveal", None)
         reveal.connect("activate", weak_call(self.reveal_current))
         reveal.set_enabled(self._current_index() is not None)

@@ -31,7 +31,7 @@ import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 gi.require_version("Gdk", "4.0")
-from gi.repository import Adw, Gdk, GLib, GObject, Gtk, Pango  # noqa: E402
+from gi.repository import Adw, Gdk, Gio, GLib, GObject, Gtk, Pango  # noqa: E402
 
 import cairo  # noqa: E402
 
@@ -81,6 +81,7 @@ PROVIDER_LABELS = {
     "spotify": "Spotify",
     "youtube": "YouTube",
     "ytmusic": "YouTube Music",
+    "youtube-account": "YouTube Music",
     "url": "YouTube",
     "radio": "ラジオ",
     "radio-browser": "ラジオ",
@@ -719,6 +720,16 @@ class PageBase(Adw.NavigationPage):
 
     def on_resync(self) -> None:
         """隠れていた後で再び表示された。隠れている間の変化に追いつく。"""
+
+    def append_playlist_choice(self, menu, group, source) -> None:
+        tracks = tuple(t for t in source if t.path and not t.live and not t.unplayable)
+        section = Gio.Menu()
+        section.append("表示中の曲をプレイリストに追加…", "page.choose-playlist")
+        menu.append_section(None, section)
+        act = Gio.SimpleAction.new("choose-playlist", None)
+        act.set_enabled(bool(tracks) and self.ctx.store.supports("playlist_add") and self.ctx.store.connected)
+        act.connect("activate", lambda _a, _v: self.ctx.choose_playlist(tracks))
+        group.add_action(act)
 
     def on_hidden(self) -> None:
         """隠れた (タイマーを止めるなど)。"""

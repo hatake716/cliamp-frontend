@@ -33,6 +33,7 @@ gi.require_version("Gsk", "4.0")
 gi.require_version("Graphene", "1.0")
 from gi.repository import Adw, Gdk, Gio, GLib, GObject, Graphene, Gsk, Gtk, Pango  # noqa: E402
 
+from .album import can_resolve_album, choose_album  # noqa: E402
 from .pages import Bindings  # noqa: E402
 from .protocol import (  # noqa: E402
     VOLUME_MIN_DB,
@@ -400,6 +401,8 @@ class PlayerBar(Adw.BreakpointBin):
         art_menu = Gio.Menu()
         art_menu.append("ミニプレーヤー", "app.miniplayer")
         art_menu.append("フルスクリーンプレーヤー", "app.fullscreen-player")
+        art_menu.append("この曲をプレイリストに追加…", "bar.save-song")
+        art_menu.append("アルバムをプレイリストに追加…", "bar.save-album")
         self.art_button.set_menu_model(art_menu)
         self.art_button.update_property([Gtk.AccessibleProperty.LABEL], ["アートワーク"])
         row.append(self.art_button)
@@ -554,6 +557,10 @@ class PlayerBar(Adw.BreakpointBin):
         second = Gio.Menu()
         second.append("再生中のリストを表示", "app.reveal-current")
         menu.append_section(None, second)
+        save = Gio.Menu()
+        save.append("この曲をプレイリストに追加…", "bar.save-song")
+        save.append("アルバムをプレイリストに追加…", "bar.save-album")
+        menu.append_section(None, save)
         links = Gio.Menu()
         links.append("リンクをコピー", "bar.copy-link")
         links.append("ブラウザで開く", "bar.open-browser")
@@ -604,6 +611,12 @@ class PlayerBar(Adw.BreakpointBin):
         browser = Gio.SimpleAction.new("open-browser", None)
         browser.connect("activate", PlayerBar._on_open_browser, self.ctx)
         group.add_action(browser)
+        save_song = Gio.SimpleAction.new("save-song", None)
+        save_song.connect("activate", self._on_save_song)
+        group.add_action(save_song)
+        save_album = Gio.SimpleAction.new("save-album", None)
+        save_album.connect("activate", self._on_save_album)
+        group.add_action(save_album)
         self.actions = group
         self.insert_action_group("bar", group)
 
@@ -860,9 +873,25 @@ class PlayerBar(Adw.BreakpointBin):
         url = track.web_url if track is not None else None
         self.actions.lookup_action("copy-link").set_enabled(bool(url))
         self.actions.lookup_action("open-browser").set_enabled(bool(url))
+        can_save = (track is not None and store.connected
+                    and store.supports("playlist_add")
+                    and not track.live
+                    and not track.unplayable and bool(track.path))
+        self.actions.lookup_action("save-song").set_enabled(can_save)
+        self.actions.lookup_action("save-album").set_enabled(can_save and can_resolve_album(track))
         self._update_texts()
         self._update_progress()
         self._update_ticking()
+
+    def _on_save_song(self, _action, _param) -> None:
+        track = self.ctx.store.current_track()
+        if track is not None:
+            self.ctx.choose_playlist((track,))
+
+    def _on_save_album(self, _action, _param) -> None:
+        track = self.ctx.store.current_track()
+        if track is not None:
+            choose_album(self.ctx, track)
 
     def _update_texts(self) -> None:
         st = self.ctx.store.status

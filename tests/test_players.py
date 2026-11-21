@@ -94,6 +94,30 @@ class HelperTest(unittest.TestCase):
         untitled = Track(path="/m/Artist/夜の歌.mp3", artist="A")
         self.assertEqual(fs_mod.lyrics_subject(Status(state="playing", track=untitled)), ("A", "夜の歌"))
 
+    def test_lyrics_subject_agreement(self):
+        from cliamp_music.panels import lyrics_query
+        track = Track(path="https://www.youtube.com/watch?v=dQw4w9WgXcQ", artist='歌手 - Topic', title='歌手 - 曲名 (Official Music Video)')
+        status = Status(state="playing", track=track)
+        expected = ('歌手', '曲名')
+        self.assertEqual(fs_mod.lyrics_subject(status), expected)
+        self.assertEqual(lyrics_query(track), expected)
+
+    def test_lyrics_subject_live_suffix(self):
+        from cliamp_music.panels import lyrics_query
+        track = Track(path="https://www.youtube.com/watch?v=dQw4w9WgXcQ", artist='歌手 - Topic', title='曲名 (Live)')
+        status = Status(state="playing", track=track)
+        expected = ('歌手', '曲名 (Live)')
+        self.assertEqual(fs_mod.lyrics_subject(status), expected)
+        self.assertEqual(lyrics_query(track), expected)
+
+    def test_lyrics_subject_spotify_uri_preserves_values(self):
+        from cliamp_music.panels import lyrics_query
+        track = Track(path="spotify:track:" + "a" * 22, artist='Artist', title='One - Live')
+        status = Status(state="playing", track=track)
+        expected = ('Artist', 'One - Live')
+        self.assertEqual(fs_mod.lyrics_subject(status), expected)
+        self.assertEqual(lyrics_query(track), expected)
+
     def test_volume_mapping_is_shared_with_the_bar(self):
         from cliamp_music import protocol
 
@@ -713,6 +737,23 @@ class PanelsTest(PlayerTestBase):
         self.assertTrue(run_loop(lambda: self.fake.pl.index() == 7 and not self.fake.pl.queue, 5.0))
         self.assertEqual(self.fake.requests_for("play_index"), [])
         self.assertTrue(run_loop(lambda: not panel.queue_header.get_visible(), 3.0))
+
+    def test_lyrics_retry_recovers_from_a_transient_lookup_failure(self):
+        from cliamp_music.panels import LyricsPanel
+
+        panel = LyricsPanel(self.ctx)
+        self.host(panel)
+        self.play(0, at=7.0)
+        lookup = self.fake._cmd_lyrics
+        self.fake._cmd_lyrics = lambda req, now: {"ok": False, "error": "lrclib: temporary error"}
+        panel.set_active(True)
+        self.assertTrue(run_loop(lambda: panel.empty.button is not None
+                                 and panel.empty.button.get_visible(), 3))
+        self.assertEqual(panel.empty.title_label.get_text(), "歌詞を取得できませんでした")
+        self.fake._cmd_lyrics = lookup
+        panel.empty.button.emit("clicked")
+        self.assertTrue(run_loop(lambda: bool(panel._lines) and panel._current >= 0, 4))
+        self.assertEqual(len(self.fake.requests_for("lyrics")), 2)
 
     def test_lyrics_scroller_shows_no_scrollbar(self):
         from cliamp_music.panels import LyricsPanel

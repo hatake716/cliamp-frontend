@@ -168,7 +168,8 @@ class Menu(ContextTest):
         model, group = self.ctx.track_menu(YT, index=4, context="nowplaying")
         items = menu_items(model)
         labels = [label for label, _, _ in items]
-        self.assertEqual(labels, ["次に再生", "最後に再生", "プレイリストに追加", "ドライブ", "Focus",
+        self.assertEqual(labels, ["次に再生", "最後に再生", "この曲をプレイリストに追加…",
+                                  "アルバムをプレイリストに追加…", "このPCのプレイリストに追加", "ドライブ", "Focus",
                                   "新規プレイリスト…", "ステーションを作成", "リンクをコピー", "ブラウザで開く",
                                   "リストから削除"])
         self.assertIn(("ドライブ", "track.add-to-playlist", "ドライブ"), items)
@@ -176,6 +177,13 @@ class Menu(ContextTest):
                      "copy-link", "open-browser", "remove"):
             self.assertTrue(group.has_action(name), name)
             self.assertTrue(group.get_action_enabled(name), name)
+
+    def test_song_chooser_keeps_the_track_from_the_open_menu(self):
+        _, actions = self.ctx.track_menu(YT)
+        self.ctx.store.status.track = LOCAL
+        with mock.patch.object(self.ctx, "choose_playlist") as choose:
+            actions.activate_action("choose-playlist", None)
+            choose.assert_called_once_with((YT,))
 
     def test_actions(self):
         model, group = self.ctx.track_menu(YT, index=4, context="nowplaying")

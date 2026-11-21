@@ -63,9 +63,10 @@ GUI から cliamp へ曲を渡すとき (`replace` / `enqueue` / `playlist_add`)
 `history` の history.toml) は往復で欠ける:
 
 - ローカルのプレイリストに残るのは path (UTF-8 でない名前もそのまま)・title・artist・album・
-  genre・year・track_number・duration・feed・bookmark だけ。`history` はさらに feed と
+  genre・year・track_number・duration・feed・bookmark。`history` はさらに feed と
   bookmark も持たない。
-- `live`・`meta`・`unplayable` は残らない。`stream` は持ち越さず、読み戻すときに path が
+- このPCの 2.4.0 版は保存時に、有効な `spotify.id`・`spotify.album_id` と、曲 ID に対応する `spotify.bridge=youtube` を残す。
+  その他の `meta`・`live`・`unplayable` は保存対象外。`stream` は持ち越さず、読み戻すときに path が
   URL (http(s) か yt-dlp の検索式) かで決め直す。
 - そのため GUI はラジオの局 (live) を「プレイリストに追加」させない (読み戻すと局の絵も
   「ライブ」の印も失う)。
@@ -282,9 +283,11 @@ TrackInfo の `path` のまま) を付けると、cliamp はその曲か確か�
 | `search` | `provider` (省略で `youtube`), `query`, `limit` (既定 25、最大 50) | `tracks` |
 | `search_playlists` | `provider` (省略で `youtube`), `query`, `limit` (既定 10、最大 30) | `playlists` ([PlaylistHit]、該当なしは `[]`)。下の「プレイリストの検索」 |
 | `load_provider` | `provider`, `id`, `index`, `name` | `total`, `gen` (`tracks` の結果で `replace` する。`source` は `{provider, id, name}`。`index` が範囲外なら何も替えずに `index out of range`)。プロバイダーに取り直させて添字で選ぶので、GUI は見えている並びがあるときは `replace` で送る (見た後でリストが変わっていても、見た曲を鳴らすため) |
-| `lyrics` | `artist`, `title` | `lyrics`, `synced` / `error: "not found"` |
+| `lyrics` | `artist`, `title`、任意の `path`（Spotify の曲 URI） | `lyrics`, `synced` / `error: "not found"` |
 | `history` | `limit` (既定 50) | `tracks` (新しい順、`played_at` 付き) |
 | `playlist_add` | `name`, `tracks` | `{ok}` (ローカルのプレイリスト `~/.config/cliamp/playlists/<name>.toml` に追加。無ければ作る。TOML に残る欄は上の「型」を参照。`<name>.toml` が 255 バイト (NAME_MAX) を超える名前は `open …/<name>.toml: file name too long`。GUI は名前 250 バイトまでに抑える) |
+| `spotify_destinations` | なし | `playlists`（編集できる Spotify プレイリストの `id` と `name`） |
+| `spotify_save` | 既存の `id` または新規の `name`、`tracks` | `id`、確定した `added`、`skipped`。作成は非公開。途中で失敗したときも、作成済みの ID と確定件数を返す |
 | `playlist_delete` | `name` | `{ok}` (無ければ `remove …/<name>.toml: no such file or directory`) |
 | `playlist_remove_track` | `name`, `index`, `path` | `{ok}` (`path` は上の「添字の確かめ」)。**最後の曲を外すと、プレイリストのファイルごと消える** (external/local の RemoveTrack)。その後の `tracks` は `open …/<name>.toml: no such file or directory`、`playlists` にも出ない |
 
@@ -419,9 +422,8 @@ after <長さ>` (`Retry-After` が無いか読めなければ `; retry after …
   developer.spotify.com/dashboard): http status 403 Forbidden: {…}`。ほかの誤りは従来どおり `spotify: search: …`。
 - Spotify のプレイリストへの追加は `POST /v1/playlists/{id}/items` (`{"uris": […]}`)、作成は
   `POST /v1/me/playlists` (`{"name": …, "public": false}`。利用者 ID を `/v1/me` に尋ねなくなった) を使う。
-  取り除かれた `POST /v1/playlists/{id}/tracks` と `POST /v1/users/{id}/playlists` は使わない。使うのは TUI の
-  「Spotify のプレイリストへ追加」「新しいプレイリスト」だけで、IPC のコマンドは Spotify のプレイリストを
-  書き換えない (`playlist_add` はローカルのプレイリスト)。
+  このPCの GUI は `spotify_save` で同じプロバイダーに書き込みを委ねる。
+  `playlist_add` はローカルのプレイリストに書き込む。
 - ほかの呼び出し (`GET /v1/me` の `id`、`GET /v1/me/tracks`、`GET /v1/me/playlists`、
   `GET /v1/playlists/{id}/items`) はこの変更の影響を受けない。プレイリストの中身が読めるのは自分の・共同編集の
   ものだけ (従来どおり、それ以外は `playlists` に出さない)。
@@ -462,7 +464,7 @@ daemon の `seek_to` もすぐ答え、シークしている間の `status` の 
   一時停止と再開をしているため)。
 - 「Spotify から取り込む」(GUI だけの機能。パッチは関わらない): GUI は Spotify の公開の埋め込み用の頁から
   プレイリスト・アルバムの曲を読み、Web API だけの接続と同じ橋渡しの形 (`ytsearch1:…`、meta の `spotify.id` と
-  `spotify.bridge`) で `playlist_add` する。ローカルのプレイリストの TOML には meta が残らないので、GUI は
+  `spotify.bridge`) で `playlist_add` する。以前の版で保存された曲と履歴にも対応するため、GUI は
   橋渡しの path → Spotify の曲 ID の表を自分で持ち、読み戻した曲 (`tracks`・`playlist`・`status`・`history`) に
   meta を付け直して扱う。置き換え (「Spotify から更新」) は `playlist_delete` のあと `playlist_add` (cliamp に
   置き換えの命令は無い。足せなければ前の曲を `playlist_add` で戻し、戻せなければ GUI の状態のディレクトリに控える)。

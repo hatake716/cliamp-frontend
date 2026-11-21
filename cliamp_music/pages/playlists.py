@@ -53,6 +53,8 @@ from ..protocol import (  # noqa: E402
     is_spotify_owner_premium_required,
     is_youtube_bridge,
 )
+from .. import youtube_account
+from ..youtube_library import connect_youtube, run_async
 from ..spotify_import import EMBED_TRACK_CAP, ImportedList, SpotifyImportError, SpotifyRef  # noqa: E402
 from ..widgets import (  # noqa: E402
     CapsuleButton,
@@ -142,10 +144,11 @@ class _ProviderSection(Gtk.Box):
         self.note.set_visible(False)
         self.append(self.note)
         # 「Spotify から取り込む…」(ローカルが空のとき・Spotify のライブラリが読めないとき)
-        self.action = CapsuleButton(IMPORT_LABEL, "music-import-symbolic")
+        youtube = key == "youtube-account"
+        self.action = CapsuleButton("YouTube Music に接続…" if youtube else IMPORT_LABEL, "music-import-symbolic")
         self.action.add_css_class("music-section-action")
         self.action.set_halign(Gtk.Align.START)
-        self.action.connect("clicked", weak_call(page.open_import))
+        self.action.connect("clicked", weak_call(page.connect_account if youtube else page.open_import))
         page.inset(self.action)
         self.action.set_visible(False)
         self.append(self.action)
@@ -182,11 +185,15 @@ class PlaylistsPage(PageBase):
         self.header_bar.pack_end(self.sync_all_button)
         self.state = ContentStack("読み込み中…")
         self.sections: dict[str, _ProviderSection] = {}
+        self._native_ytmusic = False
+        self._section_versions = {}
         self.body.append(self.state)
         self._serial = 0
         self.watch(ctx.store, "connection-changed", self._on_connection)
         if isinstance(ctx, GObject.Object):
             self.watch(ctx, "local-playlists-changed", self._on_local_changed)
+            if GObject.signal_lookup("account-playlists-changed", type(ctx)):
+                self.watch(ctx, "account-playlists-changed", self._on_account_changed)
             if GObject.signal_lookup("providers-changed", type(ctx)):
                 self.watch(ctx, "providers-changed", self._on_providers_changed)
 
@@ -216,6 +223,11 @@ class PlaylistsPage(PageBase):
             remember_provider_names(self.ctx, result)
             keys = [LOCAL] + [p.key for p in result
                               if p.playlists and not p.virtual and p.key not in (LOCAL, "radio")]
+            self._native_ytmusic = "ytmusic" in keys
+            if self._native_ytmusic:
+                keys[keys.index("ytmusic")] = "youtube-account"
+            else:
+                keys.append("youtube-account")
             self._arrange(keys)
             for key in keys:
                 self._load_section(serial, key, force)
@@ -271,6 +283,23 @@ class PlaylistsPage(PageBase):
         if LOCAL in self.sections:
             self._load_section(self._serial, LOCAL, False)
 
+    def _on_account_changed(self, _ctx, provider) -> None:
+        if provider in self.sections:
+            self.sections[provider].keys = None
+            self._load_section(self._serial, provider, True)
+
+    def connect_account(self) -> None:
+        button = self.sections["youtube-account"].action
+        button.set_sensitive(False)
+
+        def done(error):
+            button.set_sensitive(True)
+            if error:
+                self.ctx.toast(error)
+            else:
+                self.ctx.emit("account-playlists-changed", "youtube-account")
+        connect_youtube(self.ctx.window, done)
+
     def _on_providers_changed(self, *_args) -> None:
         # 鳴らし方が分かった・変わった (Spotify のセッションができた後の providers の答え)
         for section in self.sections.values():
@@ -280,7 +309,11 @@ class PlaylistsPage(PageBase):
         """節の注意書き: 取れないときの説明、無ければ曲を YouTube で探して鳴らすことの書き添え。"""
         if not section.loaded:
             return
-        section.action.set_visible(section.offer_import and self.ctx.store.supports("playlist_add"))
+        if section.key == "youtube-account":
+            section.action.set_visible(True)
+            section.action.set_label("アカウントを接続し直す…" if youtube_account.is_connected() else "YouTube Music に接続…")
+        else:
+            section.action.set_visible(section.offer_import and self.ctx.store.supports("playlist_add"))
         if section.problem:
             section.show_note(section.problem)
         elif provider_playback(self.ctx, section.key) == PLAYBACK_YOUTUBE:
@@ -308,8 +341,10 @@ class PlaylistsPage(PageBase):
             previous = section
 
     def _load_section(self, serial: int, key: str, force: bool) -> None:
+        version = self._section_versions[key] = self._section_versions.get(key, 0) + 1
+
         def done(result) -> None:
-            if serial != self._serial:
+            if serial != self._serial or version != self._section_versions.get(key):
                 return
             section = self.sections.get(key)
             if section is None:
@@ -340,7 +375,27 @@ class PlaylistsPage(PageBase):
             self._update_note(section)
             self._fill(section, infos)
 
-        self.ctx.catalog.playlists(key, done, force=force)
+        if key == "youtube-account":
+            self._load_youtube_section(serial, done, force)
+        else:
+            self.ctx.catalog.playlists(key, done, force=force)
+
+    def _load_youtube_section(self, serial, finish, force=False):
+        if not youtube_account.is_connected():
+            if self._native_ytmusic:
+                self.ctx.catalog.playlists("ytmusic", finish, force=force)
+            else:
+                finish([])
+            return
+
+        def deliver(rows, error):
+            if serial != self._serial:
+                return
+            if error:
+                finish(Response(False, {}, error, "error"))
+            else:
+                finish([PlaylistInfo("youtube-account", id, name) for id, name in rows])
+        run_async(youtube_account.list_playlists, deliver)
 
     @staticmethod
     def _clear_groups(section: _ProviderSection) -> None:
@@ -459,6 +514,8 @@ class PlaylistDetailPage(PageBase):
         self.watch(store, "track-changed", self._on_track)
         self.watch(store, "state-changed", self._on_track)
         self.watch(store, "connection-changed", self._on_connection)
+        if isinstance(ctx, GObject.Object) and GObject.signal_lookup("account-playlists-changed", type(ctx)):
+            self.watch(ctx, "account-playlists-changed", self._account_changed)
         if self.editable and isinstance(ctx, GObject.Object):
             self.watch(ctx, "local-playlists-changed", self._on_local_changed)
         if (not self.is_local and isinstance(ctx, GObject.Object)
@@ -474,6 +531,10 @@ class PlaylistDetailPage(PageBase):
     def editable(self) -> bool:
         """書き換えられるローカルのプレイリストか (履歴の仮想プレイリストは除く)。"""
         return self.is_local and self.playlist_id != RECENTLY_PLAYED
+
+    def _account_changed(self, _ctx, provider):
+        if provider == self.provider:
+            self.load(force=True)
 
     def _art_key(self) -> str:
         return f"{self.provider}:{self.playlist_id}"
@@ -526,7 +587,12 @@ class PlaylistDetailPage(PageBase):
             self._public_list = None
             self._show(result)
 
-        self.ctx.catalog.tracks(self.provider, self.playlist_id, done, force=force)
+        if self.provider == "youtube-account":
+            def deliver(tracks, error):
+                done(Response(False, {}, error, "error") if error else tracks)
+            run_async(lambda: youtube_account.list_tracks(self.playlist_id), deliver)
+        else:
+            self.ctx.catalog.tracks(self.provider, self.playlist_id, done, force=force)
 
     def _load_public_playlist(self, serial: int) -> None:
         """API が曲の取得を断った公開プレイリストを、取り込みと同じ worker で読む。"""
@@ -730,6 +796,9 @@ class PlaylistDetailPage(PageBase):
             source = Source(provider=self.provider, id=self.playlist_id, name=self.playlist_name)
             self.ctx.play_tracks(tracks, index, source)
             return
+        if self.provider == "youtube-account":
+            self.ctx.toast(f"このプレイリストの一括再生には {REPLACE_MAX_TRACKS} 曲以内のリストが必要です。")
+            return
         self.ctx.load_provider(self.provider, self.playlist_id, index, self.playlist_name)
 
     # --- ボタン -------------------------------------------------------------------
@@ -748,11 +817,15 @@ class PlaylistDetailPage(PageBase):
             source = Source(provider=self.provider, id=self.playlist_id, name=self.playlist_name)
             shuffle_tracks(self.ctx, self._tracks, source)
             return
+        if self.provider == "youtube-account":
+            self.ctx.toast(f"このプレイリストのシャッフルには {REPLACE_MAX_TRACKS} 曲以内のリストが必要です。")
+            return
         shuffle_provider(self.ctx, self.provider, self.playlist_id, len(self._tracks), self.playlist_name)
 
     def _menu(self):
         menu = Gio.Menu()
         group = Gio.SimpleActionGroup()
+        self.append_playlist_choice(menu, group, self._tracks)
         supports = self.ctx.store.supports
         playable = [t for t in self._tracks if not t.unplayable]
         queue = Gio.Menu()

@@ -24,6 +24,7 @@ gi.require_version("Gsk", "4.0")
 gi.require_version("Graphene", "1.0")
 from gi.repository import Adw, Gdk, Gio, GLib, Gsk, Gtk  # noqa: E402
 
+from .album import can_resolve_album, choose_album  # noqa: E402
 from .fullscreen import (  # noqa: E402
     CoverArt,
     ArtBackdrop,
@@ -233,12 +234,18 @@ class MiniPlayer(Adw.Window):
             action.connect("activate", handler)
             self._actions.add_action(action)
         self.insert_action_group("mini", self._actions)
+        for name, handler in (("save-song", self._act_save_song), ("save-album", self._act_save_album)):
+            action = Gio.SimpleAction.new(name, None)
+            action.connect("activate", handler)
+            self._actions.add_action(action)
         self._menu_mode = Gio.Menu()
         menu = Gio.Menu()
         menu.append_section(None, self._menu_mode)
         others = Gio.Menu()
         others.append("フルスクリーンプレーヤー", "mini.fullscreen")
         others.append("メインの窓を表示", "mini.main-window")
+        others.append("この曲をプレイリストに追加…", "mini.save-song")
+        others.append("アルバムをプレイリストに追加…", "mini.save-album")
         menu.append_section(None, others)
         closing = Gio.Menu()
         closing.append("ミニプレーヤーを閉じる", "mini.close")
@@ -545,6 +552,16 @@ class MiniPlayer(Adw.Window):
     def _on_state(self, _store) -> None:
         self._update_ticking()
 
+    def _act_save_song(self, _action, _param) -> None:
+        track = self.ctx.store.current_track()
+        if track is not None:
+            self.ctx.choose_playlist((track,))
+
+    def _act_save_album(self, _action, _param) -> None:
+        track = self.ctx.store.current_track()
+        if track is not None:
+            choose_album(self.ctx, track)
+
     def _sync_status(self) -> None:
         store = self.ctx.store
         status = store.status
@@ -555,6 +572,13 @@ class MiniPlayer(Adw.Window):
             title, subtitle = "再生していません", ""
         else:
             title, subtitle = status.display_title, status.display_subtitle
+        can_save = (track is not None
+                    and store.connected
+                    and store.supports("playlist_add")
+                    and not track.live
+                    and not track.unplayable and bool(track.path))
+        self._actions.lookup_action("save-song").set_enabled(can_save)
+        self._actions.lookup_action("save-album").set_enabled(can_save and can_resolve_album(track))
         for label, text in ((self.square_title, title), (self.square_subtitle, subtitle),
                             (self.compact_title, title), (self.compact_subtitle, subtitle)):
             _set_text(label, text)

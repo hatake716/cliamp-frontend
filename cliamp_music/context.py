@@ -74,6 +74,7 @@ class AppContext(GObject.Object):
     __gsignals__ = {
         "local-playlists-changed": (GObject.SignalFlags.RUN_FIRST, None, ()),
         "providers-changed": (GObject.SignalFlags.RUN_FIRST, None, ()),
+        "account-playlists-changed": (GObject.SignalFlags.RUN_FIRST, None, (str,)),
     }
 
     def __init__(self, app: Any = None, *, window: Any = None, client: CliampClient | None = None,
@@ -274,14 +275,32 @@ class AppContext(GObject.Object):
             self.catalog.invalidate()
             self.refresh_local_playlists()
 
+    def choose_playlist(self, tracks: Iterable[Track]):
+        from .playlist_picker import present_picker
+
+        return present_picker(self, tracks)
+
     def add_to_playlist(self, name: str, tracks: Iterable[Track]) -> None:
         tracks = list(tracks)
         if not tracks:
             return
 
+        if name in self.imports.auto_sync_names():
+            self.toast("自動同期中のプレイリストです。手動で追加するには自動同期をオフにしてください。")
+            return
         def done(response: Response) -> None:
             if response.ok:
-                self.toast(f"「{name}」に追加しました")
+                added = response.get("added")
+                skipped = response.get("skipped", 0)
+                if added is None:
+                    self.toast(f"「{name}」に追加しました")
+                elif not added and skipped:
+                    self.toast(f"選んだ曲はすでに「{name}」に入っています")
+                else:
+                    suffix = f"（登録済み {skipped} 曲）" if skipped else ""
+                    self.toast(f"「{name}」に {added} 曲追加しました{suffix}")
+                if name in self._local_playlists and added != 0:
+                    self.emit("local-playlists-changed")
                 self.refresh_local_playlists()
             else:
                 self.toast(f"プレイリストに追加できませんでした: {response.message}")
@@ -483,6 +502,17 @@ class AppContext(GObject.Object):
             [track], "end", callback=self._toast_done(f"「{title}」を最後に再生します", "追加できませんでした")),
             supports("enqueue"))
 
+        from .album import can_resolve_album, choose_album
+        if track.path and not track.live and not track.unplayable:
+            section = Gio.Menu()
+            section.append("この曲をプレイリストに追加…", "track.choose-playlist")
+            can_save = self.store.connected and supports("playlist_add")
+            action("choose-playlist", lambda _v: self.choose_playlist((track,)), can_save)
+            if can_resolve_album(track):
+                section.append("アルバムをプレイリストに追加…", "track.choose-album")
+                action("choose-album", lambda _v: choose_album(self, track), can_save)
+            menu.append_section(None, section)
+
         # ラジオなど終わりの無い流れ (live) はプレイリストに入れない: ローカルのプレイリスト
         # (TOML) には live も局の絵も残らず、ふつうの曲として読み戻されるため
         # (「プレイリストとして保存」も live を除く)
@@ -491,7 +521,7 @@ class AppContext(GObject.Object):
             self._fill_playlist_menu(playlists)
             self._playlist_menus.append(playlists)
             add = Gio.Menu()
-            add.append_submenu("プレイリストに追加", playlists)
+            add.append_submenu("このPCのプレイリストに追加", playlists)
             menu.append_section(None, add)
             can_add = supports("playlist_add")
             action("add-to-playlist", lambda v: self.add_to_playlist(v.get_string(), [track]), can_add,

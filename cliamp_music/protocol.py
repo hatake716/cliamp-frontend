@@ -43,7 +43,7 @@ STATE_COMMANDS = frozenset(LEGACY_COMMANDS - {"plugin.call"} | {
 CATALOG_COMMANDS = frozenset({
     "providers", "playlists", "tracks", "search", "load_provider", "lyrics",
     "history", "playlist_add", "playlist_delete", "playlist_remove_track",
-    "search_playlists", "plugin.call",
+    "search_playlists", "spotify_destinations", "spotify_save", "plugin.call",
 })
 
 # 拡張 IPC (api 1) のすべてのコマンド。
@@ -1281,6 +1281,62 @@ def parse_playlist_hits(d: Any) -> list[PlaylistInfo]:
             image=image if image.startswith(("https://", "http://")) else "",
         ))
     return out
+
+
+def split_icy_title(text: str) -> tuple[str, str]:
+    """ICY の曲名 "Artist - Title" を (アーティスト, 曲名) に。区切りが無ければ ("", 全体)。"""
+    text = (text or "").strip()
+    for sep in (" - ", " – ", " — ", " / "):
+        if sep in text:
+            artist, title = text.split(sep, 1)
+            if artist.strip() and title.strip():
+                return artist.strip(), title.strip()
+    return "", text
+
+
+_YOUTUBE_LYRIC_LABEL = re.compile(
+    r"\s*[\(\[【]\s*(?:(?:official\s+)?(?:music\s+)?video"
+    r"|official\s+audio|(?:official\s+)?lyrics?\s+video|mv|公式mv|lyrics)\s*[\)\]】]",
+    re.I,
+)
+
+
+def _youtube_lyrics_query(artist: str, title: str) -> tuple[str, str]:
+    had_topic = bool(re.search(r"\s+[-–—]\s+Topic$", artist, re.I))
+    artist = re.sub(r"\s+[-–—]\s+Topic$", "", artist, flags=re.I).strip()
+    title = _YOUTUBE_LYRIC_LABEL.sub("", title).strip()
+    prefix, suffix = split_icy_title(title)
+    if prefix and (not artist or prefix.casefold() == artist.casefold()):
+        return prefix, suffix
+    if not had_topic and prefix and not re.search(r"\b(live|remix|remastered|version)\b", suffix, re.I):
+        return prefix, suffix
+    return artist, title
+
+
+def lyrics_query(track: Track | None, stream_title: str = "") -> tuple[str, str] | None:
+    if not track:
+        return None
+    if track.live or (track.stream and stream_title):
+        artist, title = split_icy_title(stream_title)
+        return (artist, title) if artist and title else None
+    artist = (track.artist or "").strip()
+    title = (track.title or "").strip()
+    if not title:
+        if track.is_local_file:
+            title = track.display_title.strip()
+        else:
+            return None
+    if track.spotify_id:
+        return (artist, title)
+    is_yt = bool(track.youtube_id) or track.path.startswith("ytsearch")
+    if is_yt:
+        artist, title = _youtube_lyrics_query(artist, title)
+        return (artist, title) if title else None
+    if not artist:
+        guessed_artist, guessed_title = split_icy_title(title)
+        if guessed_artist:
+            return guessed_artist, guessed_title
+    return artist, title
 
 
 def parse_lyrics(d: Any) -> Lyrics:

@@ -143,6 +143,42 @@ class Reading(CatalogTest):
         self.assertIsNone(self.get(self.catalog.lyrics, "真夜中ポスト", "シティライト・ブルース"))
         self.assertEqual(self.count("lyrics"), 3)  # 「見つからない」も覚える
 
+    def test_lyrics_result_caching(self):
+        artist = '青い灯台'
+        title = '夜明けのバス停'
+        res1 = self.get(self.catalog.lyrics_result, artist, title)
+        self.assertIsNotNone(res1)
+        self.assertEqual(self.count('lyrics'), 1)
+        res2 = self.get(self.catalog.lyrics_result, artist, title)
+        self.assertEqual(self.count('lyrics'), 1)
+        self.assertEqual(res1, res2)
+
+    def test_lyrics_result_spotify_id_distinct(self):
+        artist = '青い灯台'
+        title = '夜明けのバス停'
+        id1 = 'a' * 22
+        id2 = 'b' * 22
+        self.get(self.catalog.lyrics_result, artist, title, spotify_id=id1)
+        self.get(self.catalog.lyrics_result, artist, title, spotify_id=id2)
+        self.assertEqual(self.count('lyrics'), 2)
+        reqs = self.fake.requests_for('lyrics')
+        self.assertEqual(len(reqs), 2)
+        paths = {r['path'] for r in reqs}
+        self.assertEqual(paths, {"spotify:track:" + id1, "spotify:track:" + id2})
+
+    def test_lyrics_result_miss_and_force(self):
+        artist = '真夜中ポスト'
+        title = 'シティライト・ブルース'
+        res_miss = self.get(self.catalog.lyrics_result, artist, title)
+        self.assertIsNone(res_miss)
+        self.assertEqual(self.count('lyrics'), 1)
+        res_cached = self.get(self.catalog.lyrics_result, artist, title)
+        self.assertIsNone(res_cached)
+        self.assertEqual(self.count('lyrics'), 1)
+        res_force = self.get(self.catalog.lyrics_result, artist, title, force=True)
+        self.assertIsNone(res_force)
+        self.assertEqual(self.count('lyrics'), 2)
+
     def test_history(self):
         history = self.get(self.catalog.history)
         self.assertEqual(len(history), 8)

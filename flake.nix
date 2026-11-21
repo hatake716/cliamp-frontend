@@ -98,7 +98,7 @@
             pkgs.pkg-config
             pkgs.desktop-file-utils
             pkgs.librsvg
-            (pkgs.python3.withPackages (ps: [ ps.pygobject3 ps.mutagen ]))
+            (pkgs.python3.withPackages (ps: [ ps.pygobject3 ps.mutagen ps.ytmusicapi ]))
           ];
           buildInputs = [
             pkgs.gtk4
