@@ -10,14 +10,15 @@ from unittest.mock import patch
 
 try:
     from cliamp_music import soloist_setup as setup
-    from gi.repository import Gtk
+    from gi.repository import Gdk, Gtk
 except (ImportError, ValueError):
     setup = None
 
 from tests.fake_cliamp import run_loop
 
 
-@unittest.skipUnless(setup is not None and Gtk.init_check(), "GTK display required")
+@unittest.skipUnless(setup is not None and Gtk.init_check() and Gdk.Display.get_default() is not None,
+                     "GTK display required")
 class SoloistSetupTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
