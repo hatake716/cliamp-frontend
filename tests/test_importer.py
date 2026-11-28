@@ -840,8 +840,9 @@ class PlaylistsImportTest(ImportPageCase):
                 return texture is not None and texture is not loader.placeholder(
                     f"local:{card.playlist_info.id}", texture.get_width(), "playlist")
 
-            self.wait(lambda: all(real(card) for card in cards.values()), 8, "カードの絵が来ません")
-            self.assertEqual(cards[NAME].art.texture.get_width(), 64)  # Spotify の絵そのもの (2x2 ではない)
+            # 取得中はカードの幅 (170px) の仮画像も届く。Spotify からの 64px の絵が届くまで待つ。
+            self.wait(lambda: all(real(card) for card in cards.values())
+                      and cards[NAME].art.texture.get_width() == 64, 8, "カードの絵が来ません")
 
     def test_ordinary_local_playlist_has_no_import_note(self):
         from cliamp_music.pages.playlists import PlaylistDetailPage
