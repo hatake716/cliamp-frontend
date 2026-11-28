@@ -822,6 +822,19 @@ class PlaylistsTest(PageCase):
             page._update_note(section)
             self.assertFalse(section.connect_playback.get_visible())
 
+    def test_soloist_setup_uses_local_dialog_for_new_and_paired_devices(self):
+        page = self.show(PlaylistsPage(self.ctx))
+        self.wait(lambda: "spotify" in page.sections and page.sections["spotify"].loaded)
+        section = page.sections["spotify"]
+        with patch.object(self.ctx, "open_soloist_setup") as show_setup:
+            for mode in ("soloist-setup", "soloist"):
+                self.ctx._provider_playback["spotify"] = mode
+                page._update_note(section)
+                self.assertTrue(section.connect_playback.get_visible())
+                section.connect_playback.emit("clicked")
+        self.assertEqual(show_setup.call_count, 2)
+        self.assertFalse(self.requests("connect_spotify_playback"))
+
     def test_saved_grid(self):
         a = PlaylistInfo("spotify", "abc", "Same", 2, owner="one")
         b = PlaylistInfo("url", "https://music.youtube.com/playlist?list=PLabc", "Same", 3, owner="two")

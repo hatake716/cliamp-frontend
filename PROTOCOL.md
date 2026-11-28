@@ -23,11 +23,11 @@ GUI が必要とするコマンドを **足す** パッチの仕様。パッチ�
 
 ## 型
 
-このPCで使用する cliamp 2.4.0 は `capabilities.commands` に
-`connect_spotify_playback` を返す。Spotify の曲は `spotify:track:<id>`
-で返り、再生用の接続が必要なときは Spotify の ProviderInfo に
-`"playback":"spotify-sign-in"` が付く。曲の検索やプレイリストの取得で
-ブラウザー認証を開始することはない。
+このPCで使用する cliamp 2.4.0 は Spotify の `providers` に `"playback":"soloist-setup"` (設定が必要) または `"playback":"soloist"`
+(再生可能) を返す。GTK の再生設定は、ローカルの Spotify Soloist に API キーを標準入力で登録し、
+Spotify Connect のペアリングを開始する。API キーを IPC で送受信する必要はない。
+Spotify の曲は `spotify:track:<id>` で再生する。以前の2.4.0が返す
+`"playback":"spotify-sign-in"` と `connect_spotify_playback` も判別する。
 
 ### TrackInfo (既存の `track` を拡張)
 
@@ -295,7 +295,7 @@ TrackInfo の `path` のまま) を付けると、cliamp はその曲か確か�
 | `playlist_add` | `name`, `tracks` | `{ok}` (ローカルのプレイリスト `~/.config/cliamp/playlists/<name>.toml` に追加。無ければ作る。TOML に残る欄は上の「型」を参照。`<name>.toml` が 255 バイト (NAME_MAX) を超える名前は `open …/<name>.toml: file name too long`。GUI は名前 250 バイトまでに抑える) |
 | `spotify_destinations` | なし | `playlists`（編集できる Spotify プレイリストの `id` と `name`） |
 | `save_playlist_to_library` | `provider="spotify"`, `id`（元のプレイリストの ID） | サインイン中の Spotify ライブラリに元のプレイリストを保存する。同一 ID を再度指定できる。GUI は `capabilities.commands` を確認してから呼び出す。 |
-| `connect_spotify_playback` | — | このPCの2.4.0用。利用者が「Spotify の再生に接続…」を押したときに呼ぶ。再生用認証が完了すると `{"ok":true}`、失敗時は `{"ok":false,"error":"…"}`。待ち時間はサーバー側で最大5分。 |
+| `connect_spotify_playback` | — | 旧2.4.0の再生用 OAuth。利用者が「Spotify の再生に接続…」を押したときに呼ぶ。再生用認証が完了すると `{"ok":true}`、失敗時は `{"ok":false,"error":"…"}`。待ち時間はサーバー側で最大5分。 |
 | `spotify_save` | 既存の `id` または新規の `name`、`tracks` | `id`、確定した `added`、`skipped`。作成は非公開。途中で失敗したときも、作成済みの ID と確定件数を返す |
 | `playlist_delete` | `name` | `{ok}` (無ければ `remove …/<name>.toml: no such file or directory`) |
 | `playlist_remove_track` | `name`, `index`, `path` | `{ok}` (`path` は上の「添字の確かめ」)。**最後の曲を外すと、プレイリストのファイルごと消える** (external/local の RemoveTrack)。その後の `tracks` は `open …/<name>.toml: no such file or directory`、`playlists` にも出ない |

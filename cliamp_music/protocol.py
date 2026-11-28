@@ -1168,6 +1168,12 @@ def _describe(text: str) -> tuple[str, str]:
     if wait is not None:
         span = format_wait(wait)
         return f"Spotify から回数の制限を受けています ({span + 'ほど' if span else 'しばらく'}待つ)", detail
+    if "spotify soloist" in low:
+        if "期限切れ" in low:
+            return "Spotify Soloist の更新が必要です。Spotify の再生設定を開いてください", detail
+        if "未接続" in low or "インストールされていません" in low:
+            return "Spotify の再生設定でこのPCを接続してください", detail
+        return "Spotify Soloist で再生できませんでした", detail
     # サインイン (Spotify のセッション切れ、cliamp の ErrNeedsAuth "sign-in required")
     if service == "Spotify" and _any_in(low, ("sign-in required", "auth", "credential", "token", "login",
                                               "log in", "401", "cliamp spotify reset")):

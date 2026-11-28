@@ -215,9 +215,17 @@ cliamp の Spotify は、自分で [Spotify for Developers](https://developer.sp
 
 **自分の client_id と Premium** なら、プレイリスト (自分のものと共同編集のもの。他人のプレイリストの
 中身は Web API では読めない)・保存した曲 (Your Music)・検索が使える。
-この PC の cliamp 2.4.0 では、ミュージックのプレイリスト画面から Spotify の再生に接続し、
-ブラウザーで Premium アカウントを一度認証する。次回からはその接続で Spotify の音源を再生する。
-Web API にサインイン済みでも、再生用の接続を初めて使うときは認証が必要になる。
+この PC では Spotify 公式のヘッドレスクライアント **Spotify Soloist** が音声を再生する。
+
+1. ミュージックの「プレイリスト」→「Spotify」→「Spotify の再生設定…」を開く。
+2. 画面のリンクから自分の Spotify Soloist API キーを発行し、設定ウィンドウに入力する。キーは
+   Soloist の標準入力経由で登録し、次回からは Soloist が保存したキーを使う。
+3. 「ペアリングを開始」を押し、同じネットワークの Spotify アプリの「デバイスに接続」で
+   **ミュージック** を選ぶ。「Spotify に接続しました」と表示されたら、ミュージックで曲を選ぶ。
+
+Soloist 本体は初回設定で公式配布元からダウンロードする。配布ビルドの期限が切れた場合は
+再生設定から更新できる。Web API の開発者アプリの Client ID と、Soloist API キーは別々に管理する。
+[Spotify Soloist の公式ガイド](https://developer.spotify.com/documentation/soloist)
 
 他人のプレイリストを開いて Web API が曲の取得を 403 で断った場合は、Music が公開ページから
 自動で曲を読み込む。「Spotify の公開ページから表示」と書き添え、再生・シャッフルには表示した曲を

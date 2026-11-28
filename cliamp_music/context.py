@@ -94,6 +94,7 @@ class AppContext(GObject.Object):
         self.state = state or GuiState()
         self._pending_account_saves: set[tuple[str, str]] = set()
         self.spotify_playback_connecting = False
+        self.soloist_window = None
         # 取り込んだ Spotify のプレイリストの記録 (ファイルは初めて使うときに読む)
         self.imports = imports or ImportIndex(default_index_path(getattr(self.state, "path", None)))
         if hasattr(self.catalog, "track_hook"):
@@ -160,6 +161,12 @@ class AppContext(GObject.Object):
         if len(title) > 18:
             title = title[:17] + "…"
         error = status.playback_error.lower()
+        if status.track.spotify_id and "soloist" in error:
+            toast = self.toast(f"「{title}」を再生できません — {playback_error_headline(problem[0])}")
+            if toast is not None:
+                toast.set_button_label("Spotify の再生設定…")
+                toast.connect("button-clicked", lambda _toast: self.open_soloist_setup())
+            return
         if (status.track.spotify_id and store.supports("connect_spotify_playback")
                 and ("spotify: streaming unavailable" in error or "sign-in required" in error)):
             toast = self.toast("Spotify の曲を再生するには、Premium アカウントで再生用の接続を許可してください")
@@ -169,8 +176,29 @@ class AppContext(GObject.Object):
             return
         self.toast(f"「{title}」を再生できません — {playback_error_headline(problem[0])}")
 
+    def open_soloist_setup(self) -> None:
+        from .soloist_setup import SoloistSetup
+
+        if self.soloist_window is None:
+            def paired():
+                self.catalog.session_changed("spotify")
+                self.emit("account-playlists-changed", "spotify")
+
+            self.soloist_window = SoloistSetup(self.window, on_paired=paired)
+            self.soloist_window.connect("unrealize", self._soloist_closed)
+        self.soloist_window.present()
+
+    def _soloist_closed(self, window):
+        if self.soloist_window is window:
+            self.soloist_window = None
+            if window.stage != "done":
+                self.catalog.providers(self.remember_providers, force=True)
+
     def connect_spotify_playback(self) -> None:
         """利用者が接続を選んだときだけ、cliamp のブラウザー認証を開始する。"""
+        if self._provider_playback.get("spotify") in ("soloist", "soloist-setup"):
+            self.open_soloist_setup()
+            return
         if self.spotify_playback_connecting:
             self.toast("ブラウザーで Spotify の接続を完了してください")
             return

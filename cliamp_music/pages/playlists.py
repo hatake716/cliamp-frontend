@@ -117,6 +117,8 @@ def imported_note(record) -> str:
 
 
 def auth_note(ctx, provider: str) -> str:
+    if provider == "spotify" and provider_playback(ctx, provider) in ("soloist", "soloist-setup"):
+        return "Spotify のライブラリを読むには、cliamp に Spotify のカタログ用アカウントを設定してください"
     if provider == "spotify" and ctx.store.supports("connect_spotify_playback"):
         return "「プレイリスト」の Spotify 欄から Premium アカウントを接続してください"
     return f"{provider_label(ctx, provider)} はサインインが必要です (cliamp の端末で設定)"
@@ -379,10 +381,13 @@ class PlaylistsPage(PageBase):
 
     def _update_note(self, section: _ProviderSection) -> None:
         """プロバイダーの認証状態と、プレイリスト取得時のメッセージを表示する。"""
-        sign_in = provider_playback(self.ctx, section.key) == "spotify-sign-in"
+        playback = provider_playback(self.ctx, section.key)
+        soloist = playback in ("soloist", "soloist-setup")
+        sign_in = playback == "spotify-sign-in"
         if section.connect_playback is not None:
+            section.connect_playback.set_label("Spotify の再生設定…" if soloist else "Spotify の再生に接続…")
             section.connect_playback.set_visible(
-                self.ctx.store.supports("connect_spotify_playback") and (section.needs_auth or sign_in))
+                soloist or (self.ctx.store.supports("connect_spotify_playback") and (section.needs_auth or sign_in)))
         if not section.loaded:
             return
         if section.key == "youtube-account":
@@ -392,6 +397,8 @@ class PlaylistsPage(PageBase):
             section.action.set_visible(section.offer_import and self.ctx.store.supports("playlist_add"))
         if section.problem:
             section.show_note(section.problem)
+        elif playback == "soloist-setup":
+            section.show_note("Spotify の再生設定で、このPCを Spotify Connect に接続してください")
         elif sign_in:
             section.show_note("Spotify Premium アカウントを接続すると、ミュージックで直接再生できます")
         elif provider_playback(self.ctx, section.key) == PLAYBACK_YOUTUBE:
