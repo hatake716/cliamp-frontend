@@ -212,7 +212,7 @@ class SpotifySync(GObject.Object):
                 finish(False)
                 ctx.emit("local-playlists-changed")
                 return
-            if [t.path for t in current] == [t.path for t in value.tracks]:
+            if [t.for_playback().path for t in current] == [t.path for t in value.tracks]:
                 ctx.imports.mark_synced(name)
                 finish(False)  # 変わっていない = 置き換えていない
                 return

@@ -93,6 +93,7 @@ class AppContext(GObject.Object):
         self.radio = radio or RadioBrowser()
         self.state = state or GuiState()
         self._pending_account_saves: set[tuple[str, str]] = set()
+        self.spotify_playback_connecting = False
         # 取り込んだ Spotify のプレイリストの記録 (ファイルは初めて使うときに読む)
         self.imports = imports or ImportIndex(default_index_path(getattr(self.state, "path", None)))
         if hasattr(self.catalog, "track_hook"):
@@ -158,7 +159,42 @@ class AppContext(GObject.Object):
         title = status.track.display_title
         if len(title) > 18:
             title = title[:17] + "…"
+        error = status.playback_error.lower()
+        if (status.track.spotify_id and store.supports("connect_spotify_playback")
+                and ("spotify: streaming unavailable" in error or "sign-in required" in error)):
+            toast = self.toast("Spotify の曲を再生するには、Premium アカウントで再生用の接続を許可してください")
+            if toast is not None:
+                toast.set_button_label("Spotify に接続…")
+                toast.connect("button-clicked", lambda _toast: self.connect_spotify_playback())
+            return
         self.toast(f"「{title}」を再生できません — {playback_error_headline(problem[0])}")
+
+    def connect_spotify_playback(self) -> None:
+        """利用者が接続を選んだときだけ、cliamp のブラウザー認証を開始する。"""
+        if self.spotify_playback_connecting:
+            self.toast("ブラウザーで Spotify の接続を完了してください")
+            return
+        if not self.store.supports("connect_spotify_playback"):
+            self.toast(UNSUPPORTED_TEXT)
+            return
+        self.spotify_playback_connecting = True
+        self.toast("ブラウザーで Spotify Premium アカウントの接続を許可してください")
+
+        def done(response: Response) -> None:
+            self.spotify_playback_connecting = False
+            if not response.ok:
+                if "access_denied" in response.error:
+                    self.toast("Spotify の接続がキャンセルされました。プレイリスト画面から再試行できます")
+                elif "streaming unavailable" in response.error:
+                    self.toast("Spotify が再生を許可しませんでした。Premium アカウントで接続してください")
+                else:
+                    self.toast(f"Spotify の再生に接続できませんでした。{response.message}")
+                return
+            self.catalog.session_changed("spotify")
+            self.emit("account-playlists-changed", "spotify")
+            self.toast("Spotify の再生に接続しました。再生したい曲を選んでください")
+
+        self.client.request("connect_spotify_playback", done)
 
     def _toast_failure(self, prefix: str):
         def done(response: Response) -> None:

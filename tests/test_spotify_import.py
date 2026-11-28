@@ -132,56 +132,17 @@ class ParseUrlTest(unittest.TestCase):
         self.assertIn("曲のリンク", reason)
 
 
-class BridgeTest(unittest.TestCase):
-    """cliamp の external/spotify/bridge.go (TestBridgedTrack) と同じ結果になるか。"""
-
-    GO_CASES = [
-        ("single artist", ["米津玄師"], "Lemon", "ytsearch1:米津玄師 Lemon", "米津玄師"),
-        ("multiple artists", ["Queen", "David Bowie"], "Under Pressure",
-         "ytsearch1:Queen David Bowie Under Pressure", "Queen, David Bowie"),
-        ("commas stay whole", ["Earth, Wind & Fire"], "September",
-         "ytsearch1:Earth, Wind & Fire September", "Earth, Wind & Fire"),
-        ("no artists", [], "Untitled", "ytsearch1:Untitled", ""),
-        ("empty artist skipped", ["", "B"], "Song", "ytsearch1:B Song", ", B"),
-        ("special characters kept", ["AC/DC", "Beyoncé"], 'Don\'t Stop Me Now? #1 / "Live" & 100% :)',
-         'ytsearch1:AC/DC Beyoncé Don\'t Stop Me Now? #1 / "Live" & 100% :)', "AC/DC, Beyoncé"),
-        ("whitespace collapses", [" Spaced  Out "], "  Two\nLines\tTab  ",
-         "ytsearch1:Spaced Out Two Lines Tab", " Spaced  Out "),
-    ]
-
-    def test_go_examples(self):
-        for name, artists, title, path, artist in self.GO_CASES:
-            with self.subTest(name):
-                track = si.bridge_track("id" + name.replace(" ", "")[:20], title, artists, duration=254)
-                self.assertEqual(track.path, path)
-                self.assertEqual(track.artist, artist)
-                self.assertEqual(track.title, title)
-                self.assertEqual(track.duration, 254)
-                self.assertFalse(track.stream or track.unplayable or track.live)
-                self.assertEqual(dict(track.meta), {"spotify.id": track.meta_get("spotify.id"),
-                                                    "spotify.bridge": "youtube"})
-
-    def test_protocol_example_on_the_wire(self):
-        """PROTOCOL.md の「Spotify の Web API だけの接続」の例と同じ TrackInfo になる。"""
-        track = si.bridge_track("2aoo2jlRnM3A0NyLQqMN2f", "Under Pressure", ["Queen", "David Bowie"],
-                                duration=248, album="Hot Space", year=1982, track_number=11)
+class SpotifyTrackTest(unittest.TestCase):
+    def test_spotify_track_on_the_wire(self):
+        sid = "2aoo2jlRnM3A0NyLQqMN2f"
+        track = si.spotify_track(sid, "Under Pressure", ["Queen", "David Bowie"],
+                                 duration=248, album="Hot Space", year=1982, track_number=11)
         self.assertEqual(track.to_wire(), {
-            "path": "ytsearch1:Queen David Bowie Under Pressure", "title": "Under Pressure",
+            "path": f"spotify:track:{sid}", "title": "Under Pressure",
             "artist": "Queen, David Bowie", "album": "Hot Space", "year": 1982, "track_number": 11,
-            "duration": 248, "meta": {"spotify.id": "2aoo2jlRnM3A0NyLQqMN2f", "spotify.bridge": "youtube"}})
-        self.assertTrue(is_youtube_bridge(track))
-        self.assertEqual(track.spotify_id, "2aoo2jlRnM3A0NyLQqMN2f")
-        self.assertEqual(track.web_url, "https://open.spotify.com/track/2aoo2jlRnM3A0NyLQqMN2f")
+            "duration": 248, "meta": {"spotify.id": sid}})
+        self.assertEqual(track.web_url, f"https://open.spotify.com/track/{sid}")
         self.assertIsNone(track.youtube_id)
-
-    def test_go_whitespace_rules(self):
-        """Go の strings.Fields の空白 (unicode.IsSpace) だけで区切る。U+001C〜U+001F は Python の
-        str.split() では空白だが Go では空白でない。改行しない空白と全角の空白は空白。"""
-        self.assertEqual(si.bridge_query(["A\x1cB"], "T"), "ytsearch1:A\x1cB T")
-        self.assertEqual(si.bridge_query([f"青い{NBSP}灯台"], "夜\u3000明け"), "ytsearch1:青い 灯台 夜 明け")
-        self.assertEqual(si.bridge_query(["A\u2028B"], "C\u0085D\u200aE"), "ytsearch1:A B C D E")
-        self.assertEqual(si.bridge_query(["A\u200bB"], "T"), "ytsearch1:A\u200bB T")  # 幅の無い空白は字
-        self.assertEqual(si.go_fields(" \t\n"), [])
 
     def test_split_artists_uses_the_nbsp_comma(self):
         self.assertEqual(si.split_artists(f"Pitbull,{NBSP}Sensato"), ["Pitbull", "Sensato"])
@@ -202,19 +163,19 @@ class EmbedTest(unittest.TestCase):
         self.assertEqual(result.skipped, 0)
         self.assertEqual(result.url, f"https://open.spotify.com/playlist/{PID}")
         first, second, third, _fourth, fifth, sixth = result.tracks
-        self.assertEqual(first.path, "ytsearch1:青い灯台 夜明けのバス停")
+        self.assertEqual(first.path, f"spotify:track:{first.spotify_id}")
         self.assertEqual(first.duration, 214)  # ミリ秒を切り捨て (Go の DurationMs / 1000)
         self.assertEqual(second.artist, "Hyperlocal, Kite & <Theory>")
-        self.assertEqual(second.path, "ytsearch1:Hyperlocal Kite & <Theory> Tape Garden")
+        self.assertEqual(second.path, f"spotify:track:{second.spotify_id}")
         self.assertEqual(second.duration, 167)
         self.assertEqual(third.artist, "Earth, Wind & Water")
-        self.assertEqual(third.path, "ytsearch1:Earth, Wind & Water September Rain")
-        self.assertEqual(fifth.path, "ytsearch1:City Lights Ms. Tone Neon Drive (Night Mix)")
+        self.assertEqual(third.path, f"spotify:track:{third.spotify_id}")
+        self.assertEqual(fifth.path, f"spotify:track:{fifth.spotify_id}")
         self.assertEqual(fifth.artist, "City Lights, , Ms. Tone")
         self.assertEqual(fifth.title, "Neon  Drive\n(Night Mix)")
         self.assertEqual(sixth.title, "星の&<かけら>")
         for track in result.tracks:
-            self.assertTrue(is_youtube_bridge(track))
+            self.assertFalse(is_youtube_bridge(track))
             self.assertEqual(len(track.spotify_id or ""), 22)
             self.assertEqual(track.album, "")
         self.assertEqual(si.summary_line(result), "プレイリスト · 架空の作り手 · 6 曲")
@@ -303,7 +264,7 @@ class EmbedTest(unittest.TestCase):
         self.assertEqual((result.name, result.subtitle), ("夜\ufffd", "作り手\ufffd"))
         self.assertEqual(result.cover_url, "https://i.scdn.co/image/x\ufffd")
         track = result.tracks[0]
-        self.assertEqual((track.title, track.artist, track.path), ("曲\ufffd", "人\ufffd, B", "ytsearch1:人\ufffd B 曲\ufffd"))
+        self.assertEqual((track.title, track.artist, track.path), ("曲\ufffd", "人\ufffd, B", f"spotify:track:{track.spotify_id}"))
         for text in (result.name, result.subtitle, result.cover_url, track.title, track.artist, track.path,
                      si.playlist_name_for(result)):
             text.encode("utf-8")
@@ -408,7 +369,7 @@ class FetchTest(unittest.TestCase):
 
 class NamingTest(unittest.TestCase):
     def result(self, name: str, kind: str = "playlist") -> si.ImportedList:
-        return si.ImportedList(kind=kind, id=PID, name=name, tracks=(si.bridge_track(PID, "T", ["A"]),))
+        return si.ImportedList(kind=kind, id=PID, name=name, tracks=(si.spotify_track(PID, "T", ["A"]),))
 
     def test_playlist_name(self):
         self.assertEqual(si.playlist_name_for(self.result("AC/DC  ベスト\\2")), "AC／DC ベスト＼2")
@@ -476,12 +437,21 @@ class IndexTest(unittest.TestCase):
                          ("playlist", PID, "夜更かし", 6, self.result.cover_url))
         # 旧形式のローカル TOML から読み戻した曲に ID を付け直す
         original = self.result.tracks[1]
-        stored = Track(path=original.path, title=original.title, artist=original.artist, duration=original.duration,
+        legacy_path = "ytsearch1:Hyperlocal Kite & <Theory> Tape Garden"
+        old_index = json.loads(Path(self.path).read_text())
+        old_index["tracks"] = {legacy_path: original.spotify_id}
+        Path(self.path).write_text(json.dumps(old_index))
+        reloaded = si.ImportIndex(self.path)
+        stored = Track(path=legacy_path, title=original.title, artist=original.artist, duration=original.duration,
                        stream=True)
         self.assertFalse(is_youtube_bridge(stored))
         self.assertIsNone(stored.spotify_id)
         restored = reloaded.restore(stored)
         self.assertTrue(is_youtube_bridge(restored))
+        native = restored.for_playback()
+        self.assertEqual(native.path, original.path)
+        self.assertFalse(native.stream or is_youtube_bridge(native))
+        self.assertEqual(reloaded.known_count([native]), 1)
         self.assertEqual(restored.spotify_id, original.spotify_id)
         self.assertEqual(restored.web_url, f"https://open.spotify.com/track/{original.spotify_id}")
         self.assertEqual(track_key(restored), f"spotify:{original.spotify_id}")

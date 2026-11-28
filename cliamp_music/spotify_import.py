@@ -3,9 +3,7 @@
 Spotify の Web API は、開発者アプリの持ち主が Premium でないと 403 ("Active premium subscription
 required for the owner of the app") を返すので、無料プランでは cliamp の Spotify からライブラリを
 読めない。そこで、ログインの要らない埋め込み用の頁 (https://open.spotify.com/embed/playlist/<id>、
-/embed/album/<id>) の `<script id="__NEXT_DATA__">` にある曲の一覧を読み、cliamp の Web API だけの
-Spotify と同じ「YouTube で探して鳴らす形」(パッチの external/spotify/bridge.go) にして、ローカルの
-プレイリストに保存する。
+/embed/album/<id>) の `<script id="__NEXT_DATA__">` にある曲の一覧を読み、Spotify の曲 URI をローカルのプレイリストに保存する。
 
 - 読めるのは公開のプレイリストとアルバムだけ (非公開・「お気に入りの曲」は読めない)。
 - 埋め込みの頁は 100 曲までしか載せない。100 曲あれば通常の頁 (open.spotify.com/<種類>/<id>。
@@ -227,21 +225,12 @@ def check_spotify_url(text: str) -> tuple[SpotifyRef | None, str]:
 
 
 # ---------------------------------------------------------------------------
-# YouTube への橋渡し (cliamp の external/spotify/bridge.go と同じ形)
+# 公開ページの曲
 
 
 def go_fields(text: str) -> list[str]:
     """Go の strings.Fields (Unicode の空白の連なりで区切り、空の語を捨てる)。"""
     return [word for word in _GO_SPACE.split(text or "") if word]
-
-
-def bridge_query(artists: Iterable[str], title: str) -> str:
-    """"ytsearch1:<アーティストを空白で繋いだもの> <曲名>"。空白の連なり・改行・タブは 1 つの空白にし、
-    空のアーティスト名は飛ばす (bridge.go の bridgeQuery)。"""
-    words: list[str] = []
-    for text in [*artists, title]:
-        words.extend(go_fields(text))
-    return BRIDGE_PREFIX + " ".join(words)
 
 
 def split_artists(subtitle: str) -> list[str]:
@@ -251,22 +240,18 @@ def split_artists(subtitle: str) -> list[str]:
     return subtitle.split(ARTIST_SEPARATOR)
 
 
-def bridge_track(spotify_id: str, title: str, artists: Iterable[str], *, duration: int = 0,
+def spotify_track(spotify_id: str, title: str, artists: Iterable[str], *, duration: int = 0,
                  album: str = "", year: int = 0, track_number: int = 0) -> Track:
-    """cliamp の Web API だけの Spotify が返す「YouTube で探して鳴らす曲」と同じ Track (bridged())。
-
-    path は bridge_query、artist はアーティスト名を ", " で繋いだもの (名前はそのまま)、duration は秒、
-    meta は {"spotify.id": id, "spotify.bridge": "youtube"}。stream も unplayable も立てない。"""
-    artists = list(artists)
+    """Spotify の公開ページに載っている録音をその曲の URI で保存する。"""
     return Track(
-        path=bridge_query(artists, title),
+        path=f"spotify:track:{spotify_id}",
         title=title,
         artist=", ".join(artists),
         album=album,
         year=int(year or 0),
         track_number=int(track_number or 0),
         duration=max(0, int(duration or 0)),
-        meta=((META_BRIDGE, PLAYBACK_YOUTUBE), (META_ID, spotify_id)),
+        meta=((META_ID, spotify_id),),
     )
 
 
@@ -278,7 +263,7 @@ def bridge_track(spotify_id: str, title: str, artists: Iterable[str], *, duratio
 class ImportedList:
     """埋め込みの頁から読んだプレイリスト・アルバム。
 
-    tracks は YouTube で探して鳴らす形 (bridge_track)。skipped は曲でない項目 (ポッドキャストの
+    tracks は Spotify の曲 URI を持つ。skipped は曲でない項目 (ポッドキャストの
     エピソード・手元のファイル) の数。truncated は埋め込みの頁の上限 (100 曲) で切れていること、
     total は Spotify での曲数 (分からなければ 0)。"""
 
@@ -380,7 +365,7 @@ def _owner_of(entity: dict) -> str:
 
 def parse_embed_html(page: str, ref: SpotifyRef | None = None) -> ImportedList:
     """埋め込みの頁 (HTML) を読む。__NEXT_DATA__ の props.pageProps.state.data.entity の名前・
-    副題・絵・trackList から、曲を YouTube で探して鳴らす形にする。
+    副題・絵・trackList から、Spotify の曲 URI を読む。
 
     頁が 404 (無い・非公開) なら kind "not-found"、ほかの失敗の頁なら "unavailable"、形が違えば
     "shape"、曲が 1 つも無ければ "empty" の SpotifyImportError。truncated は曲の数が上限 (100) に
@@ -428,11 +413,11 @@ def parse_embed_html(page: str, ref: SpotifyRef | None = None) -> ImportedList:
         track_id = uri[len("spotify:track:"):] if uri.startswith("spotify:track:") else ""
         title = _text(item.get("title"))
         artists = split_artists(_text(item.get("subtitle")))
-        if not is_spotify_id(track_id) or bridge_query(artists, title) == BRIDGE_PREFIX:
+        if not is_spotify_id(track_id) or not any(name.strip() for name in [*artists, title]):
             skipped += 1  # エピソード (spotify:episode:)・手元のファイル (spotify:local:)・名前の無いもの
             continue
         duration_ms = _int(item.get("duration"))
-        tracks.append(bridge_track(track_id, title, artists, duration=duration_ms // 1000 if duration_ms > 0 else 0,
+        tracks.append(spotify_track(track_id, title, artists, duration=duration_ms // 1000 if duration_ms > 0 else 0,
                                    album=album))
     if not tracks:
         raise SpotifyImportError(f"この{KINDS.get(kind, kind)}には取り込める曲がありません", "empty")
@@ -778,7 +763,8 @@ class ImportIndex:
         tracks = raw.get("tracks")
         if isinstance(tracks, dict):
             for path, sid in tracks.items():
-                if isinstance(path, str) and path.startswith(BRIDGE_PREFIX) and is_spotify_id(sid):
+                if (isinstance(path, str) and is_spotify_id(sid)
+                        and (path.startswith(BRIDGE_PREFIX) or path == f"spotify:track:{sid}")):
                     data.tracks[clean_text(path)] = sid
         playlists = raw.get("playlists")
         if isinstance(playlists, dict):
@@ -816,8 +802,6 @@ class ImportIndex:
 
     def lookup(self, path: str) -> str | None:
         """橋渡しの path の Spotify の曲 ID (覚えていなければ None)。"""
-        if not isinstance(path, str) or not path.startswith(BRIDGE_PREFIX):
-            return None
         return self._loaded().tracks.get(path)
 
     def restore(self, track: Track | None) -> Track | None:
@@ -842,7 +826,8 @@ class ImportIndex:
     def known_count(self, tracks: Iterable[Track]) -> int:
         """tracks のうち、取り込んだ曲 (橋渡しの path がこの表にあるもの) の数。"""
         known = self._loaded().tracks
-        return sum(1 for t in tracks if isinstance(t.path, str) and t.path in known)
+        ids = set(known.values())
+        return sum(1 for t in tracks if t.path in known or t.spotify_id in ids)
 
     # --- プレイリスト -------------------------------------------------------------------
 
@@ -897,7 +882,7 @@ class ImportIndex:
         data = self._loaded()
         for track in result.tracks:
             sid = track.meta_get(META_ID)
-            if sid and track.path.startswith(BRIDGE_PREFIX):
+            if sid and (track.path.startswith(BRIDGE_PREFIX) or track.path == f"spotify:track:{sid}"):
                 data.tracks.pop(track.path, None)  # 入れ直して新しい側へ
                 data.tracks[track.path] = sid
         record = ImportRecord(name=name, url=result.url, kind=result.kind, id=result.id, title=result.name,

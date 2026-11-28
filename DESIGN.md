@@ -407,10 +407,8 @@ def parse_spotify_url(text) -> SpotifyRef        # open.spotify.com/{playlist,al
                                                  # ID は英数字ちょうど 22 文字 (fullmatch。"<id>\n" は通さない)
 def check_spotify_url(text) -> (SpotifyRef | None, 理由)   # 入力中の確かめ (空は (None, ""))
 def is_spotify_id(text) -> bool; def clean_text(text) -> str   # 対になっていないサロゲートを U+FFFD に
-def bridge_query(artists, title) -> str          # "ytsearch1:<アーティストを空白で> <曲名>" (Go の strings.Fields の空白で)
-def bridge_track(id, title, artists, *, duration=0, album="", year=0, track_number=0) -> Track
-    # パッチの external/spotify/bridge.go の bridged() と同じ形 (artist は ", " で繋ぐ、
-    # meta {"spotify.id", "spotify.bridge": "youtube"}、stream も unplayable も無し)
+def spotify_track(id, title, artists, *, duration=0, album="", year=0, track_number=0) -> Track
+    # Spotify の曲 URI と曲名・アーティストを保って保存する。
 def parse_embed_html(html, ref=None) -> ImportedList
     # <script id="__NEXT_DATA__"> の props.pageProps.state.data.entity (name・subtitle・coverArt か
     # visualIdentity.image・trackList)。曲の subtitle はアーティストを ",\u00a0" で繋いだもの。
@@ -689,15 +687,12 @@ macOS 27 の形: 窓の端まで続く帯 (浮かない)、赤い記号、選択
   サイドバーの「プレイリスト」の節の見出しと行を右クリック (長押し) すると「Spotify から取り込む…」
   (取り込んだものの行なら「Spotify から更新」も)。見出しは Gtk.ListBox の行の外に置かれる (get_row_at_y は
   None) ので、`Sidebar.row_at(y)` が見出しの矩形でも探す。
-  曲を YouTube で探して鳴らすプロバイダー (providers の `playback` が "youtube") の節には
-  見出しの下に「曲は YouTube で探して再生します」(12px 副次色の注意書き)。起動したばかりの
+  Spotify の再生用のサインインが必要な場合は、そのことを Spotify の節に書き添える。起動直後の
   cliamp では最初の providers の答えに `playback` が無いので、カタログが spotify の playlists の
   成功の後で取り直した答え ("providers-changed") で書き添える。
 - プレイリストの詳細: 左上に 250px の絵 (角 10、柔らかい影。先頭 4 曲の 2x2 か代わりの絵)、
   右に題 (26px/700)、提供元 (26px/400、赤)、情報の行「12 曲 · 48 分」(11px/600 副次色)、
-  YouTube で探して鳴らすプレイリスト (プロバイダーの `playback` が "youtube" か、曲が
-  `is_youtube_bridge`) はその下に「曲は YouTube で探して再生します」(11px/500 副次色、
-  `DetailHeader.set_note`)、
+  旧 cliamp が YouTube 検索式を返した場合は、Spotify の再生用のサインインを案内する。
   ボタン: シャッフルの丸 (34px) / 「▶ 再生」カプセル (34x120) / 「…」の丸。
   下に曲の行 (43px、番号・曲名・時間・「…」、区切り線は曲名の列から)。行のダブルクリックは
   見えている並びをそのまま `replace` で送る (`load_provider` はプロバイダーに取り直させて
@@ -705,8 +700,7 @@ macOS 27 の形: 窓の端まで続く帯 (浮かない)、赤い記号、選択
   超えるリストだけ `load_provider`)。ローカルのプレイリストが消えたら (最後の曲を外した・
   TUI で消した) ページを閉じる。ファイルの場所 (`open …/X.toml`) は見せない。
   Spotify から取り込んだローカルのプレイリスト (記録があり、曲の半分以上が取り込んだ曲): 提供元の行は
-  Spotify での作り手 (アルバムならアーティスト)、絵は Spotify の絵、書き添えは「Spotify から取り込み · 曲は
-  YouTube で探して再生します」(100 曲で切れていれば「(全 150 曲のうち最初の 100 曲)」も)、「…」に
+  Spotify での作り手 (アルバムならアーティスト)、絵は Spotify の絵、書き添えは「Spotify から取り込み · Spotify で再生します」(100 曲で切れていれば「(全 150 曲のうち最初の 100 曲)」も)、「…」に
   「Spotify から更新」(確かめてから置き換える)「Spotify で開く」。
   Spotify のプレイリストが「持ち主が Premium でない」「読めない」で開けないときは、題「このプレイリストは
   読めません」、説明にその理由、「Spotify から取り込む…」(ID が Spotify の形ならそのリンクを入れて開く)。

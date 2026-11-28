@@ -39,7 +39,7 @@ NATIVE_240_FORBIDDEN = ("spotify: Spotify lets apps read only playlists you own 
                         "to your own playlist in Spotify, then open that playlist: http status 403: Forbidden")
 OWNER_PREMIUM = ('spotify: list tracks: http status 403 Forbidden: '
                  '{"error":{"status":403,"message":"Active premium subscription required for the owner of the app"}}')
-PUBLIC_NOTE = "Spotify の公開ページから表示 · 曲は YouTube で探して再生します"
+PUBLIC_NOTE = "Spotify の公開ページから表示 · Spotify で再生します"
 
 
 def public_list(*, count=3, total=0, name="公開プレイリスト", seed="fallback"):

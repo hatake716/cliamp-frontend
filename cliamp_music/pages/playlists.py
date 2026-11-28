@@ -3,9 +3,7 @@
 PlaylistsPage: 大見出し「プレイリスト」。プロバイダーごとの節 (ローカルが先頭、
 次に playlists を持つプロバイダー。radio は除く) に、プレイリストのカードの格子。
 サインインの要るプロバイダーは節に小さな注意書きを出す。押すと詳細へ。
-曲を YouTube で探して鳴らすプロバイダー (ProviderInfo の playback が "youtube"。Web API
-だけの Spotify) の節には「曲は YouTube で探して再生します」と書き添える。playback は cliamp が
-Spotify のセッションを作った後 (spotify の playlists の初回の後) の providers にしか載らないので、
+Spotify の接続状態はセッションの開始後に届くので、
 カタログが取り直した答えを ctx が覚えたとき ("providers-changed") にも書き添えを直す。
 
 PlaylistDetailPage: Apple のアルバムの頁の形。左上に 250px の絵 (先頭 4 曲の 2x2、
@@ -15,15 +13,13 @@ PlaylistDetailPage: Apple のアルバムの頁の形。左上に 250px の絵 (
 取り直させて添字で選ぶので、その間にリストが変わっていると別の曲が鳴る)。replace の無い
 cliamp と、とても長いリストだけ `load_provider`。ローカルのプレイリストは「…」から
 削除でき (確認あり)、行の「…」に「プレイリストから削除」が出る。最後の曲を外すと cliamp は
-プレイリストごと消すので、そのときはページを閉じる。曲を YouTube で探して鳴らすプレイリスト
-(プロバイダーの playback が "youtube" か、曲が YouTube で探す Spotify の曲) は、情報の行の
-下に「曲は YouTube で探して再生します」と控えめに書き添える。
+プレイリストごと消すので、そのときはページを閉じる。Spotify の再生用のサインインが必要な場合は情報の行に表示する。
 
 Spotify から取り込む: すべてのプレイリストのヘッダーの右にガラスのカプセル「Spotify から取り込む…」
 (狭い幅では記号だけ)。ローカルのプレイリストが 1 つも無いときと、Spotify の節が「開発者アプリの持ち主が
 Premium でない」で読めないとき (その説明を書く) は、節にも同じボタンを出す。取り込んだローカルの
 プレイリストの詳細は、提供元の行を Spotify での作り手 (アルバムならアーティスト)、絵を Spotify の絵にし、
-情報の行の下に「Spotify から取り込み · 曲は YouTube で探して再生します」と書き添え、「…」に
+情報の行の下に「Spotify から取り込み · Spotify で再生します」と書き添え、「…」に
 「Spotify から更新」(読み直し、確かめてから置き換える)・「Spotify で開く」を足す。カードは副題を
 「Spotify · N 曲」、絵を Spotify の絵にする。取り込んだものかは記録 (名前で引く) だけでなく曲でも
 確かめる (AppContext.imported_record。TUI で消して同じ名前で作り直したものは別物として記録を忘れる)。
@@ -103,7 +99,7 @@ REPLACE_MAX_TRACKS = 10000
 IMPORT_LABEL = "Spotify から取り込む…"
 SYNC_ALL_LABEL = "すべて同期"
 _SPOTIFY_ID = re.compile(r"[A-Za-z0-9]{22}")
-IMPORTED_NOTE = "Spotify から取り込み · 曲は YouTube で探して再生します"
+IMPORTED_NOTE = "Spotify から取り込み · Spotify で再生します"
 
 
 def imported_note(record) -> str:
@@ -112,7 +108,7 @@ def imported_note(record) -> str:
     if record is None:
         return IMPORTED_NOTE
     if record.truncated and record.total > record.count:
-        base = f"Spotify から取り込み (全 {record.total} 曲のうち最初の {record.count} 曲) · 曲は YouTube で探して再生します"
+        base = f"Spotify から取り込み (全 {record.total} 曲のうち最初の {record.count} 曲) · Spotify で再生します"
     else:
         base = IMPORTED_NOTE
     if record.auto_sync:
@@ -121,6 +117,8 @@ def imported_note(record) -> str:
 
 
 def auth_note(ctx, provider: str) -> str:
+    if provider == "spotify" and ctx.store.supports("connect_spotify_playback"):
+        return "「プレイリスト」の Spotify 欄から Premium アカウントを接続してください"
     return f"{provider_label(ctx, provider)} はサインインが必要です (cliamp の端末で設定)"
 
 
@@ -144,6 +142,17 @@ class _ProviderSection(Gtk.Box):
         page.inset(self.note)
         self.note.set_visible(False)
         self.append(self.note)
+        self.connect_playback = None
+        self.needs_auth = False
+        if key == "spotify":
+            button = CapsuleButton("Spotify の再生に接続…", "music-play-symbolic")
+            button.set_halign(Gtk.Align.START)
+            button.add_css_class("music-section-action")
+            button.connect("clicked", weak_call(page.ctx.connect_spotify_playback))
+            page.inset(button)
+            button.set_visible(False)
+            self.append(button)
+            self.connect_playback = button
         # 「Spotify から取り込む…」(ローカルが空のとき・Spotify のライブラリが読めないとき)
         youtube = key == "youtube-account"
         self.action = CapsuleButton("YouTube Music に接続…" if youtube else IMPORT_LABEL, "music-import-symbolic")
@@ -369,7 +378,11 @@ class PlaylistsPage(PageBase):
             self._update_note(section)
 
     def _update_note(self, section: _ProviderSection) -> None:
-        """節の注意書き: 取れないときの説明、無ければ曲を YouTube で探して鳴らすことの書き添え。"""
+        """プロバイダーの認証状態と、プレイリスト取得時のメッセージを表示する。"""
+        sign_in = provider_playback(self.ctx, section.key) == "spotify-sign-in"
+        if section.connect_playback is not None:
+            section.connect_playback.set_visible(
+                self.ctx.store.supports("connect_spotify_playback") and (section.needs_auth or sign_in))
         if not section.loaded:
             return
         if section.key == "youtube-account":
@@ -379,8 +392,10 @@ class PlaylistsPage(PageBase):
             section.action.set_visible(section.offer_import and self.ctx.store.supports("playlist_add"))
         if section.problem:
             section.show_note(section.problem)
+        elif sign_in:
+            section.show_note("Spotify Premium アカウントを接続すると、ミュージックで直接再生できます")
         elif provider_playback(self.ctx, section.key) == PLAYBACK_YOUTUBE:
-            # Web API だけの Spotify (無料プランなど): 曲は YouTube で探して鳴らす
+            # 旧 cliamp が Web API だけの Spotify を返す場合
             section.show_note(WEB_ONLY_NOTE)
         else:
             section.show_note("")
@@ -401,6 +416,7 @@ class PlaylistsPage(PageBase):
             else:
                 content.reorder_child_after(section, previous)
             section.header.set_title(provider_label(self.ctx, key))
+            self._update_note(section)
             previous = section
 
     def _load_section(self, serial: int, key: str, force: bool) -> None:
@@ -413,6 +429,7 @@ class PlaylistsPage(PageBase):
             if section is None:
                 return
             section.loaded = True
+            section.needs_auth = isinstance(result, Response) and result.needs_auth
             if isinstance(result, Response):
                 section.keys = None
                 self._clear_groups(section)
@@ -729,8 +746,8 @@ class PlaylistDetailPage(PageBase):
         self._update_note()
 
     @property
-    def plays_via_youtube(self) -> bool:
-        """曲を YouTube で探して鳴らすか (プロバイダーがそう言っているか、曲がそうなっている)。"""
+    def has_legacy_spotify_bridge(self) -> bool:
+        """旧 cliamp が Web API のみの Spotify セッションを使っているか。"""
         if self.is_local:
             return False
         return (provider_playback(self.ctx, self.provider) == PLAYBACK_YOUTUBE
@@ -763,14 +780,14 @@ class PlaylistDetailPage(PageBase):
             return
         if self._public_list is not None:
             result = self._public_list
-            note = f"Spotify の公開ページから表示 · {WEB_ONLY_NOTE}"
+            note = "Spotify の公開ページから表示 · Spotify で再生します"
             if result.truncated:
                 extent = (f"全 {result.total} 曲のうち最初の {result.count} 曲" if result.total > result.count
                           else f"最初の {result.count} 曲 (公開ページは {EMBED_TRACK_CAP} 曲まで)")
                 note += f" · {extent}"
             self.header.set_note(note)
             return
-        self.header.set_note(WEB_ONLY_NOTE if self._tracks and self.plays_via_youtube else "")
+        self.header.set_note(WEB_ONLY_NOTE if self._tracks and self.has_legacy_spotify_bridge else "")
 
     def _show_problem(self, icon: str, title: str, text: str, *, button_label: str | None = None,
                       on_button=None) -> None:
@@ -845,7 +862,7 @@ class PlaylistDetailPage(PageBase):
         status = store.status
         if self._loaded_here() and status.track is not None:
             i = status.index
-            if 0 <= i < len(self._tracks) and self._tracks[i].path == status.track.path:
+            if 0 <= i < len(self._tracks) and self._tracks[i].for_playback().path == status.track.for_playback().path:
                 index = i
         self.list.set_current_index(index, is_playing(status))
 

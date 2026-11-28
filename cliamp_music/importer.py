@@ -69,7 +69,7 @@ PLACEHOLDER_TEXT = "リンクを貼ると、ここにプレイリストの名前
 LOADING_TEXT = "Spotify から読み込んでいます…"
 RETRY_LABEL = "もう一度読む"
 IMPORT_TITLE = "Spotify から取り込む"
-IMPORT_BODY = "公開プレイリストかアルバムのリンクを貼り付けてください。\n曲は YouTube で探して再生します。"
+IMPORT_BODY = "公開プレイリストかアルバムのリンクを貼り付けてください。\n取り込んだ曲は Spotify で再生します。"
 MISSING_TEXT = "no such file or directory"
 # 読み直せば通るかもしれない失敗 (「もう一度読む」を出す)
 RETRY_KINDS = frozenset({"network", "rate-limited", "unavailable"})
@@ -988,7 +988,7 @@ def update_import(ctx, name: str, callback: Callable[[bool], object] | None = No
             finish(False, f"「{name}」はもう Spotify から取り込んだプレイリストではないため、更新しません")
             ctx.emit("local-playlists-changed")  # 取り込んだものとしての見せ方を外す
             return
-        if [t.path for t in current] == [t.path for t in value.tracks]:
+        if [t.for_playback().path for t in current] == [t.path for t in value.tracks]:
             try:
                 ctx.imports.record(name, value)  # 名前・絵・曲数の記録を新しく
             except Exception as exc:

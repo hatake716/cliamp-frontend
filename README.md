@@ -22,16 +22,14 @@ macOS 27 の「ミュージック」風に操作する GTK4 + libadwaita のア�
   プレイリスト (cliamp のローカルのプレイリストと、Spotify など cliamp に登録された
   プロバイダーのもの)。窓の端まで続く macOS 27 の形で、記号は赤。
 - **Spotify から取り込む**: Spotify の公開プレイリスト・アルバムのリンクを貼ると、ローカルの
-  プレイリストとして取り込み、曲は YouTube で探して鳴らす (Spotify の無料プランでも使える。
-  [下](#spotify-から取り込む-公開プレイリストアルバム))。
+  プレイリストとして取り込み、Spotify の曲 ID を使って同じ録音を再生する。
 - **再生バー**: 画面の下に浮かぶガラスのカプセル。シャッフル・前へ・再生・次へ・
   リピート、アートワークと曲名、ドラッグでシークできる細い線、再生速度・イコライザ・
   リンクのコピー、歌詞と次に再生のパネル、出力先 (cliamp の `device`)、音量。
 - **ホーム**: 最近再生した YouTube の曲から作るステーション (YouTube のミックス)、
   最近再生した項目、プレイリスト、日本の人気のラジオ局。
-- **検索**: YouTube (cliamp の yt-dlp の検索)、Spotify (登録されていれば。自分の client_id で、
-  開発者アプリの持ち主が Premium のとき。[下](#spotify))、ライブラリ
-  (ローカルのプレイリストと履歴)。トップの結果と曲の一覧、最近の検索、カテゴリーのタイル。
+- **検索**: 既定の検索先は Spotify。YouTube とライブラリにも切り替えられ、前回選んだ範囲を記憶する。
+  Spotify 日本トップ50のカードからは掲載された曲を直接再生できる。
 - **ラジオ**: cliamp ラジオ (組み込みの局とお気に入り) と
   [Radio Browser](https://www.radio-browser.info/) の人気局・局の検索。
 - **プレイリストの詳細と再生中のリスト**: アルバムのページの形。再生中の行に動くバー。
@@ -73,8 +71,7 @@ macOS 27 の「ミュージック」風に操作する GTK4 + libadwaita のア�
 - アプリは MPRIS の名前を取らない (GNOME のメディアの操作や Open-Voice からは、今まで
   どおり cliamp が 1 つのプレーヤーとして見える)。
 - アートワークは cliamp が持っていないので、アプリが曲から求める: YouTube の曲は
-  サムネイル (黒帯を除いて正方形に切り抜く)、Spotify は oEmbed (YouTube で探して鳴らす
-  Spotify の曲も、探した動画ではなく Spotify のアルバムの絵)、手元のファイルは埋め込みの
+  サムネイル (黒帯を除いて正方形に切り抜く)、Spotify は oEmbed、手元のファイルは埋め込みの
   絵か同じフォルダの cover.jpg、ラジオは局の favicon。取れなければ色の代わりの絵。
   `~/.cache/cliamp-music/` に 256 MiB まで置く。
 
@@ -217,12 +214,10 @@ cliamp の Spotify は、自分で [Spotify for Developers](https://developer.sp
   ように長さ) と出す。
 
 **自分の client_id と Premium** なら、プレイリスト (自分のものと共同編集のもの。他人のプレイリストの
-中身は Web API では読めない)・保存した曲 (Your Music)・検索が使える。曲を Spotify から直接鳴らせるかは、
-Spotify が librespot (Spotify の再生の仕組み) のセッションを受け入れるかによる。受け入れれば曲は
-Spotify から鳴り、断られたら (自分で登録した client_id のトークンを `login5` が断る、など) Web API だけの
-接続になって、曲は **YouTube で探して鳴らす** (下の「Web API だけ」)。前に Web API だけで繋がっていた
-cliamp は librespot を試し直さないので、Premium にした後で Spotify から直接鳴らしたいときは、端末で
-`cliamp spotify reset` してサインインし直す。
+中身は Web API では読めない)・保存した曲 (Your Music)・検索が使える。
+この PC の cliamp 2.4.0 では、ミュージックのプレイリスト画面から Spotify の再生に接続し、
+ブラウザーで Premium アカウントを一度認証する。次回からはその接続で Spotify の音源を再生する。
+Web API にサインイン済みでも、再生用の接続を初めて使うときは認証が必要になる。
 
 他人のプレイリストを開いて Web API が曲の取得を 403 で断った場合は、Music が公開ページから
 自動で曲を読み込む。「Spotify の公開ページから表示」と書き添え、再生・シャッフルには表示した曲を
@@ -253,9 +248,8 @@ Spotify のライブラリは読めません。Premium にした直後は、Spot
 
 Spotify の Web API を通さず、ログインの要らない埋め込み用の頁
 (`https://open.spotify.com/embed/playlist/<id>`、`/embed/album/<id>`) から曲の一覧を読み、
-cliamp の **ローカルのプレイリスト** として保存する。曲は下の「Web API だけ」の接続と同じ形
-(`ytsearch1:<アーティスト> <曲名>`) で、**YouTube で探して鳴らす** (最初に見つかった動画を鳴らすので、
-ライブ版やカバーが当たることもある)。
+cliamp の **ローカルのプレイリスト** として各曲の `spotify:track:<曲 ID>` を保存する。
+取り込みにはサインイン不要。アプリ内で曲を聴くには Spotify Premium の再生用接続が必要になる。
 
 - 開き方: すべてのプレイリストの右上の「Spotify から取り込む…」、サイドバーの「プレイリスト」の
   見出しか行の右クリック、ローカルのプレイリストが無いときのボタン。Spotify のアプリの「共有」→
@@ -266,7 +260,7 @@ cliamp の **ローカルのプレイリスト** として保存する。曲は�
   尋ねる。取り込んだら「「名前」を取り込みました (N 曲)」と出て、そのプレイリストを開く。
   プレイリストの名前はファイル名になるので、長すぎる名前 (日本語でおよそ 80 文字を超えるもの) は
   使えない (Spotify の名前が長ければ縮めて入れる)。
-- 取り込んだプレイリストの詳細には「Spotify から取り込み · 曲は YouTube で探して再生します」と
+- 取り込んだプレイリストの詳細には「Spotify から取り込み · Spotify で再生します」と
   書き添え、「…」の「Spotify から更新」で読み直して曲を置き換える (名前はそのまま)。置き換える前に
   「「名前」の N 曲を、Spotify の〜の M 曲に置き換えます」と確かめる (自分で足した曲が混じっていれば、
   それが外れることも言う。Spotify と同じならそのまま)。GUI を閉じている間に TUI で消して同じ名前で
@@ -275,9 +269,8 @@ cliamp の **ローカルのプレイリスト** として保存する。曲は�
   足す。足せなければ前の曲を戻す。戻すこともできなかったとき (cliamp が止まった・ディスクが一杯) は、
   前の曲の一覧を `~/.local/state/cliamp-music/playlist-backups/` に残し、窓で「もう一度戻す」を出す。
   「Spotify で開く」は元のプレイリストの頁。曲の絵・「リンクをコピー」・「Spotify で開く」は
-  Spotify の曲のもの。このPCの cliamp 2.4.0 は有効な Spotify の曲 ID・アルバム ID と
-  YouTube 再生を示す情報をローカルのプレイリストに保存する。古いプレイリストや履歴で曲 ID が
-  欠けているときは、アプリが `~/.local/state/cliamp-music/spotify-imports.json` の対応表から補う。
+  Spotify の曲のもの。以前取り込んだプレイリストや履歴も、保存された曲 ID または
+  `~/.local/state/cliamp-music/spotify-imports.json` の対応表から同じ Spotify の録音を再生する。
 - 制限:
   - 読めるのは **公開** のプレイリストとアルバムだけ。非公開のプレイリストと「お気に入りの曲」
     (Liked Songs) は Spotify の外からは読めない (公開のプレイリストに入れてから取り込む)。
@@ -290,34 +283,13 @@ cliamp の **ローカルのプレイリスト** として保存する。曲は�
 
 ### Premium の開発者アプリ (Web API)
 
-開発者アプリの持ち主が Premium なら、今までどおり自分の client_id で cliamp の Spotify を使う
-(Premium のアカウントならこれが普通の使い方)。パッチは Spotify の接続を 2 つの形で扱う。
-
-- **Premium** (librespot のセッションが作れる): 今までどおり。曲は Spotify から直接鳴り、
-  `spotify_credentials.json` の形も変わらない。
-- **Web API だけ**: サインイン (OAuth) は済んだが、Spotify が librespot のセッションを断った
-  とき (自分で登録した client_id のトークンに `login5` が `INVALID_CREDENTIALS` を返す、
-  無料プランのアカウントにアクセスポイントが Premium を求める、など。一時的なネットワークの失敗は
-  含まない)。cliamp はトークンを捨てずに Web API だけを使い、プレイリストと保存した曲 (Your Music)
-  の一覧は Spotify から取る。曲は **YouTube で探して鳴らす** (Spotify の曲名とアーティストで yt-dlp の
-  `ytsearch1:` を引き、最初に見つかった動画を鳴らす)。曲名・アルバム・長さ・アートワークは Spotify の
-  もので、「リンクをコピー」も Spotify の曲を指す。アプリのプレイリストの詳細とすべての
-  プレイリストの Spotify の節には「曲は YouTube で探して再生します」と出る。リフレッシュ
-  トークンは Web API だけの印と一緒に `spotify_credentials.json` に残るので、次からはブラウザを
-  開かずに繋がる (librespot は試し直さないので、Premium にしたら `cliamp spotify reset` して
-  サインインし直す)。
-
-Spotify が librespot のセッションを断らなかったとき (組み込みの共有の client_id で起きた) は
-Web API だけの接続にならず、曲は Spotify から鳴らそうとして失敗する。
-
-使い方: [cliamp の説明](https://github.com/bjarneo/cliamp/blob/main/docs/spotify.md) のとおり
-[Spotify for Developers](https://developer.spotify.com/dashboard) でアプリを作り (開発モードで
-よい。Redirect URI は `http://127.0.0.1:19872/login`)、その Client ID を
-`~/.config/cliamp/config.toml` の `[spotify]` の `client_id` に書く。サインインは端末の cliamp で
-行う (アプリからは始めない)。
+Spotify のライブラリと検索には開発者アプリの Web API を使う。
+自分の client_id を使う場合は `~/.config/cliamp/config.toml` の `[spotify]` に設定する。
+Web API の認可と音声の再生用接続は別々に管理する。
+[cliamp の Spotify 設定](https://github.com/bjarneo/cliamp/blob/main/docs/spotify.md)
 
 - **検索**: 開発モードのアプリでも、1 回 10 件までなら `/v1/search` を使える。パッチの cliamp は
-  10 件ずつに分けて頼む (Web API だけの接続では、結果の曲も YouTube で探して鳴らす形になる)。
+  10 件ずつに分けて頼む。再生時には検索結果の Spotify の曲 ID を使う。
   古い cliamp (1 回に 10 件より多く頼む) や、Spotify が上限をさらに下げたときは 400 "Invalid limit" で
   断られ、検索の「Spotify」の範囲では英語の誤りの代わりに「Spotify では検索できません」と今の規則を出し、
   「YouTube で検索」のボタンで YouTube の範囲に替えて探し直せる。プレイリストと保存した曲は
@@ -328,14 +300,14 @@ Web API だけの接続にならず、曲は Spotify から鳴らそうとして
   もう一度試してください」のように待つ長さを出す。
 - **利用枠**: 429 に reason "QUOTA_EXCEEDED" が付いていたら、待っても戻らないので cliamp は待たずに
   失敗を返し、アプリは回数の制限とは分けて「Spotify の開発者向けの利用枠を使い切りました。…」と出す。
-- Web API だけの接続では、`spotify:track:` の曲 (前に Premium で作ったリストなど) は鳴らせず、
-  再生バーに「Spotify の曲の再生には Premium が必要です」と出る。
+- 単体ビルド用の旧 cliamp 1.50 で Web API のみに接続している場合、ライブラリは閲覧できるが、
+  Spotify の曲を聴くには librespot の再生用セッションが必要になる。
 
 ## 制限
 
 - フルスクリーンプレーヤーとミニプレーヤーは、外観によらず暗い (Apple と同じ。ぼかした絵の上に白)。
 - ライブラリにはローカル、cliamp に登録したプロバイダー、アプリで接続した YouTube Music アカウントのプレイリストが出ます。
-- Spotify のサインインは端末の cliamp で行います。YouTube Music の書き込み権限はアプリの接続ボタンから許可します。
+- Spotify の再生は Premium アカウントに対応します。YouTube Music の書き込み権限はアプリの接続ボタンから許可します。
 - 歌詞は行ごと (cliamp の LRC)。Apple のような単語ごとの色の移り変わりは無い。
 - ローカルのプレイリストに保存できるのは cliamp の TOML にある項目だけなので、ラジオの局
   (ライブ配信) は「プレイリストに追加」できない。

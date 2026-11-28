@@ -179,15 +179,19 @@ class Catalog:
         if waiters is not None:
             waiters.append(callback)
             return
-        self._waiting[key] = [callback]
+        callbacks = [callback]
+        self._waiting[key] = callbacks
 
         def done(response: Response) -> None:
+            if self._waiting.get(key) is not callbacks:
+                # 認証の切り替えで取り消した、前のアカウントへの要求。
+                return
             if response.kind == "cancelled" and lane and self._lane_latest.get(lane) == key:
                 # 打ち直しで捨てられた検索に、また同じ語で頼まれていた (「abc」→「abcd」→「abc」)。
                 # 待っている人がいるので送り直す
                 self.client.request(cmd, done, lane=lane, **fields)
                 return
-            callbacks = self._waiting.pop(key, [])
+            del self._waiting[key]
             # セッションより前に送った providers の答え (覚えない。届いたら取り直す)
             stale = key == _PROVIDERS_KEY and self._providers_again
             if response.ok:
@@ -249,6 +253,16 @@ class Catalog:
         """providers の答え (成功したもの) が届くたびに listener(答え) を呼ぶ。カタログが自分で
         取り直した答え (セッションができた後) もここに来る。キャッシュからの答えでは呼ばない。"""
         self._providers_listeners.append(listener)
+
+    def session_changed(self, provider: str) -> None:
+        """再認証後は、前のアカウントについて送信中の取得結果も破棄する。"""
+        self.invalidate(provider)
+        for key in list(self._waiting):
+            if key[0] in _SESSION_KINDS and key[1] == provider:
+                for callback in self._waiting.pop(key):
+                    self._later(callback, Response.cancelled())
+        self._cache.pop(_PROVIDERS_KEY, None)
+        self._refresh_providers()
 
     def invalidate(self, provider: str | None = None) -> None:
         """覚えている結果を捨てる (Ctrl+R・繋ぎ直しなど)。provider を指定すればそのプロバイダーの分だけ。

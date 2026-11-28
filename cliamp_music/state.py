@@ -37,7 +37,7 @@ class GuiState:
     def __init__(self, path: str | None = None):
         self.path = path or default_path()
         self.recent_searches: list[str] = []
-        self.search_scope: str = "youtube"
+        self.search_scope: str = "spotify"
         self.right_panel: str = ""
         self.last_page: str = "home"
         self.window_width: int = 1180

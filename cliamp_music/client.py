@@ -67,7 +67,9 @@ def default_socket_path() -> str:
 
 
 def default_timeout(cmd: str) -> float:
-    """コマンドごとの待ち時間 (状態系 5 秒、カタログ系 130 秒)。"""
+    """ブラウザーでの再生用認証は、サーバーの5分の期限まで待つ。"""
+    if cmd == "connect_spotify_playback":
+        return 310.0
     return CATALOG_TIMEOUT if cmd in CATALOG_COMMANDS else STATE_TIMEOUT
 
 

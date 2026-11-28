@@ -70,6 +70,25 @@ class CatalogTest(unittest.TestCase):
 
 
 class Reading(CatalogTest):
+    def test_old_spotify_response_cannot_replace_new_session_library(self):
+        sent = []
+        def request(cmd, callback, **_kwargs):
+            if cmd == "playlists":
+                sent.append(callback)
+
+        old, new = [], []
+        with unittest.mock.patch.object(self.catalog.client, "request", side_effect=request):
+            self.catalog.playlists("spotify", old.append)
+            self.catalog.session_changed("spotify")
+            self.catalog.playlists("spotify", new.append)
+            self.assertEqual(len(sent), 2)
+            sent[1](Response(True, {"playlists": [{"id": "B", "name": "new"}]}))
+            sent[0](Response(True, {"playlists": [{"id": "A", "name": "old"}]}))
+            self.assertTrue(run_loop(lambda: old))
+            self.assertEqual(old[0].kind, "cancelled")
+            self.assertEqual([info.id for info in new[0]], ["B"])
+            self.assertEqual(self.get(self.catalog.playlists, "spotify"), new[0])
+
     def test_providers(self):
         providers = self.get(self.catalog.providers)
         keys = [p.key for p in providers]

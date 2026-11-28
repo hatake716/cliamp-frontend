@@ -20,6 +20,7 @@ import time
 import unittest
 import weakref
 from pathlib import Path
+from dataclasses import replace
 from unittest import mock
 
 HERE = Path(__file__).resolve().parent
@@ -161,22 +162,21 @@ class ImportFlowTest(WebMixin, unittest.TestCase):
             self.wait(lambda: box)
         self.assertEqual(box[0].kind, "shape")
 
-    def test_save_writes_bridged_tracks_and_remembers_their_ids(self):
+    def test_save_writes_spotify_tracks_and_remembers_their_ids(self):
         result = si.fetch_list(URL)
         self.assertEqual(self.save(NAME, result), [True])
         self.assertIn(f"「{NAME}」を取り込みました (6 曲)", self.window.toasts)
         self.assertEqual(self.window.pages[-1], ("playlist", {"provider": "local", "id": NAME, "name": NAME}))
         self.assertIn(NAME, self.ctx.local_playlists)
-        # YouTube で再生する Spotify の曲を送り、現行のプレイリストが曲 ID と橋渡しの印を保存する。
+        # 公開ページの曲 URI をそのまま送って保存する。
         sent = self.fake.requests_for("playlist_add")[-1]["tracks"]
         self.assertEqual([t["path"] for t in sent], [t.path for t in result.tracks])
-        self.assertTrue(all(t["meta"]["spotify.bridge"] == "youtube" for t in sent))
+        self.assertTrue(all(t["path"] == "spotify:track:" + t["meta"]["spotify.id"] for t in sent))
         stored = self.fake.local_playlists[NAME]
         self.assertTrue(all("meta" in t for t in stored))
-        self.assertEqual(stored[0], {"path": "ytsearch1:青い灯台 夜明けのバス停", "title": "夜明けのバス停",
-                                     "artist": "青い灯台", "duration": 214, "stream": True,
-                                     "meta": {"spotify.id": result.tracks[0].spotify_id,
-                                              "spotify.bridge": "youtube"}})
+        self.assertEqual(stored[0], {"path": result.tracks[0].path, "title": "夜明けのバス停",
+                                     "artist": "青い灯台", "duration": 214,
+                                     "meta": {"spotify.id": result.tracks[0].spotify_id}})
         # 表に書いた
         record = self.ctx.imports.get(NAME)
         self.assertEqual((record.url, record.count, record.title), (f"https://open.spotify.com/playlist/{PID}", 6, NAME))
@@ -187,7 +187,7 @@ class ImportFlowTest(WebMixin, unittest.TestCase):
         self.wait(lambda: box)
         tracks = box[0]
         self.assertEqual([t.spotify_id for t in tracks], [t.spotify_id for t in result.tracks])
-        self.assertTrue(all(is_youtube_bridge(t) for t in tracks))
+        self.assertFalse(any(is_youtube_bridge(t) for t in tracks))
         self.assertEqual(art_sources(tracks[0])[0],
                          f"{SPOTIFY_OEMBED}https://open.spotify.com/track/{result.tracks[0].spotify_id}")
         self.assertEqual(tracks[0].web_url, f"https://open.spotify.com/track/{result.tracks[0].spotify_id}")
@@ -219,7 +219,7 @@ class ImportFlowTest(WebMixin, unittest.TestCase):
         original = self.fake._cmd_playlist_add
 
         def refuse_bridged(req, now):
-            if any(str(t.get("path", "")).startswith("ytsearch1:") for t in req.get("tracks") or []):
+            if any(str(t.get("path", "")).startswith("spotify:track:") for t in req.get("tracks") or []):
                 return {"ok": False, "error": "disk full"}
             return original(req, now)
 
@@ -252,7 +252,7 @@ class ImportFlowTest(WebMixin, unittest.TestCase):
         original = self.fake._cmd_playlist_add
 
         def add(req, now):
-            if any(str(t.get("path", "")).startswith("ytsearch1:") for t in req.get("tracks") or []):
+            if any(str(t.get("path", "")).startswith("spotify:track:") for t in req.get("tracks") or []):
                 return {"ok": False, "error": "disk full"}
             time.sleep(0.4)  # 戻すのに時間がかかる
             return original(req, now)
@@ -303,7 +303,7 @@ class ImportFlowTest(WebMixin, unittest.TestCase):
         self.assertEqual(result.name, "Sur\ufffd")
         name = si.playlist_name_for(result)
         self.assertEqual(self.save(name, result), [True])
-        self.assertEqual(self.fake.local_playlists[name][0]["path"], "ytsearch1:人\ufffd 曲\ufffd")
+        self.assertEqual(self.fake.local_playlists[name][0]["path"], result.tracks[0].path)
         self.assertTrue(self.ctx.imports.save())
         self.assertEqual(si.ImportIndex(self.ctx.imports.path).get(name).title, "Sur\ufffd")
 
@@ -332,28 +332,39 @@ class ImportFlowTest(WebMixin, unittest.TestCase):
         """TUI や load_provider で読み込んだ取り込み済みのプレイリスト (cliamp の曲に meta が無い) でも、
         再生バー・次に再生・履歴の曲は Spotify の曲として絵とリンクを持つ。"""
         result = si.fetch_list(URL)
-        self.save(NAME, result)
-        # この曲 ID が保存される前の版が書いたリストを再現する。
+        legacy = [replace(t, path=f"ytsearch1:{t.title}", stream=True,
+                          meta={"spotify.id": t.spotify_id, "spotify.bridge": "youtube"})
+                  for t in result.tracks]
+        self.ctx.imports.record(NAME, replace(result, tracks=tuple(legacy)))
+        # 旧 cliamp のローカル TOML には曲 ID が無く、GUI の対応表だけに保存されている。
         with self.fake.lock:
-            for item in self.fake.local_playlists[NAME]:
-                item.pop("meta", None)
+            self.fake.local_playlists[NAME] = [dict(path=t.path, title=t.title, stream=True) for t in legacy]
         store = self.ctx.store
         self.ctx.load_provider("local", NAME, 1, NAME)
-        self.wait(lambda: store.status.track is not None and store.status.track.path == result.tracks[1].path, 8)
+        self.wait(lambda: store.status.track is not None and store.status.track.path == legacy[1].path, 8)
         self.assertNotIn("meta", self.fake.pl.current()[0] or {}, "偽の cliamp の曲に meta が残っています")
         track = store.status.track
         self.assertTrue(is_youtube_bridge(track))
         self.assertEqual(track.spotify_id, result.tracks[1].spotify_id)
         self.assertEqual(art_sources(track)[0],
                          f"{SPOTIFY_OEMBED}https://open.spotify.com/track/{result.tracks[1].spotify_id}")
-        self.wait(lambda: len(store.playlist.tracks) == 6 and store.playlist.tracks[0].path == result.tracks[0].path)
+        self.wait(lambda: len(store.playlist.tracks) == 6 and store.playlist.tracks[0].path == legacy[0].path)
         self.assertTrue(all(is_youtube_bridge(t) for t in store.playlist.tracks))
         # Spotify の ID が無い旧形式の履歴にも対応する。
         with self.fake.lock:
-            self.fake.history.insert(0, (history_track(result.tracks[2].to_wire()), "2026-09-27T01:00:00Z"))
+            self.fake.history.insert(0, (history_track(legacy[2].to_wire()), "2026-09-27T01:00:00Z"))
         store.refresh_history()
-        self.wait(lambda: store.history and store.history[0].path == result.tracks[2].path)
+        self.wait(lambda: store.history and store.history[0].path == legacy[2].path)
         self.assertEqual(store.history[0].spotify_id, result.tracks[2].spotify_id)
+
+        store.enqueue([store.history[0]], mode="next")
+        self.wait(lambda: self.fake.requests_for("enqueue"))
+        self.assertEqual(self.fake.requests_for("enqueue")[-1]["tracks"][0]["path"], result.tracks[2].path)
+        store.replace(store.playlist.tracks)
+        self.wait(lambda: self.fake.requests_for("replace"))
+        sent = self.fake.requests_for("replace")[-1]["tracks"]
+        self.assertEqual([t["path"] for t in sent[:len(legacy)]], [t.path for t in result.tracks])
+        self.assertFalse(any("spotify.bridge" in t.get("meta", {}) for t in sent))
 
     def test_refresh_forgets_records_of_removed_playlists(self):
         result = si.fetch_list(URL)
@@ -626,7 +637,7 @@ class DialogTest(ImportPageCase):
         ask = self.last_dialog()
         self.addCleanup(close, ask)
         ask.emit("response", "replace")
-        self.wait(lambda: self.fake.local_playlists.get("ドライブ", [{}])[0].get("path", "").startswith("ytsearch1:"),
+        self.wait(lambda: self.fake.local_playlists.get("ドライブ", [{}])[0].get("path", "").startswith("spotify:track:"),
                   8, "置き換えません")
         self.assertEqual(len(self.fake.local_playlists["ドライブ"]), 6)
         self.assertIsNotNone(self.ctx.imports.get("ドライブ"))
@@ -732,7 +743,7 @@ class PlaylistsImportTest(ImportPageCase):
         self.assertEqual(page.header.note_label.get_text(), IMPORTED_NOTE)
         self.assertEqual(page.header.subtitle_label.get_text(), "架空の作り手")
         self.assertTrue(page.imported)
-        self.assertTrue(all(is_youtube_bridge(t) for t in page.tracks))
+        self.assertFalse(any(is_youtube_bridge(t) for t in page.tracks))
         model, _group = page._menu()
         labels = menu_labels(model)
         self.assertIn("Spotify から更新", labels)

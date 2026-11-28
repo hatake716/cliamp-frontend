@@ -70,7 +70,7 @@ class GuiStateTest(unittest.TestCase):
     def test_defaults_when_missing(self):
         state = GuiState(self.path)
         self.assertEqual(state.recent_searches, [])
-        self.assertEqual(state.search_scope, "youtube")
+        self.assertEqual(state.search_scope, "spotify")
         self.assertEqual(state.right_panel, "")
         self.assertEqual((state.window_width, state.window_height, state.window_maximized), (1180, 760, False))
         self.assertFalse(os.path.exists(self.path))  # 読むだけでは書かない
@@ -90,7 +90,7 @@ class GuiStateTest(unittest.TestCase):
                                "window_maximized": "yes", "last_page": ["x"], "extra": [1]}))
         state = GuiState(self.path)
         self.assertEqual(state.recent_searches, ["ok", "b"])
-        self.assertEqual(state.search_scope, "youtube")
+        self.assertEqual(state.search_scope, "spotify")
         self.assertEqual(state.right_panel, "")
         self.assertEqual((state.window_width, state.window_height), (1180, 760))
         self.assertFalse(state.window_maximized)

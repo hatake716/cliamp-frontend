@@ -95,9 +95,8 @@ PROVIDER_LABELS = {
 
 RECENT_SOURCE_NAME = "最近再生した項目"
 
-# Spotify の接続が Web API だけのとき (ProviderInfo の playback が "youtube")、曲は YouTube で
-# 探して鳴らす。プレイリストの詳細の情報の行の下と、すべてのプレイリストの節に書き添える。
-WEB_ONLY_NOTE = "曲は YouTube で探して再生します"
+# 旧 cliamp が Web API のみに接続していて、Spotify の再生用接続が無いとき。
+WEB_ONLY_NOTE = "Spotify で聴くには再生用のサインインが必要です"
 
 
 # --------------------------------------------------------------------------
@@ -1280,11 +1279,11 @@ class HomePage(PageBase):
         seeds = self._station_seeds()
         if seeds:
             first = seeds[0]
-            items.insert(0, ("station", first, "ステーション", station_title(first)))
+            items.append(("station", first, "YouTube ステーション", station_title(first)))
         if self._has_radio_provider:
             items.append(("radio", ("placeholder", "cliamp-radio", "station"), "ラジオ", "cliamp ラジオ"))
         for track in seeds[1:]:
-            items.append(("station", track, "ステーション", station_title(track)))
+            items.append(("station", track, "YouTube ステーション", station_title(track)))
         # 「再生中のリスト」の絵は曲が変わるたびに変わるので、並びの比較には含めず、
         # 並びが同じなら絵だけ差し替える (曲ごとにカードを作り直さない)
         keys = tuple((kind, None if kind == "nowplaying" else
@@ -1373,6 +1372,7 @@ class HomePage(PageBase):
                 self._build_picks()
             keys = ["local"] + [p.key for p in result
                                 if p.playlists and p.key not in ("local", "radio") and not p.virtual]
+            keys.sort(key=lambda key: key != "spotify")
             self._collect_playlists(serial, keys, force)
             self._update_state()
 

@@ -17,7 +17,7 @@ import math
 import os
 import re
 import unicodedata
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any, Iterable
 from urllib.parse import parse_qs, unquote, urlsplit
@@ -43,7 +43,8 @@ STATE_COMMANDS = frozenset(LEGACY_COMMANDS - {"plugin.call"} | {
 CATALOG_COMMANDS = frozenset({
     "providers", "playlists", "tracks", "search", "load_provider", "lyrics",
     "history", "playlist_add", "playlist_delete", "playlist_remove_track",
-    "search_playlists", "spotify_destinations", "spotify_save", "save_playlist_to_library", "plugin.call",
+    "search_playlists", "spotify_destinations", "spotify_save", "connect_spotify_playback",
+    "save_playlist_to_library", "plugin.call",
 })
 
 # 拡張 IPC (api 1) のすべてのコマンド。
@@ -321,6 +322,19 @@ class Track:
             return sid
         meta_id = self.meta_get("spotify.id").strip()
         return meta_id if _SPOTIFY_ID.match(meta_id) else None
+
+    def for_playback(self) -> Track:
+        """以前の Spotify 取り込み曲や共有 URL を、同じ録音の Spotify URI で再生する。"""
+        path = self.path
+        if not path.startswith(("ytsearch1:", "https://open.spotify.com/", "http://open.spotify.com/")):
+            return self
+        sid = self.spotify_id if path.startswith("ytsearch1:") else spotify_id_of(path)
+        if not sid:
+            return self
+        meta = dict(self.meta)
+        meta.pop("spotify.bridge", None)
+        meta["spotify.id"] = sid
+        return replace(self, path=f"spotify:track:{sid}", path_raw="", stream=False, meta=meta)
 
     @property
     def is_local_file(self) -> bool:

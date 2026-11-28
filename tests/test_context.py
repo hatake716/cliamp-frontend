@@ -26,7 +26,7 @@ try:
     from cliamp_music.artwork import ArtworkLoader
     from cliamp_music.client import CliampClient
     from cliamp_music.context import AppContext
-    from cliamp_music.protocol import PlaylistInfo, Track, mix_url
+    from cliamp_music.protocol import PlaylistInfo, Response, Track, mix_url
     from cliamp_music.radio import RadioBrowser
     from cliamp_music.state import GuiState
 
@@ -146,6 +146,29 @@ class Delegation(ContextTest):
 
 
 class Playing(ContextTest):
+    def test_spotify_playback_consent_is_explicit_and_retryable(self):
+        command = "connect_spotify_playback"
+        changed = []
+        self.ctx.connect("account-playlists-changed", lambda _ctx, key: changed.append(key))
+        self.assertFalse(self.fake.requests_for(command))
+        with (mock.patch.object(self.ctx.store, "supports", return_value=True),
+              mock.patch.object(self.client, "request") as request,
+              mock.patch.object(self.ctx.catalog, "session_changed") as refresh):
+            self.ctx.connect_spotify_playback()
+            self.ctx.connect_spotify_playback()
+            request.assert_called_once()
+            cmd, reply = request.call_args.args
+            self.assertEqual(cmd, command)
+            reply(Response(False, {}, "access_denied"))
+            self.assertFalse(self.ctx.spotify_playback_connecting)
+            self.assertFalse(changed)
+            self.ctx.connect_spotify_playback()
+            self.assertEqual(request.call_count, 2)
+            request.call_args.args[1](Response(True, {}))
+            self.assertFalse(self.ctx.spotify_playback_connecting)
+            self.assertEqual(changed, ["spotify"])
+            refresh.assert_called_once_with("spotify")
+
     def test_play_tracks(self):
         tracks = [YT, LOCAL]
         self.ctx.play_tracks(tracks, 1, {"provider": "youtube", "id": "q", "name": "検索"})

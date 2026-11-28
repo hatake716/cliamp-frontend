@@ -15,10 +15,8 @@
   カテゴリーのグリッドを非表示にしてチャートの MediaCard (size=140) を同じ位置に並べる。
   見出し自体は常に見える。成功時にのみ公式チャートページへの LinkButton を出す。
   チャート取得失敗または未完了の間はカテゴリータイルがそのまま見える (フォールバック)。
-  チャートのカードをクリックするとその曲名+アーティストで set_query する (既存の検索履歴・範囲の
-  意味論に従う。自動再生はしない)。
-  TopCharts の changed シグナルを weak_call で受け、スナップショットの (fetched_at, entries) タプルで
-  重複をガードする。start_fetch() はインスタンスごとに 1 度だけ。
+  チャートのカードからは掲載された録音を Spotify URI で再生する。
+
 - 結果: 左に「トップの結果」、右に「曲」の最初の 4 行 (狭い幅では縦に積む)。
   その下に「すべての曲」。行のダブルクリック/Enter で結果全体を replace して
   その曲から再生 (出どころは Source(provider=範囲, name=「語」))。
@@ -110,7 +108,7 @@ PLAYLIST_CARD = 150
 PLAYLIST_SCOPES = frozenset({"youtube", "spotify"})
 
 # (範囲の名前, 表示)。spotify は providers に検索できる spotify があるときだけ出す。
-SCOPES = (("youtube", "YouTube"), ("spotify", "Spotify"), ("library", "ライブラリ"))
+SCOPES = (("spotify", "Spotify"), ("youtube", "YouTube"), ("library", "ライブラリ"))
 SCOPE_LABELS = dict(SCOPES)
 
 # カテゴリーと色の組 (上の明るい色, 下の深い色)。並びも色も固定。
@@ -191,8 +189,8 @@ class SearchPage(PageBase):
         self._timer = 0
         self._suppress_changed = False
         self._suppress_scope = False
-        self._spotify = False
-        self._scope = ctx.state.search_scope if ctx.state.search_scope in SCOPE_LABELS else "youtube"
+        self._spotify = None  # プロバイダー確認中
+        self._scope = ctx.state.search_scope if ctx.state.search_scope in SCOPE_LABELS else "spotify"
         # 表示し終えたら検索欄にフォーカスを移す (Apple も検索を開くと欄に入る)。
         # 自分自身のシグナルなのでクラスの関数を渡す (ページを掴む closure を作らない)
         self.connect("shown", SearchPage._on_shown)
@@ -411,7 +409,8 @@ class SearchPage(PageBase):
     # --- 範囲 -------------------------------------------------------------------
 
     def _available_scopes(self) -> list[tuple[str, str]]:
-        return [(name, label) for name, label in SCOPES if name != "spotify" or self._spotify]
+        return [(name, label) for name, label in SCOPES
+                if name != "spotify" or self._spotify is not False or self._scope == "spotify"]
 
     def _fill_scopes(self) -> None:
         self._suppress_scope = True
@@ -421,7 +420,7 @@ class SearchPage(PageBase):
             for name, label in self._available_scopes():
                 self.scopes.add(Adw.Toggle(name=name, label=label))
                 names.append(name)
-            active = self._scope if self._scope in names else "youtube"
+            active = self._scope if self._scope in names else names[0]
             self.scopes.set_active_name(active)
         finally:
             self._suppress_scope = False
@@ -429,9 +428,9 @@ class SearchPage(PageBase):
 
     @property
     def scope(self) -> str:
-        """いま検索に使う範囲 (保存した範囲が使えないときは youtube)。"""
+        """いま検索に使う範囲。"""
         active = self.scopes.get_active_name()
-        return active if active in SCOPE_LABELS else "youtube"
+        return active if active in SCOPE_LABELS else self._scope
 
     def set_scope(self, name: str) -> None:
         """範囲を切り替える (保存し、語があれば検索し直す)。"""
@@ -453,7 +452,7 @@ class SearchPage(PageBase):
             self.search(self._query)
 
     def _update_placeholder(self) -> None:
-        label = SCOPE_LABELS.get(self.scope, "YouTube")
+        label = SCOPE_LABELS[self.scope]
         self.entry.set_placeholder_text(f"{label} を検索")
 
     def _load_providers(self, force: bool) -> None:
@@ -463,12 +462,16 @@ class SearchPage(PageBase):
 
         def done(result) -> None:
             if isinstance(result, Response):
-                return
-            remember_provider_names(self.ctx, result)
-            spotify = any(p.key == "spotify" and p.search for p in result)
+                # providers だけが失敗した場合も search 自身の応答を表示できるようにする。
+                spotify = True
+            else:
+                remember_provider_names(self.ctx, result)
+                spotify = any(p.key == "spotify" and p.search for p in result)
             if spotify != self._spotify:
                 self._spotify = spotify
                 self._fill_scopes()
+                if self._query and self.scope == "spotify":
+                    self.search(self._query)
 
         self.ctx.catalog.providers(done, force=force)
 
@@ -594,11 +597,10 @@ class SearchPage(PageBase):
             self.charts_grid.append(card)
 
     def _on_chart_card(self, card) -> None:
-        """チャートのカードを押したらその曲名+アーティストで検索する。"""
+        """チャートに掲載された録音の Spotify URI をそのまま再生する。"""
         track = getattr(card, "subject", None)
         if track is not None:
-            query = f"{track.display_title} {track.artist}".strip()
-            self.set_query(query)
+            self.ctx.play_now(track)
 
     # --- 検索 -------------------------------------------------------------------
 
@@ -633,6 +635,13 @@ class SearchPage(PageBase):
         self.results.set_visible(True)
         self.results.show_loading()
         self.scroll_to_top()
+        if scope == "spotify" and self._spotify is None and self.ctx.store.supports("providers"):
+            # 確認後に最新の語だけを検索する。
+            return
+        if scope == "spotify" and self._spotify is False:
+            self.results.show_empty("music-search-symbolic", "Spotify では検索できません",
+                                    "cliamp で Spotify を設定してください。")
+            return
         self._track_outcome = None
         searches_playlists = scope in PLAYLIST_SCOPES and self.ctx.store.supports("search_playlists")
         self._playlist_hits = None if searches_playlists else []

@@ -283,8 +283,22 @@ class SearchPageTest(PageCase):
     def search_requests(self):
         return [r for r in self.requests("search")]
 
+    def test_default_search_waits_for_spotify_provider(self):
+        waiting = []
+        with patch.object(self.ctx.catalog, "providers", side_effect=lambda cb, **kw: waiting.append(cb)):
+            page = self.show(SearchPage(self.ctx))
+        page.set_query("最初の検索")
+        self.assertEqual(page.scope, "spotify")
+        self.assertFalse(self.requests("search"))
+        self.assertTrue(waiting)
+        self.ctx.catalog.providers(waiting[-1], force=True)
+        self.wait(lambda: self.requests("search"))
+        self.assertEqual([r["provider"] for r in self.requests("search")], ["spotify"])
+        self.assertTrue(all(r["provider"] == "spotify" for r in self.requests("search_playlists")))
+
     def test_debounce_and_enter(self):
         page = self.show(SearchPage(self.ctx))
+        page.set_scope("youtube")
         page.entry.set_text("夜")
         run_loop(lambda: False, 0.3)
         page.entry.set_text("夜の街")
@@ -309,6 +323,7 @@ class SearchPageTest(PageCase):
     def test_youtube_search_includes_playlists(self):
         """YouTube の範囲では曲と並べてプレイリストも探し (10 件)、押すと詳細を開く。"""
         page = self.show(SearchPage(self.ctx))
+        page.set_scope("youtube")
         page.set_query("夜")
         self.wait(lambda: page.results.state == "content" and page.playlists_grid.get_visible(),
                   message="プレイリストの節が出ません")
@@ -401,6 +416,7 @@ class SearchPageTest(PageCase):
 
     def test_playlist_search_failure_only_hides_the_section(self):
         page = self.show(SearchPage(self.ctx))
+        page.set_scope("youtube")
         page.set_query("plfail 夜")
         self.wait(lambda: self.requests("search_playlists") and page.results.state == "content")
         run_loop(lambda: False, 0.3)
@@ -507,7 +523,7 @@ class SearchPageTest(PageCase):
         self.wait(lambda: self.requests("replace"))
         request = self.requests("replace")[-1]
         self.assertEqual(request["index"], 3)
-        self.assertEqual(request["source"], {"provider": "youtube", "name": "「星」"})
+        self.assertEqual(request["source"], {"provider": "spotify", "name": "「星」"})
         self.assertEqual(len(request["tracks"]), len(rows))
 
     def test_scope_is_saved_and_reused(self):
@@ -614,7 +630,7 @@ class SearchPageTest(PageCase):
             "1位 Synthetic Song 1 Synthetic Artist 1",
         )
 
-    def test_chart_card_click_triggers_search(self):
+    def test_chart_card_plays_spotify_recording(self):
         charts = self._make_charts(count=3)
         self.ctx.charts = charts
         page = self.show(SearchPage(self.ctx))
@@ -622,11 +638,10 @@ class SearchPageTest(PageCase):
         self.wait(lambda: page.charts_grid.get_visible(), 5)
         card = page.charts_grid.get_child_at_index(1).get_child()
         card.emit("clicked")
-        self.wait(lambda: self.search_requests(), 3)
-        self.assertEqual(
-            self.search_requests()[-1]["query"],
-            "Synthetic Song 2 Synthetic Artist 2",
-        )
+        self.wait(lambda: self.requests("enqueue"), 3)
+        self.assertEqual(self.requests("enqueue")[-1]["tracks"][0]["path"], card.subject.path)
+        self.assertTrue(card.subject.path.startswith("spotify:track:"))
+        self.assertFalse(self.search_requests())
 
     def test_chart_data_while_results_visible_does_not_switch(self):
         """結果表示中にチャートデータが来ても結果から切り替えない。"""
@@ -791,6 +806,22 @@ class NowPlayingEditTest(PageCase):
 
 
 class PlaylistsTest(PageCase):
+    def test_spotify_playback_button_sends_consent_only_after_click(self):
+        page = self.show(PlaylistsPage(self.ctx))
+        self.wait(lambda: "spotify" in page.sections and page.sections["spotify"].loaded)
+        section = page.sections["spotify"]
+        with patch.object(self.ctx.store, "supports", return_value=True):
+            self.ctx._provider_playback["spotify"] = "spotify-sign-in"
+            page._update_note(section)
+            self.assertTrue(section.connect_playback.get_visible())
+            self.assertFalse(self.requests("connect_spotify_playback"))
+            with patch.object(self.ctx.client, "request") as request:
+                section.connect_playback.emit("clicked")
+                self.assertEqual(request.call_args.args[0], "connect_spotify_playback")
+            self.ctx._provider_playback["spotify"] = ""
+            page._update_note(section)
+            self.assertFalse(section.connect_playback.get_visible())
+
     def test_saved_grid(self):
         a = PlaylistInfo("spotify", "abc", "Same", 2, owner="one")
         b = PlaylistInfo("url", "https://music.youtube.com/playlist?list=PLabc", "Same", 3, owner="two")
@@ -966,7 +997,7 @@ class WebOnlySpotifyTest(PageCase):
 
     fake_options = {"spotify_web_only": True}
 
-    def test_playlist_detail_says_songs_play_via_youtube(self):
+    def test_legacy_playlist_requests_native_spotify_playback(self):
         page = self.show(PlaylistDetailPage(self.ctx, provider="spotify", id="37i9dQZF1DXfake0001",
                                             name="Chill Mix"))
         self.wait(lambda: len(page.list.rows()) == 4)
@@ -974,15 +1005,15 @@ class WebOnlySpotifyTest(PageCase):
         self.assertEqual(page.header.note_label.get_text(), WEB_ONLY_NOTE)
         self.assertTrue(page.header.note_label.has_css_class("music-info"))
         self.assertEqual(page.header.info_label.get_text().split(" · ")[0], "4 曲")
-        self.assertTrue(page.plays_via_youtube)
+        self.assertTrue(page.has_legacy_spotify_bridge)
         self.assertTrue(all(is_youtube_bridge(t) for t in page.tracks))
-        # 行から鳴らすと、YouTube で探す曲の形 (meta 付き) のまま送る
+        # 旧サーバーの検索式も、アプリから再生するときは曲の URI で送る
         page.list.emit("row-activated", page.list.rows()[1])
         self.wait(lambda: self.requests("replace"))
         request = self.requests("replace")[-1]
         self.assertEqual(request["index"], 1)
-        self.assertTrue(all(t["path"].startswith("ytsearch1:") for t in request["tracks"]))
-        self.assertEqual(request["tracks"][1]["meta"]["spotify.bridge"], "youtube")
+        self.assertTrue(all(t["path"].startswith("spotify:track:") for t in request["tracks"]))
+        self.assertNotIn("spotify.bridge", request["tracks"][1]["meta"])
         # 「…」のリンクは Spotify の曲の頁
         model, _group = self.ctx.track_menu(page.tracks[0], index=0)
         self.assertEqual(page.tracks[0].web_url,
@@ -1045,9 +1076,9 @@ class WebOnlySpotifyTest(PageCase):
         self.assertEqual(page.header.note_label.get_text(), WEB_ONLY_NOTE)
         self.assertTrue(page.header.note_label.get_visible())
 
-    def test_spotify_search_shows_bridged_results(self):
+    def test_spotify_search_plays_legacy_results_by_spotify_id(self):
         """自前の client_id で Web API だけに繋がった Spotify でも、Spotify の範囲で検索でき (1 回に 20 件)、
-        結果の曲は YouTube で探して鳴らす形のまま送る。"""
+        結果の曲は Spotify URI で再生する。"""
         page = self.show(SearchPage(self.ctx))
         self.wait(lambda: page.scopes.get_n_toggles() == 3, message="Spotify の範囲が出ません")
         page.set_scope("spotify")
@@ -1065,8 +1096,8 @@ class WebOnlySpotifyTest(PageCase):
         replace = self.requests("replace")[-1]
         self.assertEqual(replace["index"], 2)
         self.assertEqual(replace["source"], {"provider": "spotify", "name": "「夜明けのバス停」"})
-        self.assertTrue(all(t["path"].startswith("ytsearch1:") for t in replace["tracks"]))
-        self.assertEqual(replace["tracks"][2]["meta"]["spotify.bridge"], "youtube")
+        self.assertTrue(all(t["path"].startswith("spotify:track:") for t in replace["tracks"]))
+        self.assertNotIn("spotify.bridge", replace["tracks"][2]["meta"])
         self.assertEqual(replace["tracks"][2]["meta"]["spotify.id"], tracks[2].spotify_id)
 
     def test_spotify_search_includes_playlists(self):

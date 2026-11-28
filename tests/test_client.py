@@ -82,6 +82,7 @@ class OneShot(unittest.TestCase):
     def test_default_timeouts(self):
         self.assertEqual(client_mod.default_timeout("status"), 5.0)
         self.assertEqual(client_mod.default_timeout("search"), 130.0)
+        self.assertGreater(client_mod.default_timeout("connect_spotify_playback"), 300)
 
     def test_parallel_requests_do_not_queue_behind_catalog(self):
         """カタログ系の遅い要求があっても、状態系の要求はすぐ返る (1 要求 1 接続)。"""

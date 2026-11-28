@@ -656,7 +656,7 @@ class PlayerStore(GObject.Object):
     def replace(self, tracks: Iterable[Track], index: int = 0, source: Source | dict | None = None,
                 callback: ResponseCallback = None) -> None:
         """リストを差し替えて index の曲から再生。"""
-        tracks = list(tracks)
+        tracks = [self._restore(t).for_playback() for t in tracks]
         if isinstance(source, dict):
             source = Source.from_wire(source)
         self._command("replace", optimistic={"position": 0.0, **self._RESTART}, tracks=tracks, index=int(index),
@@ -665,7 +665,7 @@ class PlayerStore(GObject.Object):
     def enqueue(self, tracks: Iterable[Track], mode: str = "next", callback: ResponseCallback = None) -> None:
         """mode: "next" (次に再生) / "end" (最後に再生) / "now" (すぐ再生)。"""
         self._command("enqueue", optimistic=dict(self._RESTART) if mode == "now" else None,
-                      tracks=list(tracks), mode=mode, callback=callback)
+                      tracks=[self._restore(t).for_playback() for t in tracks], mode=mode, callback=callback)
 
     def queue_edit(self, mode: str, index: int | None = None, to: int | None = None,
                    callback: ResponseCallback = None, path: str | None = None) -> None:
