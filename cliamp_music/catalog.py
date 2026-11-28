@@ -213,6 +213,7 @@ class Catalog:
                         self._store(key, miss_ttl, value)
             for cb in callbacks:
                 _call(cb, _copy(value))
+            callbacks.clear()  # workers may retain their last job while idle
             self._after(key, response.ok, value, stale)
 
         self.client.request(cmd, done, lane=lane, **fields)
@@ -259,8 +260,10 @@ class Catalog:
         self.invalidate(provider)
         for key in list(self._waiting):
             if key[0] in _SESSION_KINDS and key[1] == provider:
-                for callback in self._waiting.pop(key):
+                callbacks = self._waiting.pop(key)
+                for callback in callbacks:
                     self._later(callback, Response.cancelled())
+                callbacks.clear()
         self._cache.pop(_PROVIDERS_KEY, None)
         self._refresh_providers()
 

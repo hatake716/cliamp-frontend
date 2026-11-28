@@ -925,7 +925,7 @@ class PlaylistsTest(PageCase):
         # 自分で鳴らせる Spotify (Premium) には「YouTube で探して再生」の書き添えを出さない
         self.wait(lambda: self.requests("providers"))
         run_loop(lambda: False, 0.2)
-        self.assertFalse(page.plays_via_youtube)
+        self.assertFalse(page.has_legacy_spotify_bridge)
         self.assertFalse(page.header.note_label.get_visible())
 
     def test_detail_reloads_after_track_removed(self):
